@@ -1,0 +1,45 @@
+{
+  "name": "noodle",
+  "version": "0.1.0",
+  "description": "Self-hostable GitHub agent that turns issues into pull requests, powered by the pi agent toolkit.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "bin": {
+    "noodle": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.80.3",
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "better-sqlite3": "^12.11.1",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.9.0",
+    "octokit": "^5.0.5",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.2",
+    "simple-git": "^3.26.0",
+    "typebox": "1.1.38",
+    "yaml": "^2.9.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

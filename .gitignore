@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+noodle.config.yaml
+noodle.config.yml
+tmp/
+.cache/
+.DS_Store
+*.tsbuildinfo

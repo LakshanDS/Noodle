@@ -1,0 +1,79 @@
+# Noodle configuration.
+# Copy to `noodle.config.yaml` and edit. Secrets live in `.env`, not here.
+
+# Default profile used when no routing rule matches an issue.
+default_profile: cheap
+
+# Agent profiles. Each pins a model (via @earendil-works/pi-ai) and a tool set.
+# `provider` + `model` select the model. `base_url` overrides the endpoint
+# (for local / OpenAI-compatible servers like Ollama).
+profiles:
+  claude:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    thinking_level: medium
+    tools: [read, bash, edit, write, grep, find, ls]
+
+  cheap:
+    provider: openrouter
+    model: anthropic/claude-3-5-haiku
+    thinking_level: "off"
+    tools: [read, grep, find, ls]
+
+  openai:
+    provider: openai
+    model: gpt-4o-mini
+    thinking_level: "off"
+    tools: [read, bash, edit, write, grep, find, ls]
+
+  # Example local model. Requires LOCAL_BASE_URL in .env and a running server.
+  local:
+    provider: ollama
+    base_url: http://localhost:11434/v1
+    model: qwen2.5-coder:32b
+    thinking_level: "off"
+    tools: [read, bash, edit, write, grep, find, ls]
+
+  # Any OpenAI-compatible endpoint: vLLM, LM Studio, DeepSeek, Cerebras, a proxy.
+  # `api` picks the wire protocol; `api_key_env` is the env var holding the key
+  # (omit it for no-auth local endpoints like Ollama).
+  vllm:
+    provider: vllm
+    api: openai-completions
+    base_url: http://localhost:8000/v1
+    model: meta-llama/Llama-3.1-70B-Instruct
+    api_key_env: VLLM_API_KEY        # optional for local no-auth servers
+    context_window: 131072
+    max_tokens: 32000
+    thinking_level: "off"
+    tools: [read, bash, edit, write, grep, find, ls]
+
+  # Any Anthropic-protocol endpoint: a self-hosted proxy, Cloudflare/Fireworks
+  # exposing the Anthropic messages shape, a corporate gateway.
+  anthropic-proxy:
+    provider: acme-llm
+    api: anthropic-messages
+    base_url: https://llm.internal.acme.corp
+    model: our-finetune-v2
+    api_key_env: ACME_LLM_KEY
+    context_window: 200000
+    max_tokens: 8192
+    thinking_level: "off"
+    tools: [read, bash, edit, write, grep, find, ls]
+
+# Routing rules — evaluated top-to-bottom, first match wins.
+# kind: slash    — a `/word` command in the issue body or a comment
+# kind: label    — a label on the issue
+# kind: keyword  — a regex matched against title + body
+routing:
+  - { kind: slash,   match: "/claude",      profile: claude }
+  - { kind: slash,   match: "/opus",        profile: claude }
+  - { kind: slash,   match: "/cheap",       profile: cheap }
+  - { kind: label,   match: "agent:big",    profile: claude }
+  - { kind: label,   match: "bug",          profile: cheap }
+  - { kind: keyword, match: "refactor|architecture", profile: claude }
+
+# Per-repo overrides (optional). Any top-level key can be overridden here.
+repos:
+  # owner/name:
+  #   default_profile: claude
