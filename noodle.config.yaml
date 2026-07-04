@@ -1,0 +1,28 @@
+# Noodle bot configuration.
+# Profiles, routing, and server settings for the webhook-driven agent.
+
+default_profile: default
+
+profiles:
+  default:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_tokens: 8192
+    api_rpm: 30
+    thinking_level: "off"
+    tools: [read, bash, edit, write, grep, find, ls]
+
+routing: []
+
+server:
+  host: "0.0.0.0"
+  port: 3000
+
+storage:
+  # Render persistent disk mounted at /data
+  sqlite_path: /data/noodle.db
+
+scheduler:
+  enabled: false
+  interval_minutes: 30
+  repos: []

@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: noodle-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Free instance — spins down after 15 min of inactivity, wakes on request
+    plan: free
+    # Persistent disk for SQLite database
+    disk:
+      name: noodle-data
+      mountPath: /data
+      sizeGB: 1
+    healthCheckPath: /health
+    envVars:
+      # Set these in the Render dashboard (not here — they're secrets)
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_PRIVATE_KEY
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: NOODLE_LOGIN
+        sync: false
+        value: noodle-bot
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LOG_LEVEL
+        value: info
+      - key: NODE_ENV
+        value: production

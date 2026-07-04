@@ -1,0 +1,12 @@
+node_modules
+dist
+logs
+sessions
+.env
+*.pem
+.git
+.github
+tests
+vitest.config.ts
+PLAN.md
+README.md

@@ -5,8 +5,8 @@ logs/
 sessions/
 .env
 .env.local
-noodle.config.yaml
-noodle.config.yml
+noodle.config.local.yaml
+noodle.config.local.yml
 tmp/
 .cache/
 .DS_Store
