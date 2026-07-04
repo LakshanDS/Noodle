@@ -59,6 +59,12 @@ export const ProfileSchema = z.object({
   thinking_level: ThinkingLevel.default("off"),
   tools: z.array(z.string()).default([...BUILTIN_TOOLS]),
   system_prompt_file: z.string().optional(),
+  /**
+   * Max LLM requests per minute for this profile. Noodle installs a pre-request
+   * throttle so the agent loop never exceeds the provider's rate limit.
+   * `0` = unlimited. Default: 30.
+   */
+  api_rpm: z.number().int().min(0).default(30),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
 
@@ -76,11 +82,47 @@ export const RepoOverrideSchema = z.object({
 });
 export type RepoOverride = z.infer<typeof RepoOverrideSchema>;
 
+/**
+ * Phase 2 server settings. All optional — omitted means the server block is
+ * inactive and only the CLI / scheduler (if enabled) run.
+ */
+export const ServerConfigSchema = z.object({
+  host: z.string().default("0.0.0.0"),
+  port: z.number().int().positive().max(65535).default(3000),
+});
+export type ServerConfig = z.infer<typeof ServerConfigSchema>;
+
+/** Where the SQLite job queue + scan state live. */
+export const StorageConfigSchema = z.object({
+  sqlite_path: z.string().default("./noodle.db"),
+});
+export type StorageConfig = z.infer<typeof StorageConfigSchema>;
+
+/**
+ * Periodic cron scan of watched repos for new issues matching routing rules.
+ * `repos` is the explicit list of owner/name repos to poll.
+ */
+export const SchedulerConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** Minutes between scans. */
+  interval_minutes: z.number().int().positive().default(30),
+  /** Repos to watch, as "owner/name". Required when enabled. */
+  repos: z.array(z.string().min(1)).default([]),
+});
+export type SchedulerConfig = z.infer<typeof SchedulerConfigSchema>;
+
 export const NoodleConfigSchema = z.object({
   default_profile: z.string().min(1),
   profiles: z.record(z.string(), ProfileSchema),
   routing: z.array(RoutingRuleSchema).nullish().transform((v) => v ?? []),
   repos: z.record(z.string(), RepoOverrideSchema).nullish().transform((v) => v ?? {}),
+  server: ServerConfigSchema.nullish().transform((v) => v ?? { host: "0.0.0.0", port: 3000 }),
+  storage: StorageConfigSchema.nullish().transform((v) => v ?? { sqlite_path: "./noodle.db" }),
+  scheduler: SchedulerConfigSchema.nullish().transform((v) => v ?? {
+    enabled: false,
+    interval_minutes: 30,
+    repos: [],
+  }),
 });
 export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;
 
@@ -130,6 +172,16 @@ export function crossValidate(config: NoodleConfig): string[] {
   for (const [repo, override] of Object.entries(config.repos)) {
     if (override.default_profile && !names.has(override.default_profile)) {
       errors.push(`repos.${repo}.default_profile "${override.default_profile}" is not defined`);
+    }
+  }
+
+  // Scheduler: when enabled, it must have at least one repo to watch.
+  if (config.scheduler.enabled && config.scheduler.repos.length === 0) {
+    errors.push(`scheduler: "repos" must list at least one repo when scheduler.enabled is true`);
+  }
+  for (const [i, repo] of config.scheduler.repos.entries()) {
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+      errors.push(`scheduler.repos[${i}]: "${repo}" is not a valid "owner/name"`);
     }
   }
 

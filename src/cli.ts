@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import "dotenv/config";
 import { Command } from "commander";
 import { loadConfig, ConfigError } from "./config/load.js";
 import { createOctokit } from "./github/auth.js";
 import { GitHubClient } from "./github/client.js";
 import { runJob } from "./engine/run.js";
+import { serve, scanOnce } from "./server/serve.js";
 import { log } from "./util/log.js";
 
 const program = new Command();
@@ -56,13 +58,9 @@ program
     const gh = new GitHubClient(createOctokit());
 
     if (opts.scan) {
-      // Dry-run: list open issues and show the routed profile for each.
+      // Dry-run: list open issues and show what would be enqueued.
       console.log(`Scanning open issues in ${opts.repo} (dry-run)…\n`);
-      // We don't have a listIssues method on the client yet; reuse getIssue by walking
-      // is overkill for the MVP scan — instead, document that full scan comes with
-      // the scheduler (Phase 2). For now, point users at --issue.
-      console.log("Note: full issue listing arrives with the scheduler (Phase 2).");
-      console.log("Use `noodle run --repo <r> --issue <n>` for a single issue.\n");
+      await scanOnce(opts.config, opts.repo);
       process.exit(0);
     }
 
@@ -79,6 +77,17 @@ program
     }
   });
 
+// --- noodle serve (Phase 2: webhook server + worker + scheduler) -------------
+program
+  .command("serve")
+  .description("Run the webhook server + job queue (+ optional scheduler). Long-running.")
+  .option("-c, --config <path>", "path to config file")
+  .option("-H, --host <host>", "bind host (overrides config server.host)")
+  .option("-p, --port <number>", "bind port (overrides config server.port)", (v) => parseInt(v, 10))
+  .action(async (opts: { config?: string; host?: string; port?: number }) => {
+    await serve(opts.config, { host: opts.host, port: opts.port });
+  });
+
 // --- noodle doctor ----------------------------------------------------------
 program
   .command("doctor")
@@ -86,7 +95,10 @@ program
   .action(async () => {
     let ok = true;
 
-    // GitHub token
+    // GitHub auth: PAT (Phase 1) OR GitHub App (Phase 2).
+    const hasAppCreds = Boolean(
+      process.env.GITHUB_APP_ID && (process.env.GITHUB_PRIVATE_KEY || process.env.GITHUB_PRIVATE_KEY_FILE),
+    );
     if (process.env.GITHUB_TOKEN) {
       try {
         const gh = new GitHubClient(createOctokit());
@@ -96,9 +108,16 @@ program
         ok = false;
         console.error(`✗ GITHUB_TOKEN set but failed: ${(e as Error).message}`);
       }
+    } else if (hasAppCreds) {
+      console.log("✓ GitHub App credentials present (GITHUB_APP_ID + private key).");
+      console.log("  (App token exchange is exercised by `noodle serve`.)");
     } else {
       ok = false;
-      console.error("✗ GITHUB_TOKEN not set.");
+      console.error("✗ No GitHub auth: set GITHUB_TOKEN (PAT) or GITHUB_APP_ID + GITHUB_PRIVATE_KEY (App).");
+    }
+
+    if (hasAppCreds && !process.env.GITHUB_WEBHOOK_SECRET) {
+      console.warn("⚠ GITHUB_WEBHOOK_SECRET not set — required for `noodle serve` webhook verification.");
     }
 
     // LLM keys — at least one provider key should be present per the configured profiles.

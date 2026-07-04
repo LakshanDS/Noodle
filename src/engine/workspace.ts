@@ -31,6 +31,23 @@ export class Workspace {
     log.debug({ dir: this.path, branch: name }, "created branch");
   }
 
+  /** Remove only the skills Noodle copied (not user-owned skills). */
+  async removeInternals(): Promise<void> {
+    const { noodleSkillsDir } = await import("../util/paths.js");
+    const { readdir } = await import("node:fs/promises");
+    const src = noodleSkillsDir();
+    try {
+      const entries = await readdir(src, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        await rm(join(this.path, ".agents", "skills", entry.name), { recursive: true, force: true });
+      }
+      log.debug("removed Noodle-copied skills from workspace");
+    } catch {
+      // No skills dir or nothing to clean — fine.
+    }
+  }
+
   /** Stage all changes and commit. Returns true if there was anything to commit. */
   async commitAll(message: string): Promise<boolean> {
     await this.git.add("-A");

@@ -33,5 +33,6 @@ adds the fix workflow.
 
 ## Finish
 
-Call `finish_run` (required). If you couldn't fix it, still call it — say so,
-set `confidence: low`.
+End by posting your final answer as a normal text message. Keep it short — what
+you changed and why, or the answer to the question. Match the length to the
+task. If you couldn't fix it, say so clearly and why.

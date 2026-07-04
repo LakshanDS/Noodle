@@ -37,4 +37,3 @@ Group by file. Lead with highest severity. Found nothing? Say so — don't inven
 - Don't speculate about runtime behavior you haven't checked — say "appears to"
   or verify with `bash`/`grep`.
 - Don't comment on style unless it causes a real problem.
-- When done, call `finish_run` with the findings as your summary.

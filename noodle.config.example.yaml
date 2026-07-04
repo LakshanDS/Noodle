@@ -48,6 +48,21 @@ profiles:
     thinking_level: "off"
     tools: [read, bash, edit, write, grep, find, ls]
 
+  # Rate-limited provider example. Set api_rpm when a provider caps requests per
+  # minute (e.g. NVIDIA NIM's free tier = 40). Noodle installs a pre-request
+  # throttle so the agent loop never exceeds it. 0 = unlimited. Default: 30.
+  nim:
+    provider: nvidia
+    api: openai-completions
+    base_url: https://integrate.api.nvidia.com/v1
+    model: minimaxai/minimax-m3
+    api_key_env: NVIDIA_API_KEY
+    api_rpm: 40
+    context_window: 131072
+    max_tokens: 8192
+    thinking_level: "off"
+    tools: [read, bash, edit, write, grep, find, ls]
+
   # Any Anthropic-protocol endpoint: a self-hosted proxy, Cloudflare/Fireworks
   # exposing the Anthropic messages shape, a corporate gateway.
   anthropic-proxy:
@@ -77,3 +92,25 @@ routing:
 repos:
   # owner/name:
   #   default_profile: claude
+
+# --- Phase 2: webhook server + scheduler (all optional) ---------------------
+# These only matter when running `noodle serve`. Leave them out for Phase 1
+# CLI-only usage (the existing `noodle run --repo … --issue …` flow is unchanged).
+
+# HTTP server that receives GitHub webhooks.
+# server:
+#   host: 0.0.0.0
+#   port: 3000
+
+# Where the SQLite job queue + scan state live.
+# storage:
+#   sqlite_path: ./noodle.db
+
+# Periodic cron scan. Every `interval_minutes`, Noodle polls each repo in
+# `repos` for open issues updated since the last scan, routes each through the
+# rules above, and enqueues any that match. Disabled by default.
+# scheduler:
+#   enabled: false
+#   interval_minutes: 30
+#   repos:
+#     - owner/name

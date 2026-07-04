@@ -7,9 +7,9 @@ to read the code, fix the bug, and open a pull request.
 Multiple **agent profiles** (each pinned to a different LLM) are routed per
 issue — use a strong model for hard features and a cheap one for small fixes.
 
-> **Status: Phase 1 (CLI runner).** `noodle run --repo … --issue …` works end
-> to end. The webhook server + scheduler (live GitHub App mode) are Phase 2 —
-> see [PLAN.md](./PLAN.md).
+> **Status: Phase 2 (webhook server + scheduler).** `noodle serve` runs a live
+> GitHub App: webhooks → SQLite job queue → agent → PR. The Phase 1 CLI runner
+> (`noodle run`) and GitHub Action still work unchanged. See [PLAN.md](./PLAN.md).
 
 ---
 
@@ -24,7 +24,10 @@ issue → Noodle fetches it → routes a profile → clones a temp branch
 Noodle owns the GitHub/git/routing/scheduling layer; pi owns the coding task
 (LLM calls, file edits, tool use). One process, one runtime.
 
-## What's built (Phase 1)
+## What's built
+
+- **Profile routing** — slash commands (`/claude`), labels, keyword regex, or a
+  default. First match wins. Per-repo overrides supported.
 
 - **Profile routing** — slash commands (`/claude`), labels, keyword regex, or a
   default. First match wins. Per-repo overrides supported.
@@ -37,16 +40,25 @@ Noodle owns the GitHub/git/routing/scheduling layer; pi owns the coding task
   the ponytail lazy-ladder with grug-brain developer principles: minimal diff,
   stdlib first, no over-engineering, root-cause over symptom. Every fix defaults
   to "the best code is the code never written."
-- **Structured output** — the agent must call a `finish_run` tool with a summary;
-  that becomes the PR body and issue comment (with a deterministic fallback if
-  the agent doesn't call it).
+- **Structured output** — after the agent finishes, one extra LLM call phrases
+  its final answer into a clean summary; that becomes the PR body and issue
+  comment (with a deterministic fallback if the call fails).
 - **Noodle skills (composable)** — `noodle-default` (the always-active
   lazy-senior mindset) is paired with a task skill: `noodle-fix` for fixes,
   `noodle-review` for audits. Task skills stay lean — they extend the default
   rather than duplicate it, so adding a new task type later is one small file.
 - **A custom tool** — `comment_on_issue`, so the agent can ask the reporter a
   question mid-run.
-- **CLI** — `run`, `config validate`, `doctor`.
+- **CLI** — `run`, `config validate`, `doctor`, and (Phase 2) `serve`.
+- **Webhook server + job queue (Phase 2)** — `noodle serve` runs a long-lived
+  process: a fastify webhook receiver (HMAC-verified), a SQLite-backed job
+  queue with dedup, and a single-consumer worker that drives the same run loop.
+  GitHub-App installation tokens are minted and cached (1h TTL) so no long-lived
+  PAT is needed. Graceful shutdown on SIGINT/SIGTERM drains the worker first.
+- **Cron scheduler (Phase 2)** — periodically polls a configured list of repos
+  for open issues updated since the last scan and enqueues any that match the
+  routing rules. Per-repo "last seen" watermark is persisted in SQLite, so
+  restarts don't reprocess the backlog.
 
 ---
 
@@ -212,6 +224,109 @@ DeepSeek/Cerebras and anything OpenAI-compatible; `anthropic-messages` covers
 Anthropic-protocol proxies/gateways. Built-in providers (anthropic, openai,
 openrouter, …) don't need `api`/`base_url` — only custom endpoints do.
 
+### Rate limiting (`api_rpm`)
+
+`api_rpm` caps the LLM requests-per-minute a profile will make. Noodle installs a
+pre-request throttle via pi's `before_provider_request` hook, so the agent loop's
+back-to-back turns never exceed it. **Default: `30`.** Set `0` for unlimited.
+
+```yaml
+profiles:
+  nim:
+    provider: nvidia
+    api: openai-completions
+    base_url: https://integrate.api.nvidia.com/v1
+    model: minimaxai/minimax-m3
+    api_key_env: NVIDIA_API_KEY
+    api_rpm: 40   # → at least 1500ms between LLM calls (0 = unlimited)
+```
+
+pi already retries `429` responses with exponential backoff (3 attempts, 2000ms
+base); this throttle is the proactive floor that prevents most 429s from firing.
+
+## Server mode: `noodle serve` (Phase 2)
+
+For a live, self-hosted agent — open an issue, watch a PR appear with no manual
+command — run Noodle as a long-running server. It receives GitHub webhooks,
+queues jobs in SQLite, and runs them through the same engine as the CLI.
+
+```
+GitHub ──webhook──▶ noodle serve (fastify)
+                      │  HMAC-verify (X-Hub-Signature-256)
+                      ▼
+                   SQLite job queue (deduped per repo+issue)
+                      ▼
+                   worker → GitHub-App install token → engine.runJob → PR
+```
+
+### 1. Create a GitHub App
+
+Under *Settings → Developer settings → GitHub Apps → New GitHub App*:
+
+- **Permissions**: `contents:write`, `pull-requests:write`, `issues:write`.
+- **Subscribe to events**: `issues`, `issue_comment`.
+- **Webhook URL**: your server's `/webhook` (use `cloudflared tunnel` / `ngrok`
+  in dev; a reverse proxy with HTTPS in prod). Set the webhook secret.
+- Generate a **private key** (PEM) and note the **App ID**.
+
+Install the App on the repos you want Noodle to work on.
+
+### 2. Configure environment
+
+```dotenv
+# .env — Phase 2 server mode
+GITHUB_APP_ID=123456
+GITHUB_PRIVATE_KEY_FILE=/path/to/app.private-key.pem   # or paste the PEM inline
+GITHUB_WEBHOOK_SECRET=whsecret                          # matches the App's webhook secret
+ANTHROPIC_API_KEY=sk-ant-xxx                            # whichever provider(s) you use
+NOODLE_LOGIN=noodle-bot                                 # the App's bot login, to scope `assigned`
+```
+
+PAT mode (`GITHUB_TOKEN`) still works for `noodle serve` if you don't want a
+full App — but App tokens are short-lived and per-installation, which is the
+recommended path for a long-running server.
+
+> **Assignment trigger.** Noodle runs when an issue is **assigned to it** —
+> assign-to-a-human is ignored. In App mode set `NOODLE_LOGIN` to the App's bot
+> login (e.g. `my-noodle[bot]`); in PAT mode Noodle resolves its own login
+> automatically, or you can set `NOODLE_LOGIN` explicitly. Without it,
+> `assigned` events are ignored and Noodle only fires on open / reopen / label
+> / `/noodle` comment.
+
+### 3. Enable the scheduler (optional)
+
+Add a `scheduler` block to `noodle.config.yaml` so Noodle also polls repos on a
+timer — the "periodically wake up and find bugs" path, independent of webhooks:
+
+```yaml
+scheduler:
+  enabled: true
+  interval_minutes: 30
+  repos:
+    - owner/name
+```
+
+### 4. Run
+
+```bash
+npm run dev -- serve
+# or with overrides:
+npm run dev -- serve --host 0.0.0.0 --port 3000
+```
+
+Open an issue in an installed repo — Noodle clones, fixes, opens a PR, comments,
+done. `GET /health` returns `{ "status": "ok" }` for uptime checks. SIGINT /
+SIGTERM drain the worker, close the server, and close the DB cleanly.
+
+### Dry-run scan
+
+```bash
+npm run dev -- run --repo owner/name --scan
+```
+
+Lists what the scheduler *would* enqueue right now (no agent runs, no jobs
+queued) — handy for validating routing rules before enabling the scheduler.
+
 ## Routing at a glance
 
 In the issue body, a comment, labels, or keywords — first match wins:
@@ -227,14 +342,15 @@ In the issue body, a comment, labels, or keywords — first match wins:
 
 ```
 src/
-├── cli.ts              noodle CLI (run / config validate / doctor)
+├── cli.ts              noodle CLI (run / config validate / doctor / serve)
 ├── config/             zod schema + loader for noodle.config.yaml
 ├── profiles/           issue → profile routing (pure, tested)
-├── github/             octokit client + PAT auth
+├── github/             octokit client + PAT auth + GitHub-App auth + webhook parsing
 ├── engine/             workspace (git) + prompt + the run loop + tools
+├── server/             fastify webhook server + SQLite job queue + cron scheduler
 └── util/               logging, paths
 skills/                 noodle-default, noodle-fix, noodle-review (Noodle's own)
-tests/                  config + routing + output + skills unit tests
+tests/                  config + routing + output + webhook + auth + queue + scheduler tests
 ```
 
 ### Skills — composable mindset
@@ -258,9 +374,9 @@ npm run build          # compile to dist/
 
 ## Roadmap
 
-- **Phase 2** — GitHub App (installation tokens), webhook server, SQLite job
-  queue, cron scheduler for proactive scanning. See [PLAN.md](./PLAN.md).
-- **Phase 3** — Docker-per-job isolation, cost tracking, optional web UI.
+- **Phase 3** — Docker-per-job isolation (route pi's `BashOperations`/`ReadOperations`
+  into an ephemeral container), cost tracking, retries/timeouts/concurrency limits
+  on the queue, optional web UI. See [PLAN.md](./PLAN.md).
 
 ## License
 

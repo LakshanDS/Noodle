@@ -1,57 +1,64 @@
 import { describe, it, expect } from "vitest";
 import { buildPrBody, buildIssueComment } from "../src/engine/run.js";
-import type { FinishRunResult } from "../src/engine/tools.js";
 
 const profile = { name: "claude", provider: "anthropic", model: "claude-sonnet-4-20250514" };
 const changedFiles = ["src/auth.ts", "tests/auth.test.ts"];
-const summary: FinishRunResult = {
-  summary: "Fixed verifyToken to check the exp claim; added a regression test.",
-  confidence: "high",
-  needs_human_review: false,
-};
+const agentMessage =
+  "Yes, the project has a dashboard. It lives at `/jasladmin/dashboard`, " +
+  "gated by TOTP login at `/jasladmin/login`. The main page shows system stats " +
+  "and there are per-section management pages for projects, roadmap, and skills.";
 
 describe("buildPrBody", () => {
-  it("uses the agent summary when present", () => {
-    const body = buildPrBody(profile.name, changedFiles, "https://x/#42", summary);
-    expect(body).toContain(summary.summary);
-    expect(body).toContain("Closes https://x/#42");
+  it("uses the agent message verbatim as the body", () => {
+    const body = buildPrBody(profile.name, changedFiles, "https://x/#42", agentMessage);
+    expect(body).toContain(agentMessage);
     expect(body).toContain("- `src/auth.ts`");
+    expect(body).toContain("Closes https://x/#42");
+    expect(body).toContain("Noodle");
   });
 
-  it("falls back to a notice when no summary (agent didn't call finish_run)", () => {
+  it("falls back to a notice when the agent left no message", () => {
     const body = buildPrBody(profile.name, changedFiles, "https://x/#42", undefined);
-    expect(body).toMatch(/did not return a structured summary/i);
+    expect(body).toMatch(/did not leave a summary/i);
     expect(body).toContain("- `src/auth.ts`"); // git facts still present
     expect(body).toContain("Closes https://x/#42");
-  });
-
-  it("flags needs_human_review", () => {
-    const body = buildPrBody(profile.name, changedFiles, "https://x/#42", {
-      ...summary,
-      needs_human_review: true,
-    });
-    expect(body).toMatch(/human review/i);
   });
 });
 
 describe("buildIssueComment", () => {
-  it("links the PR and quotes the summary when changes were committed", () => {
-    const c = buildIssueComment(profile, 58, "https://x/pull/58", changedFiles, summary, true);
-    expect(c).toContain("opened #58");
+  it("posts the agent message verbatim with a signature footer", () => {
+    const c = buildIssueComment(profile, agentMessage);
+    expect(c.startsWith(agentMessage)).toBe(true);
+    // signature footer
+    expect(c).toContain("Noodle");
+    expect(c).toContain("claude");
+    expect(c).toContain("anthropic/claude-sonnet-4-20250514");
+    // no PR link when none provided
+    expect(c).not.toContain("PR #");
+  });
+
+  it("includes the PR link in the signature when a PR was opened", () => {
+    const c = buildIssueComment(profile, agentMessage, {
+      prNumber: 58,
+      prUrl: "https://x/pull/58",
+      changedFiles,
+    });
+    expect(c).toContain("PR #58");
     expect(c).toContain("https://x/pull/58");
-    expect(c).toContain("> "); // summary is quoted
-    expect(c).toContain("Confidence: high");
-    expect(c).toContain("`src/auth.ts`");
   });
 
-  it("explains no-change runs and includes summary if the agent reported one", () => {
-    const c = buildIssueComment(profile, undefined, undefined, [], summary, false);
-    expect(c).toMatch(/made no code changes/);
-    expect(c).toContain(summary.summary.slice(0, 20)); // still quoted
+  it("uses a generic note when the agent produced no message", () => {
+    const c = buildIssueComment(profile, undefined);
+    expect(c).toMatch(/made no code changes and left no message/i);
+    // still has the signature
+    expect(c).toContain("Noodle");
   });
 
-  it("explains no-change runs with the generic message when no summary", () => {
-    const c = buildIssueComment(profile, undefined, undefined, [], undefined, false);
-    expect(c).toMatch(/may mean the issue needs clarification/);
+  it("preserves the agent's markdown formatting (no reformatting)", () => {
+    const msg = "## Answer\n\nYes — see `src/app/dashboard/page.tsx`.\n\n- bullet one\n- bullet two";
+    const c = buildIssueComment(profile, msg);
+    expect(c).toContain("## Answer");
+    expect(c).toContain("- bullet one");
+    expect(c).toContain("`src/app/dashboard/page.tsx`");
   });
 });

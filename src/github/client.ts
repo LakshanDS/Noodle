@@ -44,6 +44,70 @@ export class GitHubClient {
     return data.map((c) => ({ body: c.body ?? "", author: c.user?.login ?? "unknown" }));
   }
 
+  async addIssueLabel(repo: string, number: number, label: string): Promise<void> {
+    const [owner, name] = parseRepo(repo);
+    await this.octokit.rest.issues.addLabels({
+      owner,
+      repo: name,
+      issue_number: number,
+      labels: [label],
+    });
+  }
+
+  /**
+   * Ensure a repo label exists with the given color + description, creating it
+   * if missing. Idempotent: a no-op when the label is already present. Tolerates
+   * the rare create-after-404 race (ignores 422 "already exists").
+   *
+   * `color` is a 6-char hex string without `#` (GitHub API convention).
+   */
+  async ensureLabel(
+    repo: string,
+    name: string,
+    color: string,
+    description: string,
+  ): Promise<void> {
+    const [owner, repoName] = parseRepo(repo);
+    try {
+      await this.octokit.rest.issues.getLabel({ owner, repo: repoName, name });
+      return; // exists — nothing to do
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      if (status !== 404) throw e;
+    }
+    try {
+      await this.octokit.rest.issues.createLabel({
+        owner,
+        repo: repoName,
+        name,
+        color,
+        description,
+      });
+    } catch (e) {
+      // Race: another process created it between our get and create.
+      const status = (e as { status?: number }).status;
+      if (status !== 422) throw e;
+    }
+  }
+
+  async removeIssueLabel(repo: string, number: number, label: string): Promise<void> {
+    const [owner, name] = parseRepo(repo);
+    try {
+      await this.octokit.rest.issues.removeLabel({
+        owner,
+        repo: name,
+        issue_number: number,
+        name: label,
+      });
+    } catch (e) {
+      // 404 = label isn't on the issue (or doesn't exist) — benign, nothing to remove.
+      // Anything else is a real failure the caller should see (was previously swallowed,
+      // which left the cooking label stuck on the issue alongside the cooked one).
+      const status = (e as { status?: number }).status;
+      if (status !== 404) throw e;
+    }
+  }
+
   async createIssueComment(repo: string, number: number, body: string): Promise<string> {
     const [owner, name] = parseRepo(repo);
     const { data } = await this.octokit.rest.issues.createComment({
@@ -99,5 +163,56 @@ export class GitHubClient {
   async currentUserLogin(): Promise<string> {
     const { data } = await this.octokit.rest.users.getAuthenticated();
     return data.login;
+  }
+
+  /**
+   * List a repo's open issues, newest-updated first. `since` (ISO 8601) filters
+   * to issues updated at or after the timestamp — the scheduler uses it to find
+   * only what's changed since its last scan. Pull requests are excluded by
+   * GitHub when state is "open" only if the REST filter cooperates; we drop any
+   * `pull_request` entries defensively here.
+   */
+  async listOpenIssues(repo: string, since?: string): Promise<IssueData[]> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.issues.listForRepo({
+      owner,
+      repo: name,
+      state: "open",
+      since,
+      sort: "created",
+      direction: "desc",
+      per_page: 100,
+    });
+    return data
+      .filter((i) => !("pull_request" in i))
+      .map((i) => ({
+        number: i.number,
+        title: i.title,
+        body: i.body ?? "",
+        labels: i.labels
+          .map((l) => (typeof l === "string" ? l : l.name ?? ""))
+          .filter(Boolean),
+        html_url: i.html_url,
+      }));
+  }
+
+  /**
+   * Fetch the installation id of the configured GitHub App on a repo (Phase 2
+   * scheduler/webhook: maps a repo to its installation token). Returns null if
+   * the app isn't installed.
+   */
+  async repoInstallationId(repo: string): Promise<number | null> {
+    const [owner, name] = parseRepo(repo);
+    try {
+      const { data } = await this.octokit.rest.apps.getRepoInstallation({
+        owner,
+        repo: name,
+      });
+      return data.id;
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      if (status === 404) return null;
+      throw e;
+    }
   }
 }
