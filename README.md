@@ -109,6 +109,87 @@ Check your setup:
 npm run dev -- doctor
 ```
 
+## Use it as a GitHub Action (no self-hosting)
+
+Don't want to run Noodle yourself? Add it as a GitHub Action and GitHub's
+runners do the work — they spin up on a trigger, run the agent, open the PR,
+and shut down. No server, no scheduler, no webhook to maintain.
+
+This is the zero-ops path: you bring the repo + secrets, Noodle brings the
+agent. (Self-hosting the CLI or the Phase 2 server gives you more control; the
+Action is the simplest way to start.)
+
+### Setup
+
+1. **Commit a config** to the repo you want Noodle to work on:
+
+   ```bash
+   cp noodle.config.example.yaml noodle.config.yaml
+   # edit it to define your profiles + routing, then commit
+   ```
+
+2. **Add secrets** under *Settings → Secrets and variables → Actions*:
+   - `GITHUB_TOKEN` — already provided by GitHub, no action needed.
+   - At least one LLM key, matching your profiles: `ANTHROPIC_API_KEY`,
+     `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, …
+
+3. **Add the workflow.** Create `.github/workflows/noodle.yml`:
+
+   ```yaml
+   name: Noodle
+   on:
+     issues:
+       types: [opened, reopened, labeled]
+     issue_comment:
+       types: [created]
+
+   permissions:
+     contents: write
+     pull-requests: write
+     issues: write
+
+   jobs:
+     noodle:
+       if: |
+         github.event_name == 'issues' ||
+         (github.event_name == 'issue_comment' &&
+          startsWith(github.event.comment.body, '/noodle'))
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - uses: LakshanDS/Noodle@v1
+           with:
+             config: noodle.config.yaml
+           env:
+             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+             ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+   ```
+
+   That runs Noodle when an issue is opened/reopened/labeled, or when someone
+   comments `/noodle` on an issue. A full annotated copy is in
+   [`examples/github-action.yml`](./examples/github-action.yml).
+
+Open an issue — Noodle clones, fixes, opens a PR, comments, done.
+
+### Action inputs
+
+| Input    | Required | Default                | Notes |
+|----------|----------|------------------------|-------|
+| `issue`  | no       | from the event         | Issue number. Inferred from `issues` / `issue_comment` events if omitted. |
+| `repo`   | no       | current repository     | `owner/name`. |
+| `config` | no       | `noodle.config.yaml`   | Path to your Noodle config. |
+
+### Caveats
+
+- **PRs opened by the default `GITHUB_TOKEN` don't trigger downstream
+  `on: pull_request` workflows** — a standard GitHub limitation. If you need CI
+  to run on Noodle's PRs automatically, authenticate with a **PAT** or a
+  **GitHub App** (set `GITHUB_TOKEN` to that credential via a secret).
+- **Provider keys are job-level env** — set them under the `uses:` step's
+  `env:` (or job-level `env:`), matching the provider names in your config.
+- Noodle is **issue-driven in Phase 1**. `pull_request` events aren't wired up
+  yet — point the Action at issues for now.
+
 ### Custom endpoints (any OpenAI-compatible or Anthropic-compatible server)
 
 Point a profile at your own endpoint — Ollama, vLLM, LM Studio, a corporate

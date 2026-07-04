@@ -1,0 +1,88 @@
+name: Noodle
+description: Self-hosted GitHub agent — turns issues into pull requests, powered by the pi agent toolkit. Add the Action to your repo, open an issue, and Noodle clones, fixes, and opens a PR.
+author: LakshanDS
+branding:
+  icon: pull-request
+  color: yellow
+
+inputs:
+  issue:
+    description: Issue number to run on. If omitted, the action tries to derive it from the GitHub event (issues / issue_comment / pull_request).
+    required: false
+  repo:
+    description: Target repository in `owner/name` form. Defaults to the current repository.
+    required: false
+  config:
+    description: Path to a Noodle config file. Defaults to `noodle.config.yaml` in the workflow's working directory (your repo checkout). May also be set via NOODLE_CONFIG.
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22.19"
+        # No `cache: npm` here — setup-node looks for package-lock.json in the
+        # consumer's checkout (github.workspace), not in the action's directory.
+        # Most repos using Noodle aren't Node projects, so that lookup would fail.
+
+    - name: Build Noodle
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        npm ci
+        npm run build
+
+    - name: Configure git identity
+      shell: bash
+      run: |
+        git config --global user.name  "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+    - name: Resolve run arguments
+      id: args
+      shell: bash
+      env:
+        INPUT_ISSUE: ${{ inputs.issue }}
+        INPUT_REPO: ${{ inputs.repo }}
+      run: |
+        issue="$INPUT_ISSUE"
+        if [ -z "$issue" ]; then
+          case "${{ github.event_name }}" in
+            issues|issue_comment)
+              issue='${{ github.event.issue.number }}'
+              ;;
+            pull_request|pull_request_target|pull_request_review_comment)
+              # No PR-input path yet — Noodle is issue-driven in Phase 1.
+              issue=''
+              ;;
+          esac
+        fi
+        repo="$INPUT_REPO"
+        [ -z "$repo" ] && repo='${{ github.repository }}'
+        {
+          echo "issue=$issue"
+          echo "repo=$repo"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Run Noodle
+      shell: bash
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+      run: |
+        issue="${{ steps.args.outputs.issue }}"
+        if [ -z "$issue" ]; then
+          echo "::warning::Noodle could not resolve an issue number from this event. Set the \`issue\` input explicitly."
+          exit 1
+        fi
+        # Noodle's default cwd is the consumer's checkout (github.workspace),
+        # so config resolves to ./noodle.config.yaml there unless overridden.
+        config_args=()
+        if [ -n "$INPUT_CONFIG" ]; then
+          config_args=(--config "$INPUT_CONFIG")
+        fi
+        node "${{ github.action_path }}/dist/cli.js" run \
+          --repo "${{ steps.args.outputs.repo }}" \
+          --issue "$issue" \
+          "${config_args[@]}"
