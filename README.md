@@ -11,6 +11,8 @@ issue — use a strong model for hard features and a cheap one for small fixes.
 > GitHub App: webhooks → SQLite job queue → agent → PR. The Phase 1 CLI runner
 > (`noodle run`) and GitHub Action still work unchanged. See [PLAN.md](./PLAN.md).
 
+<!-- agent-test-marker: verified by Noodle agent run from issue #2 -->
+
 ---
 
 ## How it works
