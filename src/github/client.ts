@@ -140,6 +140,34 @@ export class GitHubClient {
     return data.object.sha;
   }
 
+  /**
+   * Find an open PR whose head branch matches this issue's branch pattern.
+   * Matches both the bare first-attempt name (`<agent>/issue-<n>`) and any
+   * suffixed retry (`<agent>/issue-<n>-<hash>`), so a follow-up run reuses
+   * whichever branch the previous attempt left open. Returns null when there's
+   * no open PR — the caller then starts a fresh branch.
+   */
+  async findOpenPRForIssue(
+    repo: string,
+    issueNumber: number,
+    agentSlug: string,
+  ): Promise<{ branch: string; number: number; html_url: string } | null> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.pulls.list({
+      owner,
+      repo: name,
+      state: "open",
+      per_page: 100,
+    });
+    const pattern = new RegExp(`^${agentSlug}/issue-${issueNumber}($|-)`);
+    const match = data.find(
+      (pr) => typeof pr.head?.ref === "string" && pattern.test(pr.head.ref),
+    );
+    return match
+      ? { branch: match.head.ref, number: match.number, html_url: match.html_url }
+      : null;
+  }
+
   async createPullRequest(
     repo: string,
     head: string,

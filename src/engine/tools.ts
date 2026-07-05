@@ -20,6 +20,7 @@ export function createCommentOnIssueTool(
   gh: GitHubClient,
   repo: string,
   issueNumber: number,
+  agentName = "Noodle",
 ) {
   return defineTool({
     name: "comment_on_issue",
@@ -28,7 +29,7 @@ export function createCommentOnIssueTool(
       "Post a comment on the GitHub issue currently being worked on. " +
       "Use to ask the reporter a clarifying question or share progress. " +
       "This does not end the run — to finish, write your full final answer as " +
-      "a normal text message and Noodle will handle the rest.",
+      `a normal text message and ${agentName} will handle the rest.`,
     parameters: Type.Object({
       body: Type.String({
         description: "The comment text, in Markdown.",

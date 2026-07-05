@@ -1,4 +1,4 @@
-name: Deploy noodle-bot
+name: Deploy noodle-agent
 
 on:
   push:
@@ -42,7 +42,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            cd /opt/noodle-bot
+            cd /opt/noodle-agent
             docker compose pull
             docker compose up -d --force-recreate
             docker image prune -f

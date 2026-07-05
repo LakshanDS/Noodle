@@ -30,7 +30,6 @@
     "fastify": "^5.9.0",
     "octokit": "^5.0.5",
     "pino": "^9.4.0",
-    "pino-pretty": "^11.2.2",
     "simple-git": "^3.26.0",
     "typebox": "1.1.38",
     "yaml": "^2.9.0",

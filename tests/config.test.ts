@@ -13,10 +13,22 @@ const validBase = {
 describe("config schema", () => {
   it("parses a valid config and applies defaults", () => {
     const c = NoodleConfigSchema.parse(validBase);
-    expect(c.profiles.cheap.thinking_level).toBe("off"); // default
+    expect(c.agent_name).toBe("Noodle"); // default
+    expect(c.profiles.cheap.thinking_level).toBe("medium"); // default
+    expect(c.profiles.cheap.reasoning).toBe(false); // default
     expect(c.profiles.cheap.tools).toContain("read"); // default tool set
     expect(c.profiles.cheap.api_rpm).toBe(30); // default rate limit
     expect(c.routing).toHaveLength(1);
+  });
+
+  it("accepts a custom agent_name", () => {
+    const c = NoodleConfigSchema.parse({ ...validBase, agent_name: "MyBot" });
+    expect(c.agent_name).toBe("MyBot");
+  });
+
+  it("rejects an empty agent_name", () => {
+    const r = NoodleConfigSchema.safeParse({ ...validBase, agent_name: "" });
+    expect(r.success).toBe(false);
   });
 
   it("defaults api_rpm to 30 and accepts 0 as unlimited", () => {
@@ -111,5 +123,62 @@ describe("Phase 2 config blocks", () => {
       scheduler: { enabled: true, interval_minutes: 5, repos: ["a/b", "c/d"] },
     });
     expect(crossValidate(c)).toHaveLength(0);
+  });
+});
+
+describe("Phase 3 config blocks (run + queue)", () => {
+  it("applies defaults when run/queue are omitted", () => {
+    const c = NoodleConfigSchema.parse(validBase);
+    expect(c.run).toEqual({ stall_timeout_minutes: 15, tool_stall_minutes: 60 });
+    expect(c.queue).toEqual({ concurrency: 1, max_attempts: 3, retry_backoff_seconds: 60 });
+  });
+
+  it("parses an explicit run block with both budgets", () => {
+    const c = NoodleConfigSchema.parse({
+      ...validBase,
+      run: { stall_timeout_minutes: 30, tool_stall_minutes: 120 },
+    });
+    expect(c.run.stall_timeout_minutes).toBe(30);
+    expect(c.run.tool_stall_minutes).toBe(120);
+  });
+
+  it("parses an explicit queue block", () => {
+    const c = NoodleConfigSchema.parse({
+      ...validBase,
+      queue: { concurrency: 2, max_attempts: 5, retry_backoff_seconds: 120 },
+    });
+    expect(c.queue.concurrency).toBe(2);
+    expect(c.queue.max_attempts).toBe(5);
+    expect(c.queue.retry_backoff_seconds).toBe(120);
+  });
+
+  it("accepts stall_timeout_minutes: 0 (disabled)", () => {
+    const c = NoodleConfigSchema.parse({ ...validBase, run: { stall_timeout_minutes: 0, tool_stall_minutes: 60 } });
+    expect(c.run.stall_timeout_minutes).toBe(0);
+  });
+
+  it("accepts tool_stall_minutes: 0 (falls back to idle budget)", () => {
+    const c = NoodleConfigSchema.parse({ ...validBase, run: { stall_timeout_minutes: 15, tool_stall_minutes: 0 } });
+    expect(c.run.tool_stall_minutes).toBe(0);
+  });
+
+  it("rejects a negative stall_timeout_minutes", () => {
+    const r = NoodleConfigSchema.safeParse({ ...validBase, run: { stall_timeout_minutes: -1 } });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a negative tool_stall_minutes", () => {
+    const r = NoodleConfigSchema.safeParse({ ...validBase, run: { tool_stall_minutes: -1 } });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects concurrency < 1", () => {
+    const r = NoodleConfigSchema.safeParse({ ...validBase, queue: { concurrency: 0 } });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects max_attempts < 1", () => {
+    const r = NoodleConfigSchema.safeParse({ ...validBase, queue: { max_attempts: 0 } });
+    expect(r.success).toBe(false);
   });
 });

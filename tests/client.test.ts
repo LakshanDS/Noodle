@@ -79,6 +79,19 @@ describe("GitHubClient.ensureLabel", () => {
     expect(calls.map((c) => c.method)).toEqual(["getLabel"]); // no createLabel
   });
 
+  it("creates the failed (red) label when missing", async () => {
+    const { client, calls } = makeStub();
+    await client.ensureLabel("owner/repo", "Noodle got Cooked", "b91c1c", "Noodle agent run errored out");
+    expect(calls.map((c) => c.method)).toEqual(["getLabel", "createLabel"]);
+    expect(calls[1].args).toMatchObject({
+      owner: "owner",
+      repo: "repo",
+      name: "Noodle got Cooked",
+      color: "b91c1c",
+      description: "Noodle agent run errored out",
+    });
+  });
+
   it("rethrows non-404 errors from getLabel", async () => {
     const { client } = makeStub({ getLabel: () => { throw httpError("boom", 500); } });
     await expect(client.ensureLabel("owner/repo", "x", "ffffff", "d")).rejects.toThrow("boom");
@@ -131,5 +144,72 @@ describe("GitHubClient.removeIssueLabel", () => {
       removeLabel: () => { throw httpError("boom", 500); },
     });
     await expect(client.removeIssueLabel("owner/repo", 7, "x")).rejects.toThrow("boom");
+  });
+});
+
+describe("GitHubClient.findOpenPRForIssue", () => {
+  /** Build a stubbed octokit whose `pulls.list` returns the given PR shapes. */
+  function makePrStub(prs: Array<{ head: { ref: string } | null; number: number; html_url: string }>) {
+    const calls: { method: string; args: unknown }[] = [];
+    const client = new GitHubClient({
+      rest: {
+        pulls: {
+          list: async (args: unknown) => {
+            calls.push({ method: "list", args });
+            return { data: prs };
+          },
+        },
+      },
+    } as unknown as import("octokit").Octokit);
+    return { client, calls };
+  }
+
+  it("matches the bare first-attempt branch name", async () => {
+    const { client, calls } = makePrStub([
+      { head: { ref: "main" }, number: 1, html_url: "https://x/p/1" },
+      { head: { ref: "noodle/issue-42" }, number: 7, html_url: "https://x/p/7" },
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
+    expect(pr).toEqual({ branch: "noodle/issue-42", number: 7, html_url: "https://x/p/7" });
+    expect(calls[0].args).toMatchObject({ owner: "owner", repo: "repo", state: "open", per_page: 100 });
+  });
+
+  it("matches a suffixed retry branch (noodle/issue-42-abc123)", async () => {
+    const { client } = makePrStub([
+      { head: { ref: "noodle/issue-42-k7m2xa" }, number: 9, html_url: "https://x/p/9" },
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
+    expect(pr?.branch).toBe("noodle/issue-42-k7m2xa");
+  });
+
+  it("returns null when no open PR matches the issue", async () => {
+    const { client } = makePrStub([
+      { head: { ref: "noodle/issue-43" }, number: 5, html_url: "https://x/p/5" }, // different issue
+      { head: { ref: "feature/x" }, number: 6, html_url: "https://x/p/6" },       // unrelated
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
+    expect(pr).toBeNull();
+  });
+
+  it("does not match a different agent's branch for the same issue number", async () => {
+    const { client } = makePrStub([
+      { head: { ref: "otherbot/issue-42" }, number: 8, html_url: "https://x/p/8" },
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
+    expect(pr).toBeNull();
+  });
+
+  it("does not match a leading-substring issue (issue-42 vs issue-423)", async () => {
+    const { client } = makePrStub([
+      { head: { ref: "noodle/issue-423" }, number: 10, html_url: "https://x/p/10" },
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
+    expect(pr).toBeNull(); // pattern anchors with ($|-), so 423 ≠ 42
+  });
+
+  it("returns null for an empty PR list", async () => {
+    const { client } = makePrStub([]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
+    expect(pr).toBeNull();
   });
 });

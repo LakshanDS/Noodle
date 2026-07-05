@@ -13,28 +13,23 @@ export class ConfigError extends Error {
   }
 }
 
-/** Locate the config file: NOODLE_CONFIG env, else ./noodle.config.{yaml,yml}. */
+/** Locate the config file: NOODLE_CONFIG env, else ./noodle.config.yaml. */
 function configPath(): string {
   if (process.env.NOODLE_CONFIG) return resolve(process.env.NOODLE_CONFIG);
-  const cwd = process.cwd();
-  for (const name of ["noodle.config.yaml", "noodle.config.yml"]) {
-    try {
-      const p = resolve(cwd, name);
-      readFileSync(p); // throws if missing
-      return p;
-    } catch {
-      // try next
-    }
+  const p = resolve(process.cwd(), "noodle.config.yaml");
+  try {
+    readFileSync(p); // throws if missing
+    return p;
+  } catch {
+    throw new ConfigError(
+      "No config file found. Set NOODLE_CONFIG or create noodle.config.yaml.",
+      [
+        "Looked for:",
+        "  $NOODLE_CONFIG",
+        "  ./noodle.config.yaml",
+      ],
+    );
   }
-  throw new ConfigError(
-    "No config file found. Set NOODLE_CONFIG or create noodle.config.yaml.",
-    [
-      "Looked for:",
-      "  $NOODLE_CONFIG",
-      "  ./noodle.config.yaml",
-      "  ./noodle.config.yml",
-    ],
-  );
 }
 
 /** Load + zod-validate + cross-validate the config. Throws ConfigError on any problem. */
@@ -47,7 +42,15 @@ export function loadConfig(path?: string): NoodleConfig {
     throw new ConfigError(`Failed to read config ${file}: ${(e as Error).message}`);
   }
 
-  const parsed = NoodleConfigSchema.safeParse(raw);
+  // Env var fallback: NOODLE_AGENT_NAME wins only when the config file doesn't
+  // set `agent_name` explicitly. The env var is useful for Docker/CI where
+  // editing the YAML is awkward.
+  const rawObj = (raw ?? {}) as Record<string, unknown>;
+  if (!("agent_name" in rawObj) && process.env.NOODLE_AGENT_NAME) {
+    rawObj.agent_name = process.env.NOODLE_AGENT_NAME;
+  }
+
+  const parsed = NoodleConfigSchema.safeParse(rawObj);
   if (!parsed.success) {
     throw new ConfigError(
       `Config validation failed for ${file}`,

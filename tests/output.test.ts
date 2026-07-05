@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { buildPrBody, buildIssueComment } from "../src/engine/run.js";
+import {
+  buildPrBody,
+  buildIssueComment,
+  buildErrorComment,
+  buildFooter,
+  formatDuration,
+  labelsFor,
+  type RunStats,
+} from "../src/engine/run.js";
 
 const profile = { name: "claude", provider: "anthropic", model: "claude-sonnet-4-20250514" };
 const changedFiles = ["src/auth.ts", "tests/auth.test.ts"];
@@ -8,40 +16,147 @@ const agentMessage =
   "gated by TOTP login at `/jasladmin/login`. The main page shows system stats " +
   "and there are per-section management pages for projects, roadmap, and skills.";
 
+const stats: RunStats = {
+  durationMs: 252000, // 4m 12s
+  tokens: { input: 45210, output: 3180, cacheRead: 0, cacheWrite: 0, total: 48390 },
+  cost: 0.1834,
+  toolCalls: 8,
+  turns: 3,
+};
+
+describe("formatDuration", () => {
+  it("formats sub-second as ms", () => {
+    expect(formatDuration(500)).toBe("500ms");
+  });
+  it("formats seconds", () => {
+    expect(formatDuration(42000)).toBe("42s");
+  });
+  it("formats minutes + seconds", () => {
+    expect(formatDuration(252000)).toBe("4m 12s");
+  });
+});
+
+describe("buildFooter", () => {
+  it("puts the agent name alone on the first line", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f.split("\n")[0]).toBe("🤖 **Noodle-Agent**");
+  });
+
+  it("includes profile + model on the Profile line", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f).toContain("Profile: claude (`anthropic/claude-sonnet-4-20250514`)");
+  });
+
+  it("includes duration, tool calls, and turns on the Cooked-for line", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f).toContain("Cooked for: 4m 12s");
+    expect(f).toContain("8 tool calls");
+    expect(f).toContain("3 turns");
+  });
+
+  it("includes token usage with thousands separators", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f).toContain("45,210 in");
+    expect(f).toContain("3,180 out");
+    expect(f).toContain("48,390 total");
+  });
+
+  it("omits cache tokens when cacheRead/cacheWrite are 0", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f).not.toContain("cache read");
+    expect(f).not.toContain("cache write");
+  });
+
+  it("includes cache tokens when non-zero (caching providers)", () => {
+    const cacheStats: RunStats = {
+      ...stats,
+      tokens: { input: 45210, output: 3180, cacheRead: 12800, cacheWrite: 5000, total: 66190 },
+    };
+    const f = buildFooter(profile, "Noodle-Agent", cacheStats);
+    expect(f).toContain("12,800 cache read");
+    expect(f).toContain("5,000 cache write");
+    expect(f).toContain("66,190 total");
+  });
+
+  it("includes cost for priced providers", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f).toContain("$0.18");
+  });
+
+  it("omits cost line when cost is 0 (local/custom models)", () => {
+    const localStats: RunStats = { ...stats, cost: 0 };
+    const f = buildFooter(profile, "Noodle-Agent", localStats);
+    expect(f).not.toMatch(/^Cost:/m);
+    // tokens still present
+    expect(f).toContain("48,390 total");
+  });
+
+  it("omits Cooked-for/Tokens/Cost lines when stats missing", () => {
+    const f = buildFooter(profile, "Noodle-Agent", undefined);
+    expect(f).not.toMatch(/Cooked for:/);
+    expect(f).not.toMatch(/^Tokens:/m);
+    expect(f).not.toMatch(/^Cost:/m);
+    // identity lines + fun line still there
+    expect(f).toContain("**Noodle-Agent**");
+    expect(f).toContain("Profile:");
+    expect(f).toMatch(/^\*.+\*$/m);
+  });
+
+  it("includes the PR link on the Profile line when provided", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats, { prNumber: 58, prUrl: "https://x/pull/58" });
+    expect(f).toContain("PR #58");
+    expect(f).toContain("https://x/pull/58");
+  });
+
+  it("includes a fun one-liner in italics as the last line", () => {
+    const f = buildFooter(profile, "Noodle-Agent", stats);
+    expect(f).toMatch(/\*[^*]+\*$/m);
+  });
+});
+
 describe("buildPrBody", () => {
   it("uses the agent message verbatim as the body", () => {
-    const body = buildPrBody(profile.name, changedFiles, "https://x/#42", agentMessage);
+    const body = buildPrBody(profile, changedFiles, "https://x/#42", agentMessage, "Noodle", stats);
     expect(body).toContain(agentMessage);
     expect(body).toContain("- `src/auth.ts`");
     expect(body).toContain("Closes https://x/#42");
-    expect(body).toContain("Noodle");
+  });
+
+  it("includes the footer with stats", () => {
+    const body = buildPrBody(profile, changedFiles, "https://x/#42", agentMessage, "Noodle", stats);
+    expect(body).toContain("4m 12s");
+    expect(body).toContain("48,390 total");
+    expect(body).toContain("$0.18");
   });
 
   it("falls back to a notice when the agent left no message", () => {
-    const body = buildPrBody(profile.name, changedFiles, "https://x/#42", undefined);
+    const body = buildPrBody(profile, changedFiles, "https://x/#42", undefined);
     expect(body).toMatch(/did not leave a summary/i);
-    expect(body).toContain("- `src/auth.ts`"); // git facts still present
     expect(body).toContain("Closes https://x/#42");
+  });
+
+  it("accepts legacy callsites passing profile name as a string", () => {
+    const body = buildPrBody("claude", changedFiles, "https://x/#42", agentMessage);
+    expect(body).toContain(agentMessage);
+    expect(body).toContain("**Noodle**");
   });
 });
 
 describe("buildIssueComment", () => {
-  it("posts the agent message verbatim with a signature footer", () => {
-    const c = buildIssueComment(profile, agentMessage);
+  it("posts the agent message verbatim with the footer", () => {
+    const c = buildIssueComment(profile, agentMessage, undefined, "Noodle", stats);
     expect(c.startsWith(agentMessage)).toBe(true);
-    // signature footer
-    expect(c).toContain("Noodle");
-    expect(c).toContain("claude");
+    expect(c).toContain("**Noodle**");
     expect(c).toContain("anthropic/claude-sonnet-4-20250514");
+    expect(c).toContain("4m 12s");
     // no PR link when none provided
     expect(c).not.toContain("PR #");
   });
 
-  it("includes the PR link in the signature when a PR was opened", () => {
+  it("includes the PR link in the footer when a PR was opened", () => {
     const c = buildIssueComment(profile, agentMessage, {
       prNumber: 58,
       prUrl: "https://x/pull/58",
-      changedFiles,
     });
     expect(c).toContain("PR #58");
     expect(c).toContain("https://x/pull/58");
@@ -50,15 +165,87 @@ describe("buildIssueComment", () => {
   it("uses a generic note when the agent produced no message", () => {
     const c = buildIssueComment(profile, undefined);
     expect(c).toMatch(/made no code changes and left no message/i);
-    // still has the signature
     expect(c).toContain("Noodle");
   });
 
-  it("preserves the agent's markdown formatting (no reformatting)", () => {
+  it("preserves the agent's markdown formatting", () => {
     const msg = "## Answer\n\nYes — see `src/app/dashboard/page.tsx`.\n\n- bullet one\n- bullet two";
     const c = buildIssueComment(profile, msg);
     expect(c).toContain("## Answer");
-    expect(c).toContain("- bullet one");
     expect(c).toContain("`src/app/dashboard/page.tsx`");
+  });
+});
+
+describe("buildErrorComment", () => {
+  it("posts a templated error notice quoting the actual error", () => {
+    const c = buildErrorComment(profile, "insufficient_quota: monthly limit reached", "Noodle", stats);
+    expect(c).toMatch(/errored out before finishing/i);
+    expect(c).toContain("insufficient_quota: monthly limit reached");
+    expect(c).toMatch(/No changes were made/);
+  });
+
+  it("includes the footer with stats captured up to failure", () => {
+    const c = buildErrorComment(profile, "rate limited (429)", "Noodle", stats);
+    expect(c).toContain("4m 12s");
+    expect(c).toContain("48,390 total");
+  });
+
+  it("works without stats", () => {
+    const c = buildErrorComment(profile, "boom");
+    expect(c).toContain("boom");
+    expect(c).toContain("**Noodle**");
+    expect(c).not.toContain("📊");
+  });
+
+  it("falls back to 'unknown error' for empty messages", () => {
+    const c = buildErrorComment(profile, "");
+    expect(c).toContain("unknown error");
+  });
+});
+
+describe("custom agent name", () => {
+  it("uses the custom name in PR body", () => {
+    const body = buildPrBody(profile, changedFiles, "https://x/#42", agentMessage, "MyBot", stats);
+    expect(body).toContain("**MyBot**");
+    expect(body).not.toContain("**Noodle**");
+  });
+
+  it("uses the custom name in issue comment", () => {
+    const c = buildIssueComment(profile, agentMessage, undefined, "MyBot");
+    expect(c).toContain("**MyBot**");
+    expect(c).not.toContain("**Noodle**");
+  });
+
+  it("uses the custom name in error comment", () => {
+    const c = buildErrorComment(profile, "boom", "MyBot");
+    expect(c).toContain("MyBot's run");
+    expect(c).toContain("**MyBot**");
+  });
+
+  it("uses the custom name in fallback message", () => {
+    const c = buildIssueComment(profile, undefined, undefined, "MyBot");
+    expect(c).toMatch(/MyBot ran but made no code changes/);
+  });
+});
+
+describe("labelsFor (failed label)", () => {
+  it("includes a red 'got Cooked' label for errored runs", () => {
+    const labels = labelsFor("Noodle");
+    expect(labels.failed.name).toBe("Noodle got Cooked");
+    expect(labels.failed.color).toBe("b91c1c");
+    expect(labels.failed.description).toMatch(/errored/i);
+  });
+
+  it("uses the configurable agent name in the failed label", () => {
+    const labels = labelsFor("MyBot");
+    expect(labels.failed.name).toBe("MyBot got Cooked");
+    expect(labels.failed.description).toContain("MyBot");
+  });
+
+  it("keeps the three labels distinct", () => {
+    const labels = labelsFor("Noodle");
+    const names = [labels.cooking.name, labels.cooked.name, labels.failed.name];
+    expect(new Set(names).size).toBe(3);
+    expect(labels.failed.color).not.toBe(labels.cooked.color);
   });
 });

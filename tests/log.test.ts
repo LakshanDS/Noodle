@@ -1,100 +1,122 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { createRunLogger } from "../src/util/log.js";
-
-/** Wait until the file at `filePath` contains at least `minLines` lines. */
-async function waitForLines(filePath: string, minLines: number, timeoutMs = 1000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const content = readFileSync(filePath, "utf8").trim();
-      if (content && content.split("\n").length >= minLines) return;
-    } catch {
-      // file not readable yet — keep waiting
-    }
-    await new Promise((r) => setTimeout(r, 10));
-  }
-  throw new Error(`timed out waiting for ${minLines} lines in ${filePath}`);
-}
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { Writable } from "node:stream";
 
 /**
- * createRunLogger reads NOODLE_LOGS_DIR lazily, so we point it at a throwaway
- * tmp dir per test, build a logger, await `ready` (the file fd is open), write,
- * then read the file back and assert valid JSON-Lines + the bound context.
+ * The custom formatter in src/util/log.ts writes to `process.stdout`. To assert
+ * on the rendered output we spy on stdout.write — which works here because, unlike
+ * pino-pretty's worker-thread transport, our formatter runs in-process and writes
+ * synchronously through `process.stdout.write`.
  */
-let dir: string;
-const createdDirs: string[] = [];
+
+let chunks: string[];
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "noodle-log-"));
-  createdDirs.push(dir);
-  process.env.NOODLE_LOGS_DIR = dir;
-  process.env.NOODLE_JSON_LOGS = "1"; // pick the JSON-stdout branch regardless of tty
+  vi.resetModules();
+  chunks = [];
 });
 
 afterEach(() => {
-  for (const d of createdDirs) rmSync(d, { recursive: true, force: true });
-  createdDirs.length = 0;
-  delete process.env.NOODLE_LOGS_DIR;
-  delete process.env.NOODLE_JSON_LOGS;
+  vi.restoreAllMocks();
+  delete process.env.LOG_LEVEL;
 });
 
-describe("createRunLogger", () => {
-  it("writes valid newline-delimited JSON to logs/<branch-slug>.log", async () => {
-    const { log, filePath, ready } = createRunLogger("noodle/issue-42-abc12345", {
-      jobId: "job-1",
-      repo: "owner/name",
-      issue: 42,
-    });
-    await ready;
-    log.info({ step: "clone" }, "cloned repo");
-    log.info({ step: "commit" }, "committed");
-    await waitForLines(filePath, 2);
+/** Spy on stdout, load the module fresh (so LOG_LEVEL is re-read), return helpers. */
+async function loadLog() {
+  const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    chunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+    return true;
+  });
+  const mod = await import("../src/util/log.js");
+  return { mod, output: () => chunks.join(""), spy };
+}
 
-    const content = readFileSync(filePath, "utf8").trim();
-    const lines = content.split("\n");
-    expect(lines).toHaveLength(2);
-    for (const line of lines) {
-      const obj = JSON.parse(line); // throws if not valid JSON
-      expect(obj.msg).toBeTypeOf("string");
-    }
+describe("log", () => {
+  it("renders a human-readable line: [timestamp] LEVEL: message", async () => {
+    const { mod, output } = await loadLog();
+    mod.log.info("hello world");
+    const line = output().trim().split("\n").pop()!;
+    expect(line).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] INFO: hello world$/);
+    expect(line.startsWith("{")).toBe(false); // not JSON
   });
 
-  it("slugifies the branch name (/ -> -) for the filename", async () => {
-    const { filePath, ready } = createRunLogger("noodle/issue-7-xyz", { jobId: "j", repo: "o/r", issue: 7 });
-    await ready;
-    expect(filePath).toMatch(/[\\/]noodle-issue-7-xyz\.log$/);
+  it("does not emit raw JSON objects", async () => {
+    const { mod, output } = await loadLog();
+    mod.log.info({ foo: "bar", n: 42 }, "started");
+    const line = output().trim().split("\n").pop()!;
+    expect(line.startsWith("{")).toBe(false);
+    expect(line).toContain("started");
+    expect(line).toContain("foo=bar");
+    expect(line).toContain("n=42");
   });
 
-  it("binds the context fields onto every log line", async () => {
-    const { log, filePath, ready } = createRunLogger("noodle/issue-9-a1", {
+  it("respects LOG_LEVEL env var", async () => {
+    process.env.LOG_LEVEL = "error";
+    const { mod, output } = await loadLog();
+    mod.log.info("should-not-appear");
+    mod.log.error("should-appear");
+    const out = output();
+    expect(out).toContain("should-appear");
+    expect(out).not.toContain("should-not-appear");
+  });
+
+  it("defaults LOG_LEVEL to info when unset", async () => {
+    delete process.env.LOG_LEVEL;
+    const { mod } = await loadLog();
+    expect(mod.log.level).toBe("info");
+  });
+
+  it("renders all severity levels", async () => {
+    process.env.LOG_LEVEL = "trace";
+    const { mod, output } = await loadLog();
+    mod.log.trace("t"); mod.log.debug("d"); mod.log.info("i"); mod.log.warn("w"); mod.log.error("e");
+    const out = output();
+    expect(out).toMatch(/\bTRACE: t/);
+    expect(out).toMatch(/\bDEBUG: d/);
+    expect(out).toMatch(/\bINFO: i/);
+    expect(out).toMatch(/\bWARN: w/);
+    expect(out).toMatch(/\bERROR: e/);
+  });
+});
+
+describe("runLogger", () => {
+  it("suppresses run-context fields from the trailing key=value dump", async () => {
+    // Run context (jobId, repo, issue, branch, pid) is bound to the raw JSON
+    // for grep/tools, but the pretty formatter hides it from per-event lines —
+    // it's printed once on the run-header banner instead.
+    const { mod, output } = await loadLog();
+    const log_ = mod.runLogger({ jobId: "job-9", repo: "owner/repo", issue: 9, branch: "b", pid: 1 });
+    log_.info("running");
+    const line = output().trim().split("\n").pop()!;
+    expect(line).toContain("running");
+    expect(line).not.toContain("jobId=");
+    expect(line).not.toContain("repo=");
+    expect(line).not.toContain("issue=");
+    expect(line).not.toContain("branch=");
+  });
+
+  it("binds context onto the raw JSON (accessible via bindings())", async () => {
+    const { mod } = await loadLog();
+    const log_ = mod.runLogger({ jobId: "job-9", repo: "owner/repo", issue: 9 });
+    expect(log_.bindings()).toMatchObject({
       jobId: "job-9",
       repo: "owner/repo",
       issue: 9,
-      branch: "noodle/issue-9-a1",
     });
-    await ready;
-    log.info("hello");
-    await waitForLines(filePath, 1);
-
-    const obj = JSON.parse(readFileSync(filePath, "utf8").trim());
-    expect(obj.jobId).toBe("job-9");
-    expect(obj.repo).toBe("owner/repo");
-    expect(obj.issue).toBe(9);
-    expect(obj.branch).toBe("noodle/issue-9-a1");
-    expect(obj.msg).toBe("hello");
   });
 
-  it("creates the logs directory if it does not exist", async () => {
-    const nested = join(dir, "deeper", "logs");
-    process.env.NOODLE_LOGS_DIR = nested;
-    const { log, filePath, ready } = createRunLogger("noodle/issue-1-z", { jobId: "j", repo: "o/r", issue: 1 });
-    await ready;
-    log.info("deep");
-    await waitForLines(filePath, 1);
-    expect(filePath.startsWith(nested)).toBe(true);
-    expect(readFileSync(filePath, "utf8").trim().length).toBeGreaterThan(0);
+  it("inherits the parent's level", async () => {
+    process.env.LOG_LEVEL = "warn";
+    const { mod } = await loadLog();
+    const log_ = mod.runLogger({ jobId: "x" });
+    expect(log_.level).toBe("warn");
+  });
+
+  it("still renders non-context fields as key=value", async () => {
+    const { mod, output } = await loadLog();
+    const log_ = mod.runLogger({ jobId: "job-9" });
+    log_.info({ step: "clone", durationMs: 42 }, "cloned");
+    const line = output().trim().split("\n").pop()!;
+    expect(line).toContain("step=clone");
+    expect(line).toContain("durationMs=42");
   });
 });

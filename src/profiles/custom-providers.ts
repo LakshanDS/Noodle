@@ -26,14 +26,37 @@ export function registerCustomProviders(config: NoodleConfig, registry: ModelReg
             name: profile.model,
             contextWindow: profile.context_window ?? 32768,
             maxTokens: profile.max_tokens ?? 8192,
-            reasoning: false,
+            // Opt-in: only true when the profile declares `reasoning: true`.
+            // pi-ai gates all thinking-format handling on this flag, so a custom
+            // endpoint must set it to receive the thinking_level.
+            reasoning: profile.reasoning,
             input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            // USD per 1M tokens. Custom endpoints are $0 unless the profile sets
+            // the *_price fields; pi computes cost from these during the run.
+            // cache_read_price / cache_write_price matter only for providers that
+            // expose prompt caching (e.g. an Anthropic-protocol proxy).
+            cost: {
+              input: profile.input_token_price,
+              output: profile.output_token_price,
+              cacheRead: profile.cache_read_price,
+              cacheWrite: profile.cache_write_price,
+            },
           },
         ],
       });
+      const priced =
+        profile.input_token_price > 0 ||
+        profile.output_token_price > 0 ||
+        profile.cache_read_price > 0 ||
+        profile.cache_write_price > 0;
       log.info(
-        { profile: name, provider: profile.provider, api: profile.api, baseUrl: profile.base_url },
+        {
+          profile: name,
+          provider: profile.provider,
+          api: profile.api,
+          baseUrl: profile.base_url,
+          priced,
+        },
         "registered custom provider",
       );
     } catch (e) {

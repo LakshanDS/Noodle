@@ -6,6 +6,7 @@ import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/aut
 import { runJob } from "../engine/run.js";
 import { loadConfig } from "../config/load.js";
 import { log } from "../util/log.js";
+import { slugify } from "../util/slugify.js";
 import type { NoodleConfig } from "../config/schema.js";
 
 /**
@@ -33,17 +34,35 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
 
   // The worker's runJobFn: resolve auth for the job's repo, build a GitHubClient,
   // and call the existing engine.runJob with the token + run store plumbed through.
+  // Providers re-call forRepo() at each git+HTTP op so a long-running job (2h+)
+  // re-mints its token after the GitHub-App installation token's 1h TTL expires.
+  // The auth provider caches, so the repeated calls are hash lookups.
   const runJobFn: RunJobFn = async (job) => {
-    const { gh, token } = await authProvider.forRepo(job.repo, job.installation_id ?? undefined);
-    await runJob(config, gh, {
+    const instId = job.installation_id ?? undefined;
+    const initial = await authProvider.forRepo(job.repo, instId);
+    await runJob(config, initial.gh, {
       repo: job.repo,
       issueNumber: job.issue_number,
       jobId: `job-${job.id}`,
-      token,
-    }, { runStore });
+      token: initial.token,
+    }, {
+      runStore,
+      tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
+      ghProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.gh),
+    });
   };
 
-  const worker = new QueueWorker(queue, runJobFn);
+  // Worker pool: N workers pulling from the shared queue. `claimNext` is
+  // transactional so two workers never grab the same job. Default concurrency is
+  // 1 (safe for a small VPS — each agent run holds a workspace + pi session in
+  // memory); raise via `queue.concurrency` only with headroom.
+  const concurrency = config.queue.concurrency;
+  const workerOpts = {
+    maxAttempts: config.queue.max_attempts,
+    retryBackoffSec: config.queue.retry_backoff_seconds,
+  };
+  const workers = Array.from({ length: concurrency }, () => new QueueWorker(queue, runJobFn, workerOpts));
+  log.info({ concurrency, maxAttempts: workerOpts.maxAttempts }, "worker pool configured");
 
   // Webhook handler → enqueue into the queue.
   const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET ?? "";
@@ -51,21 +70,22 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     log.warn("GITHUB_WEBHOOK_SECRET not set — webhook signatures cannot be verified. Set it before exposing the server.");
   }
 
-  // Noodle's own login — used to scope `assigned` events to assignments that
-  // target Noodle. App mode reads NOODLE_LOGIN (declared); PAT mode resolves it
-  // once from the API. Left undefined, `assigned` events are ignored.
-  const selfLogin = await resolveSelfLogin(authProvider).catch((e) => {
-    log.warn({ err: e }, "could not resolve Noodle's own login; `assigned` events will be ignored");
+  // The agent's own login — used to scope `assigned` events to assignments that
+  // target the agent. Derived from agent_name (e.g. "Noodle" → "noodle-agent")
+  // unless NOODLE_LOGIN is set explicitly.
+  const selfLogin = await resolveSelfLogin(authProvider, config.agent_name).catch((e) => {
+    log.warn({ err: e }, "could not resolve agent login; `assigned` events will be ignored");
     return undefined;
   });
   if (selfLogin) {
     log.info({ selfLogin }, "assignment trigger scoped to this login");
   } else {
-    log.warn("set NOODLE_LOGIN to enable the assignment trigger (Noodle will ignore `assigned` events until then)");
+    log.warn("set NOODLE_LOGIN to enable the assignment trigger (`assigned` events will be ignored until then)");
   }
 
   const app = createWebhookApp(webhookSecret, {
     selfLogin,
+    agentName: config.agent_name,
     enqueue: async (intent) => {
       queue.enqueue({
         repo: intent.repo,
@@ -101,8 +121,8 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     scheduler = new Scheduler(config, schedulerDeps);
   }
 
-  // --- Boot order: worker first (drains backlog), then http, then scheduler. ---
-  const workerPromise = worker.run();
+  // --- Boot order: workers first (drain backlog), then http, then scheduler. ---
+  const workerPromises = Promise.all(workers.map((w) => w.run()));
 
   await app.listen({ host, port });
   log.info({ host, port }, "webhook server listening");
@@ -116,9 +136,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     shuttingDown = true;
     log.info({ signal }, "shutting down");
     scheduler?.stop();
-    worker.stop();
+    for (const w of workers) w.stop();
     await app.close().catch((e) => log.error({ err: e }, "http close error"));
-    await workerPromise.catch(() => {}); // worker exits its loop
+    await workerPromises.catch(() => {}); // all workers exit their loops
     queue.close();
     log.info("shutdown complete");
     process.exit(0);
@@ -127,24 +147,32 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   // Keep this function alive until shutdown exits the process.
-  await workerPromise;
+  await workerPromises;
 }
 
 /**
- * Resolve Noodle's own login so the `assigned` webhook trigger can be scoped to
- * assignments that target Noodle (not human-to-human reshuffles).
+ * Resolve the agent's own login so the `assigned` webhook trigger can be scoped
+ * to assignments that target the agent (not human-to-human reshuffles).
  *
  * - Explicit: `NOODLE_LOGIN` always wins (also the only source in App mode,
  *   where fetching "our own login" would need an extra round-trip per event).
- * - PAT fallback: query `/user` once with the configured token.
- * - App mode without NOODLE_LOGIN: returns undefined → `assigned` is ignored.
+ * - Default: derived from `agent_name` → `<slug>-agent` (e.g. "Noodle" → "noodle-agent").
+ * - PAT fallback: if no env var and not App mode, query `/user` once.
+ * - App mode without NOODLE_LOGIN: returns the derived default.
  */
-async function resolveSelfLogin(authProvider: AuthProvider): Promise<string | undefined> {
+async function resolveSelfLogin(authProvider: AuthProvider, agentName: string): Promise<string | undefined> {
   const fromEnv = process.env.NOODLE_LOGIN?.trim();
   if (fromEnv) return fromEnv;
-  if (isAppMode()) return undefined; // App mode has no cheap "me" lookup.
-  const { gh } = await authProvider.forRepo("__self__");
-  return gh.currentUserLogin();
+  // Derive a sensible default from the agent name.
+  const derived = `${slugify(agentName)}-agent`;
+  if (isAppMode()) return derived; // App mode: use derived default.
+  // PAT mode: try to resolve from the API, fall back to derived default.
+  try {
+    const { gh } = await authProvider.forRepo("__self__");
+    return gh.currentUserLogin();
+  } catch {
+    return derived;
+  }
 }
 
 /**

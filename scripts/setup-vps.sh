@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run this ONCE on your VPS to set up noodle-bot.
+# Run this ONCE on your VPS to set up the noodle-agent.
 # Usage: bash setup-vps.sh
 
 set -euo pipefail
 
-INSTALL_DIR="/opt/noodle-bot"
+INSTALL_DIR="/opt/noodle-agent"
 
 echo "==> Creating install directory"
 sudo mkdir -p "$INSTALL_DIR"
@@ -19,7 +19,7 @@ cat > "$INSTALL_DIR/.env" << 'EOF'
 GITHUB_APP_ID=
 GITHUB_PRIVATE_KEY=
 GITHUB_WEBHOOK_SECRET=
-NOODLE_LOGIN=noodle-bot
+NOODLE_LOGIN=noodle-agent
 
 # LLM
 ANTHROPIC_API_KEY=

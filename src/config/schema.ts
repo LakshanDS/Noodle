@@ -56,7 +56,31 @@ export const ProfileSchema = z.object({
   /** Model metadata for custom endpoints (pi needs context window etc.). */
   context_window: z.number().int().positive().optional(),
   max_tokens: z.number().int().positive().optional(),
-  thinking_level: ThinkingLevel.default("off"),
+  /**
+   * USD per 1M tokens — for cost reporting on custom endpoints, which pi
+   * otherwise prices at $0. Set to your provider's published rates (e.g.
+   * DeepSeek: input=0.14, output=0.28). Ignored for built-in providers, which
+   * use pi-ai's built-in price table. 0 (default) = that token type isn't
+   * priced (the corresponding cost contribution is $0).
+   *
+   * cache_read_price / cache_write_price only matter for providers that support
+   * prompt caching (e.g. an Anthropic-protocol proxy). Most OpenAI-compatible
+   * endpoints don't expose caching — leave them at 0.
+   */
+  input_token_price: z.number().min(0).default(0),
+  output_token_price: z.number().min(0).default(0),
+  cache_read_price: z.number().min(0).default(0),
+  cache_write_price: z.number().min(0).default(0),
+  /**
+   * Whether this model supports reasoning/thinking. For built-in providers
+   * (anthropic, openai o-series) pi-ai knows this automatically. For custom
+   * endpoints, set `reasoning: true` when the underlying model is a
+   * reasoning-capable one (DeepSeek-R1, Qwen3-Thinking, o-series proxy) so the
+   * thinking_level is forwarded; otherwise leave false (default) and the level
+   * is silently dropped. See pi-ai's per-provider thinking-format handling.
+   */
+  reasoning: z.boolean().default(false),
+  thinking_level: ThinkingLevel.default("medium"),
   tools: z.array(z.string()).default([...BUILTIN_TOOLS]),
   system_prompt_file: z.string().optional(),
   /**
@@ -111,7 +135,52 @@ export const SchedulerConfigSchema = z.object({
 });
 export type SchedulerConfig = z.infer<typeof SchedulerConfigSchema>;
 
+/**
+ * Per-run controls. The stall watcher aborts a run that has emitted no agent
+ * activity (tool calls, turns, messages, tool output, compactions) for N
+ * minutes — a strong signal of a hang (dropped socket, deadlock) that a
+ * wall-clock timeout can't distinguish from a healthy hours-long run. See
+ * src/engine/stall.ts for the two-budget design.
+ */
+export const RunConfigSchema = z.object({
+  /**
+   * Abort after this many minutes of silence while NO tool is running — i.e.
+   * the agent is between turns or waiting on an LLM call. Silence here usually
+   * means a dropped connection or deadlocked loop; catch it fast. 0 = off.
+   * Default 15.
+   */
+  stall_timeout_minutes: z.number().int().min(0).default(15),
+  /**
+   * Abort after this many minutes of silence while a tool IS running — e.g. a
+   * build, a test suite, a slow clone. Silence here is normal (a bash command
+   * only emits events when the process writes output), so this must be larger
+   * than stall_timeout_minutes. It still catches a genuinely hung tool; a chatty
+   * build (which emits tool_execution_update) never trips it. Falls back to
+   * stall_timeout_minutes when set to 0. Default 60.
+   */
+  tool_stall_minutes: z.number().int().min(0).default(60),
+});
+export type RunConfig = z.infer<typeof RunConfigSchema>;
+
+/**
+ * Job-queue behavior: how many jobs run at once, and how failed jobs are
+ * retried. The worker pool shares one SQLite queue; `concurrency` is the number
+ * of workers pulling from it. Raise carefully on a small VPS — each concurrent
+ * agent run holds a workspace + a pi session in memory. Defaults are safe.
+ */
+export const QueueConfigSchema = z.object({
+  /** Max jobs running at once. */
+  concurrency: z.number().int().min(1).default(1),
+  /** Total attempts per job (1 = no retry). */
+  max_attempts: z.number().int().min(1).default(3),
+  /** Base backoff seconds; doubles each attempt, capped at 10 min. */
+  retry_backoff_seconds: z.number().int().min(1).default(60),
+});
+export type QueueConfig = z.infer<typeof QueueConfigSchema>;
+
 export const NoodleConfigSchema = z.object({
+  /** Display name used in issue labels, comments, PR bodies, branch names, etc. */
+  agent_name: z.string().min(1).default("Noodle"),
   default_profile: z.string().min(1),
   profiles: z.record(z.string(), ProfileSchema),
   routing: z.array(RoutingRuleSchema).nullish().transform((v) => v ?? []),
@@ -122,6 +191,12 @@ export const NoodleConfigSchema = z.object({
     enabled: false,
     interval_minutes: 30,
     repos: [],
+  }),
+  run: RunConfigSchema.nullish().transform((v) => v ?? { stall_timeout_minutes: 15, tool_stall_minutes: 60 }),
+  queue: QueueConfigSchema.nullish().transform((v) => v ?? {
+    concurrency: 1,
+    max_attempts: 3,
+    retry_backoff_seconds: 60,
   }),
 });
 export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;

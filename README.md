@@ -279,7 +279,7 @@ GITHUB_APP_ID=123456
 GITHUB_PRIVATE_KEY_FILE=/path/to/app.private-key.pem   # or paste the PEM inline
 GITHUB_WEBHOOK_SECRET=whsecret                          # matches the App's webhook secret
 ANTHROPIC_API_KEY=sk-ant-xxx                            # whichever provider(s) you use
-NOODLE_LOGIN=noodle-bot                                 # the App's bot login, to scope `assigned`
+NOODLE_LOGIN=noodle-agent                               # the App's bot login, to scope `assigned`
 ```
 
 PAT mode (`GITHUB_TOKEN`) still works for `noodle serve` if you don't want a

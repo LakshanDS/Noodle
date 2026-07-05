@@ -1,12 +1,22 @@
 # Noodle configuration.
 # Copy to `noodle.config.yaml` and edit. Secrets live in `.env`, not here.
 
+# Display name used in issue labels, comments, PR bodies, branch names, slash
+# command, and every other user-facing string. Change this to rebrand the agent.
+agent_name: Noodle
+
 # Default profile used when no routing rule matches an issue.
 default_profile: cheap
 
 # Agent profiles. Each pins a model (via @earendil-works/pi-ai) and a tool set.
 # `provider` + `model` select the model. `base_url` overrides the endpoint
 # (for local / OpenAI-compatible servers like Ollama).
+#
+# `thinking_level` controls how much the model "reasons" before answering.
+# Built-in reasoning models (Anthropic Claude w/ thinking, OpenAI o-series,
+# gpt-5) honor it; non-reasoning models (gpt-4o, haiku, etc.) silently ignore
+# it. Default everywhere below is "medium". Custom endpoints must ALSO set
+# `reasoning: true` for the level to take effect.
 profiles:
   claude:
     provider: anthropic
@@ -17,13 +27,13 @@ profiles:
   cheap:
     provider: openrouter
     model: anthropic/claude-3-5-haiku
-    thinking_level: "off"
+    thinking_level: medium
     tools: [read, grep, find, ls]
 
   openai:
     provider: openai
     model: gpt-4o-mini
-    thinking_level: "off"
+    thinking_level: medium
     tools: [read, bash, edit, write, grep, find, ls]
 
   # Example local model. Requires LOCAL_BASE_URL in .env and a running server.
@@ -31,12 +41,19 @@ profiles:
     provider: ollama
     base_url: http://localhost:11434/v1
     model: qwen2.5-coder:32b
-    thinking_level: "off"
+    thinking_level: medium
     tools: [read, bash, edit, write, grep, find, ls]
 
   # Any OpenAI-compatible endpoint: vLLM, LM Studio, DeepSeek, Cerebras, a proxy.
   # `api` picks the wire protocol; `api_key_env` is the env var holding the key
   # (omit it for no-auth local endpoints like Ollama).
+  # `*_price` fields are USD per 1M tokens — set them to your provider's published
+  # rates so the run footer reports real cost (pi computes it automatically).
+  # `cache_read_price` / `cache_write_price` only matter for providers that
+  # support prompt caching (e.g. an Anthropic-protocol proxy); leave 0 otherwise.
+  # `reasoning: true` opts the endpoint into thinking_level forwarding — set it
+  # only when the underlying model is reasoning-capable (DeepSeek-R1, Qwen3,
+  # o-series proxy) and speaks a format pi-ai recognizes.
   vllm:
     provider: vllm
     api: openai-completions
@@ -45,7 +62,12 @@ profiles:
     api_key_env: VLLM_API_KEY        # optional for local no-auth servers
     context_window: 131072
     max_tokens: 32000
-    thinking_level: "off"
+    input_token_price: 0.90          # USD per 1M input tokens
+    output_token_price: 0.90         # USD per 1M output tokens
+    # cache_read_price: 0.09         # only if the endpoint supports caching
+    # cache_write_price: 1.13
+    # reasoning: true                # only for reasoning-capable models
+    thinking_level: medium
     tools: [read, bash, edit, write, grep, find, ls]
 
   # Rate-limited provider example. Set api_rpm when a provider caps requests per
@@ -60,7 +82,7 @@ profiles:
     api_rpm: 40
     context_window: 131072
     max_tokens: 8192
-    thinking_level: "off"
+    thinking_level: medium
     tools: [read, bash, edit, write, grep, find, ls]
 
   # Any Anthropic-protocol endpoint: a self-hosted proxy, Cloudflare/Fireworks
@@ -73,7 +95,7 @@ profiles:
     api_key_env: ACME_LLM_KEY
     context_window: 200000
     max_tokens: 8192
-    thinking_level: "off"
+    thinking_level: medium
     tools: [read, bash, edit, write, grep, find, ls]
 
 # Routing rules — evaluated top-to-bottom, first match wins.
@@ -114,3 +136,35 @@ repos:
 #   interval_minutes: 30
 #   repos:
 #     - owner/name
+
+# --- Phase 3: run + queue hardening (all optional) --------------------------
+# Both apply to `noodle serve` AND `noodle run` (the stall watcher guards CLI
+# runs too). Defaults shown — omit a block to use them.
+
+# Per-run controls.
+# run:
+#   # Abort a run that has emitted no agent activity (tool calls, turns, messages,
+#   # compaction, retries) for this many minutes WHILE NO TOOL IS RUNNING. Silence
+#   # while waiting on an LLM call usually means a dropped connection — catch it
+#   # fast. A healthy long run emits events constantly. 0 disables it. Default: 15.
+#   stall_timeout_minutes: 15
+#   # Abort after this many minutes of silence WHILE A TOOL IS RUNNING. A bash
+#   # command building/running tests legitimately produces no events until it
+#   # writes output, so this must be larger than stall_timeout_minutes. A chatty
+#   # build (which emits tool_execution_update constantly) never trips it; only a
+#   # genuinely hung tool does. Falls back to stall_timeout_minutes when set to 0.
+#   # Default: 60.
+#   tool_stall_minutes: 60
+
+# Job-queue behavior.
+# queue:
+#   # Max jobs running at once. Each holds a workspace + pi session in memory; on
+#   # a small VPS keep this at 1. Raise only with headroom.
+#   concurrency: 1
+#   # Total attempts per job (1 = no retry). Retries skip permanent errors (auth,
+#   # config, model-not-found) and stall timeouts; everything else (network blips,
+#   # transient 5xx) is retried with exponential backoff. Pi retries 429s itself.
+#   max_attempts: 3
+#   # Base backoff seconds for retries. Doubles each attempt, capped at 10 min:
+#   # attempt 1→60s, 2→120s, 3→240s, …
+#   retry_backoff_seconds: 60

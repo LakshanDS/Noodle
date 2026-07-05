@@ -1,12 +1,12 @@
 services:
   noodle:
     image: ghcr.io/lakshands/noodle-agent:latest
-    container_name: noodle-bot
+    container_name: noodle-agent
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    network_mode: host
     volumes:
       - noodle-data:/data
+      - ./noodle.config.yaml:/app/noodle.config.yaml:ro
     env_file:
       - .env
     healthcheck:

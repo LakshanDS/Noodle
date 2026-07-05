@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { slugify } from "../util/slugify.js";
 
 /**
  * Pure webhook helpers — HMAC signature verification and event parsing.
@@ -56,6 +57,7 @@ export function parseWebhookEvent(
   event: string,
   payload: unknown,
   selfLogin?: string,
+  agentName = "Noodle",
 ): WebhookIntent | null {
   const p = payload as {
     action?: string;
@@ -95,9 +97,10 @@ export function parseWebhookEvent(
 
   if (event === "issue_comment") {
     if (p.action !== "created") return null;
-    // Slash-command rerun: only react to comments starting with /noodle.
+    // Slash-command rerun: only react to comments starting with /<agent>.
     const body = (p.comment?.body ?? "").trim();
-    if (!/^\/noodle\b/i.test(body)) return null;
+    const cmd = slugify(agentName);
+    if (!new RegExp(`^\\/${cmd}\\b`, "i").test(body)) return null;
     return { kind: "comment", repo, issueNumber, installationId };
   }
 

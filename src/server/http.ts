@@ -20,6 +20,8 @@ export interface WebhookHandlerDeps {
    * target Noodle (ignored when unset — assignments then do nothing).
    */
   selfLogin?: string;
+  /** Configurable agent display name (default "Noodle"). Used for slash-command trigger. */
+  agentName?: string;
 }
 
 export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): FastifyInstance {
@@ -59,7 +61,7 @@ export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): Fast
       return reply.code(400).send({ error: "invalid json" });
     }
 
-    const intent = parseWebhookEvent(event ?? "", payload, deps.selfLogin);
+    const intent = parseWebhookEvent(event ?? "", payload, deps.selfLogin, deps.agentName);
     if (!intent) {
       // Acknowledge but ignore — not an event Noodle acts on.
       return reply.code(202).send({ ok: true, ignored: true });

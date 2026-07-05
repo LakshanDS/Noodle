@@ -133,4 +133,30 @@ describe("parseWebhookEvent", () => {
       parseWebhookEvent("issues", { action: "opened", repository: { full_name: "owner/name" } }),
     ).toBeNull();
   });
+
+  it("parses custom agent name slash command", () => {
+    const payload = {
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "/mybot please fix this" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "MyBot")).toEqual({
+      kind: "comment",
+      repo: "owner/name",
+      issueNumber: 7,
+      installationId: 42,
+    });
+  });
+
+  it("ignores /noodle when agent name is customised", () => {
+    const payload = {
+      action: "created",
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "/noodle go" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "MyBot")).toBeNull();
+  });
 });

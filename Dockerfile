@@ -16,9 +16,9 @@ FROM node:22-bookworm-slim
 # git needed for clone/push; ca-certificates for HTTPS
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Default git identity for bot commits
-RUN git config --global user.name "noodle-bot" && \
-    git config --global user.email "noodle-bot@users.noreply.github.com"
+# Default git identity for agent commits
+RUN git config --global user.name "noodle-agent" && \
+    git config --global user.email "noodle-agent@users.noreply.github.com"
 
 WORKDIR /app
 

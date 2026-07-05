@@ -2,7 +2,7 @@ import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai/compat";
 import { join, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import { log } from "../util/log.js";
+import { log, runLogger } from "../util/log.js";
 import { resolveProfile } from "../profiles/resolve.js";
 import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
@@ -10,8 +10,10 @@ import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildPrompt } from "./prompt.js";
 import { createCommentOnIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
-import { createRunLogger } from "../util/log.js";
+import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
+import { StallWatcher, StallTimeoutError } from "./stall.js";
+import { slugify } from "../util/slugify.js";
 import {
   AuthStorage,
   ModelRegistry,
@@ -25,25 +27,38 @@ import type { NoodleConfig } from "../config/schema.js";
 type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
 
 /**
- * Status labels Noodle applies to issues it works on. Both are ensured to exist
- * (created with the color + description below) at the start of every run, so a
- * repo doesn't need to set them up by hand.
+ * Status labels applied to issues the agent works on. All three are ensured to
+ * exist (created with the color + description below) at the start of every run,
+ * so a repo doesn't need to set them up by hand.
  *
  *   cooking → applied while the agent is running
- *   cooked  → applied when the run finishes (cooking is removed)
+ *   cooked  → applied when the run finishes successfully (cooking is removed)
+ *   failed  → applied when the run errors out (cooking is removed)
+ *
+ * Label names incorporate the configurable agent name (default "Noodle").
  */
-export const LABELS = {
-  cooking: {
-    name: "Noodle is cooking",
-    color: "f0be04", // amber — without leading '#'
-    description: "Noodle agent is working on this",
-  },
-  cooked: {
-    name: "Noodle cooked here",
-    color: "22c55e", // green — without leading '#'
-    description: "Noodle agent run finished",
-  },
-} as const;
+export function labelsFor(agentName: string) {
+  return {
+    cooking: {
+      name: `${agentName} is cooking`,
+      color: "f0be04", // amber — without leading '#'
+      description: `${agentName} agent is working on this`,
+    },
+    cooked: {
+      name: `${agentName} cooked here`,
+      color: "22c55e", // green — without leading '#'
+      description: `${agentName} agent run finished`,
+    },
+    failed: {
+      name: `${agentName} got Cooked`,
+      color: "b91c1c", // red — without leading '#'
+      description: `${agentName} agent run errored out`,
+    },
+  } as const;
+}
+
+/** Default labels using the built-in agent name. */
+export const LABELS = labelsFor("Noodle");
 
 export interface RunInput {
   repo: string; // owner/name
@@ -70,6 +85,26 @@ export interface RunResult {
 }
 
 /**
+ * Stats gathered over the run for the comment/PR footer: tokens, cost, timing,
+ * tool-call + turn counts. Populated from pi's `session.getSessionStats()`
+ * (sums per-message `usage`) plus a wall-clock duration Noodle captures itself.
+ * Cost is real USD for built-in providers; $0 for local/custom models.
+ */
+export interface RunStats {
+  durationMs: number;
+  tokens?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
+  cost?: number;
+  toolCalls?: number;
+  turns?: number;
+}
+
+/**
  * Run one job end-to-end: fetch issue → route profile → clone → run pi →
  * commit → push → open PR → comment on issue.
  *
@@ -88,21 +123,50 @@ export async function runJob(
     runStore?: RunStore;
     /** Override for tests. Defaults to pi's createAgentSession. */
     createAgentSessionFn?: typeof createAgentSession;
+    /**
+     * Fresh-credential providers — serve mode passes these so long jobs
+     * (2h+) re-mint their GitHub token / client at each git+HTTP op instead
+     * of reusing the 1h-TTL one captured at job start. Defaults reuse the
+     * start-of-run token/gh, preserving CLI + Phase-1 behavior.
+     */
+    tokenProvider?: () => Promise<string>;
+    ghProvider?: () => Promise<GitHubClient>;
   },
 ): Promise<RunResult> {
+  const agentName = config.agent_name;
+  const agentSlug = slugify(agentName);
   const jobId = input.jobId ?? `${input.repo.replace("/", "-")}-${input.issueNumber}`;
-  // Branch name is derived up front so we can name the per-run log file after it.
-  const branchName = makeBranchName(input.issueNumber, jobId);
+  // Branch name: bare `<agent>/issue-<n>` for a fresh attempt. If an OPEN PR
+  // already exists for this issue (a follow-up `/noodle` run while the previous
+  // attempt's PR is still open), reuse that PR's branch and stack this run's
+  // work on top — the force-push updates the same PR instead of opening a new
+  // one. Closed-without-merge and merged PRs are NOT reused (no open PR found),
+  // so a clean retry starts a fresh branch.
+  const existing = await gh.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
+  const reuseBranch = !!existing;
+  const branchName = existing?.branch ?? branchNameFor(input.issueNumber, agentSlug);
 
-  // Per-run logger: JSON-Lines file (named after the branch) + console mirror.
-  // Both Noodle's steps and every pi agent event flow through this one logger.
-  const { log: log_, filePath: runLogPath } = createRunLogger(branchName, {
+  // Per-run logger: stdout only (pretty). Run context is bound to the raw JSON
+  // for correlation/grep, but the pretty formatter hides it from per-event
+  // lines — it's printed once in the run-header banner below.
+  const log_ = runLogger({
     jobId,
     repo: input.repo,
     issue: input.issueNumber,
     branch: branchName,
+    pid: process.pid,
   });
-  log_.info({ runLogPath }, "per-run log file opened");
+  // Run header: a banner with all the identifying context up front.
+  log.info("═══════════════════════════════════════════════════════════════");
+  log.info(
+    `agent run started — issue #${input.issueNumber} | repo=${input.repo} | branch=${branchName} | jobId=${jobId} | pid=${process.pid}`,
+  );
+  log.info(
+    existing
+      ? { pr: existing.html_url, branch: branchName }
+      : { branch: branchName },
+    existing ? "reusing branch from open PR (follow-up run)" : "fresh branch (no open PR)",
+  );
 
   // Record the run in the store (serve mode only). CLI runs skip this — the
   // store is an optional dep so the CLI stays DB-free. Updated at the end with
@@ -124,20 +188,27 @@ export async function runJob(
 
   // Ensure both status labels exist in the repo (creates them if missing), then
   // mark the issue as being worked on.
+  const labels = labelsFor(agentName);
   await gh.ensureLabel(
     input.repo,
-    LABELS.cooking.name,
-    LABELS.cooking.color,
-    LABELS.cooking.description,
+    labels.cooking.name,
+    labels.cooking.color,
+    labels.cooking.description,
   );
   await gh.ensureLabel(
     input.repo,
-    LABELS.cooked.name,
-    LABELS.cooked.color,
-    LABELS.cooked.description,
+    labels.cooked.name,
+    labels.cooked.color,
+    labels.cooked.description,
   );
-  await gh.addIssueLabel(input.repo, input.issueNumber, LABELS.cooking.name);
-  log_.info({ label: LABELS.cooking.name }, "added status label");
+  await gh.ensureLabel(
+    input.repo,
+    labels.failed.name,
+    labels.failed.color,
+    labels.failed.description,
+  );
+  await gh.addIssueLabel(input.repo, input.issueNumber, labels.cooking.name);
+  log_.info({ label: labels.cooking.name }, "added status label");
 
   // 2. Route to a profile.
   const profile = resolveProfile(config, {
@@ -174,21 +245,39 @@ export async function runJob(
 
   // 4. Clone + branch. Base = repo default branch (resolved dynamically).
   const baseBranch = await gh.defaultBranch(input.repo);
-  const token = input.token ?? process.env.GITHUB_TOKEN;
-  if (!token) {
-    throw new Error(
-      "No GitHub token for clone. Pass input.token (Phase 2) or set GITHUB_TOKEN (Phase 1).",
-    );
-  }
-  const ws = await Workspace.clone(cloneUrlFor(input.repo, token), jobId);
-  // branchName was computed up front for the per-run log file; reused here.
+  // Credential providers: serve mode re-mints per-op (long jobs outlive the
+  // 1h token TTL); CLI/tests fall back to the start-of-run token/gh.
+  const tokenProvider = deps?.tokenProvider ?? (async () => input.token ?? process.env.GITHUB_TOKEN ?? "");
+  const ghProvider = deps?.ghProvider ?? (async () => gh);
+  const freshToken = async () => {
+    const t = await tokenProvider();
+    if (!t) {
+      throw new Error(
+        "No GitHub token for git op. Pass input.token (Phase 2) or set GITHUB_TOKEN (Phase 1).",
+      );
+    }
+    return t;
+  };
+  const ws = await Workspace.clone(cloneUrlFor(input.repo, await freshToken()), jobId);
   let agentAnswer: string | undefined;
   try {
-    await ws.branch(branchName);
+    // Reuse the existing branch when there's an open PR (follow-up run): fetch
+    // it and reset onto its tip so the agent's work stacks on top. Otherwise
+    // create a fresh branch off the cloned base.
+    if (reuseBranch) {
+      await ws.checkoutOrReuse(branchName, cloneUrlFor(input.repo, await freshToken()));
+    } else {
+      await ws.branch(branchName);
+    }
     await installSkills(ws.path);
 
     // 5. Build prompt + resource loader.
-    const prompt = buildPrompt(issue, comments, input.repo);
+    // Probe the host hardware up front so the agent knows whether this box can
+    // run builds/tests or must verify by reasoning — a small VPS / container
+    // often can't, and a "let me run the build" attempt will hang or crash.
+    const sysFacts = collectSysFacts();
+    log_.debug({ sysFacts }, "probed system info for agent prompt");
+    const prompt = buildPrompt(issue, comments, input.repo, agentName, buildSysInfoGuidance(sysFacts));
     // Optional per-profile rate-limit throttle (e.g. NVIDIA NIM's 40 rpm).
     const throttle = throttleForRpm(profile.api_rpm);
     const loader = new DefaultResourceLoader({
@@ -218,16 +307,55 @@ export async function runJob(
       modelRegistry,
       sessionManager,
       resourceLoader: loader,
+      // Forward the profile's thinking level. pi-ai clamps it to what the model
+      // supports (gated on model.reasoning === true), so passing "medium" to a
+      // non-reasoning model (gpt-4o) is a safe no-op. Custom endpoints must set
+      // `reasoning: true` in the profile config for this to take effect.
+      thinkingLevel: profile.thinking_level,
       tools: profile.tools,
       customTools: [
-        createCommentOnIssueTool(gh, input.repo, input.issueNumber),
+        createCommentOnIssueTool(gh, input.repo, input.issueNumber, agentName),
       ],
     });
 
     subscribeForLogging(session, log_);
 
-    log_.info("starting agent run");
-    await session.prompt(prompt);
+    // Stall watcher: abort the run if pi emits no events for the active budget.
+    // TWO budgets: a tight one for silence while waiting on the LLM
+    // (stall_timeout_minutes, default 15) and a looser one for silence while a
+    // tool is running (tool_stall_minutes, default 60) — a bash command that's
+    // building/testing legitimately produces no events until it writes output.
+    // The watcher switches budgets on tool_execution_start/end and resets the
+    // clock on every event (incl. tool_execution_update, which a chatty build
+    // emits constantly). On stall it calls session.abort(), which rejects the
+    // in-flight prompt() below.
+    const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
+    const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+    const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
+    const unsubStall = watcher.attach();
+
+    log_.info(
+      { idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" },
+      "starting agent run",
+    );
+    const startedAt = Date.now();
+    try {
+      await session.prompt(prompt);
+    } catch (e) {
+      // Translate the abort-into-reject of a stalled run into a typed error so
+      // the queue can skip retrying it (a stall won't recover on its own).
+      if (watcher.didStall) {
+        throw new StallTimeoutError(
+          (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
+          watcher.activeBudget,
+        );
+      }
+      throw e;
+    } finally {
+      watcher.dispose();
+      unsubStall?.();
+    }
+    const durationMs = Date.now() - startedAt;
 
     // After dispose, a lingering pi bash-tool PTY socket can emit a final chunk
     // whose handler throws "Agent listener invoked outside active run" from an
@@ -236,6 +364,35 @@ export async function runJob(
     // run still reaches its commit/PR/comment. Torn down once the run is done.
     const teardownDisposeGuard = suppressPostDisposeBashRace(log_);
     try {
+      // Capture run stats (tokens, cost, tool calls) BEFORE dispose. getSessionStats()
+      // reads from session.state.messages, which survives dispose, but grabbing it
+      // first is safest. Available even on error-stopped runs (partial stats).
+      const sessionStats = session.getSessionStats?.();
+      const runStats: RunStats = {
+        durationMs,
+        tokens: sessionStats?.tokens
+          ? {
+              input: sessionStats.tokens.input,
+              output: sessionStats.tokens.output,
+              cacheRead: sessionStats.tokens.cacheRead,
+              cacheWrite: sessionStats.tokens.cacheWrite,
+              total: sessionStats.tokens.total,
+            }
+          : undefined,
+        cost: sessionStats?.cost,
+        toolCalls: sessionStats?.toolCalls,
+        turns: sessionStats?.assistantMessages,
+      };
+      log_.info(
+        {
+          durationMs,
+          tokens: runStats.tokens?.total,
+          cost: runStats.cost,
+          toolCalls: runStats.toolCalls,
+          turns: runStats.turns,
+        },
+        "run stats",
+      );
       await session.dispose?.();
       log_.info("agent run finished");
 
@@ -255,10 +412,6 @@ export async function runJob(
       if (errored) {
         const errMsg = stopReason.errorMessage ?? "unknown error";
         log_.error({ errorMessage: errMsg, stopReason: stopReason.stopReason }, "agent run ended on error");
-        // Honest comment so the reporter knows it failed (not a fake answer).
-        agentAnswer =
-          `⚠️ Noodle's agent stopped with an error before finishing:\n\n> ${errMsg}\n\n` +
-          `No changes were made. The run may be retried.`;
       } else {
         // Capture the agent's final message — its actual answer. Posted verbatim
         // as the issue comment / PR body (with a signature footer), so the
@@ -275,31 +428,47 @@ export async function runJob(
       if (!errored) {
         await ws.removeInternals();
         const committed = await ws.commitAll(
-          `Fix #${input.issueNumber}: ${issue.title}\n\nGenerated by Noodle (profile: ${profile.name}).`,
+          `Fix #${input.issueNumber}: ${issue.title}\n\nGenerated by ${agentName} (profile: ${profile.name}).`,
         );
 
         if (committed) {
-          await ws.push(branchName);
+          // Re-mint credentials right before push — a long agent run can
+          // exceed the token's TTL (1h for GitHub-App installation tokens).
+          await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()));
           const changedFiles = await ws.changedFiles();
-          const prBody = buildPrBody(profile.name, changedFiles, issue.html_url, agentAnswer);
-          const pr = await gh.createPullRequest(
-            input.repo,
-            branchName,
-            baseBranch,
-            `Fixes #${issue.number}: ${issue.title}`,
-            prBody,
-          );
+          const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
+          // Re-resolve the gh client too — same expiry risk on the post-run
+          // API calls (PR/comment/label) on long runs.
+          const ghNow = await ghProvider();
+          // Re-check for an open PR on this branch right before creating one.
+          // The branch was resolved at run start, but a long agent run may have
+          // raced with a human closing/merging the PR in the meantime — re-query
+          // so we either reuse the still-open PR or open a fresh one.
+          const openNow = await ghNow.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
+          let pr: { number: number; html_url: string };
+          if (openNow) {
+            // Force-push already landed the new commits on the existing branch.
+            pr = openNow;
+            log_.info({ pr: pr.html_url, changedFiles, reused: true }, "updated existing PR (follow-up)");
+          } else {
+            pr = await ghNow.createPullRequest(
+              input.repo,
+              branchName,
+              baseBranch,
+              `Fixes #${issue.number}: ${issue.title}`,
+              prBody,
+            );
+            log_.info({ pr: pr.html_url, changedFiles }, "opened PR");
+          }
           const prUrl = pr.html_url;
-          log_.info({ pr: prUrl, changedFiles }, "opened PR");
 
-          await swapLabel(gh, input.repo, input.issueNumber, log_);
+          await swapLabel(ghNow, input.repo, input.issueNumber, labels, "cooked", log_);
 
           const commentBody = buildIssueComment(profile, agentAnswer, {
             prNumber: pr.number,
             prUrl: pr.html_url,
-            changedFiles,
-          });
-          const commentUrl = await gh.createIssueComment(input.repo, input.issueNumber, commentBody);
+          }, agentName, runStats);
+          const commentUrl = await ghNow.createIssueComment(input.repo, input.issueNumber, commentBody);
           if (runStore) {
             runStore.updateRun(jobId, {
               profile: profile.name,
@@ -324,11 +493,14 @@ export async function runJob(
       }
 
       // 9. No changes (or errored) — post the agent's answer / error text and
-      // record the run. An errored run is marked `failed`; a clean no-change
-      // run is `no_changes`.
-      await swapLabel(gh, input.repo, input.issueNumber, log_);
-      const commentBody = buildIssueComment(profile, agentAnswer);
-      const commentUrl = await gh.createIssueComment(input.repo, input.issueNumber, commentBody);
+      // record the run. An errored run swaps to the red `failed` label and posts
+      // a templated error comment; a clean no-change run swaps to `cooked`.
+      const ghNow = await ghProvider();
+      await swapLabel(ghNow, input.repo, input.issueNumber, labels, errored ? "failed" : "cooked", log_);
+      const commentBody = errored
+        ? buildErrorComment(profile, stopReason.errorMessage ?? "unknown error", agentName, runStats)
+        : buildIssueComment(profile, agentAnswer, undefined, agentName, runStats);
+      const commentUrl = await ghNow.createIssueComment(input.repo, input.issueNumber, commentBody);
       if (errored) {
         log_.warn({ hasAnswer: !!agentAnswer }, "agent errored; posted error comment");
       } else {
@@ -372,11 +544,16 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-/** Branch name unique per run: noodle/issue-42-<shortid>. */
-function makeBranchName(issueNumber: number, jobId: string): string {
-  // short, readable suffix from the jobId (already unique per run)
-  const suffix = jobId.replace(/^[\w./-]+-\d+-/, "").slice(0, 8) || Date.now().toString(36);
-  return `noodle/issue-${issueNumber}-${suffix}`;
+/**
+ * Bare branch name for an issue's first attempt: `<agent>/issue-<n>`. Stable
+ * across runs of the same issue so a follow-up run (when the previous PR is
+ * still open) reuses it. Closed/merged PRs are not reused, so a retry after
+ * rejection gets this same bare name — and since the old PR is gone, reusing
+ * the name just re-opens a fresh PR on the same clean branch. (The lookup in
+ * `findOpenPRForIssue` keys off this pattern.)
+ */
+function branchNameFor(issueNumber: number, agentSlug: string): string {
+  return `${agentSlug}/issue-${issueNumber}`;
 }
 
 /**
@@ -490,14 +667,15 @@ export function lastAssistantStopReason(
 }
 
 /**
- * Attach a subscriber that mirrors a SLIM set of pi events into the run log.
- * The agent's full conversation (messages, tool results, thinking) now lives in
- * the persisted session file — so the log only needs operational signal:
- *   - tool calls (start/end) — what the agent did
- *   - turn_start — agent wake-ups
- *   - tool errors — flagged as warnings
- * Agent text, tool-result dumps, and per-turn noise are intentionally omitted
- * to keep the log file a thin, readable operational + error tail.
+ * Attach a subscriber that mirrors pi agent events into the run log, so the
+ * full conversation flow is visible in `docker logs`:
+ *   - agent lifecycle (start/end, retries, compaction)
+ *   - assistant messages (full text — the agent's reply)
+ *   - tool calls (start with args, end with the returned output)
+ *   - turn boundaries
+ *
+ * The persisted session file (./sessions/<jobId>/) remains the authoritative
+ * record; this is the readable mirror.
  */
 function subscribeForLogging(
   session: { subscribe?: (fn: (e: unknown) => void) => unknown },
@@ -507,73 +685,290 @@ function subscribeForLogging(
   session.subscribe((event: unknown) => {
     const e = event as Record<string, unknown>;
     switch (e.type) {
-      case "tool_execution_start":
-        log_.info(
-          { tool: e.toolName, args: truncate(JSON.stringify(e.args), 200) },
-          `▸ tool start: ${e.toolName}`,
-        );
+      case "agent_start":
+        log_.info("▶ agent started");
         break;
+
+      case "agent_end": {
+        const willRetry = e.willRetry === true;
+        log_.info({ willRetry }, "■ agent finished");
+        break;
+      }
+
+      case "turn_start":
+        log_.info("── turn start ──────────────────");
+        break;
+
+      case "turn_end": {
+        const toolResults = (e.toolResults as unknown[]) ?? [];
+        log_.info({ toolResultCount: toolResults.length }, `── turn end (${toolResults.length} tool result${toolResults.length === 1 ? "" : "s"}) ──`);
+        break;
+      }
+
+      case "message_end": {
+        // Assistant's final message for this turn — log its full text.
+        const text = extractMessageText(e.message);
+        if (text) log_.info(`💬 assistant:\n${text}`);
+        break;
+      }
+
+      case "tool_execution_start": {
+        // Args go in the message text only (avoids trailing key=value duplicate).
+        const argsStr = truncate(JSON.stringify(e.args), 300);
+        log_.info({ tool: e.toolName }, `▸ tool: ${e.toolName}(${argsStr})`);
+        break;
+      }
+
       case "tool_execution_end": {
         const isError = e.isError === true;
+        const output = truncate(extractToolResultText(e.result), 2000);
+        // Output goes in the message text; `isError` stays as a field for grep.
+        const msg = `◂ ${isError ? "tool error" : "tool result"}: ${e.toolName}\n${output}`;
         if (isError) {
-          log_.warn({ tool: e.toolName, isError }, `◂ tool end: ${e.toolName}`);
+          log_.warn({ tool: e.toolName, isError }, msg);
         } else {
-          log_.info({ tool: e.toolName, isError }, `◂ tool end: ${e.toolName}`);
+          log_.info({ tool: e.toolName }, msg);
         }
         break;
       }
-      case "turn_start":
-        log_.info("── turn start (agent wake-up)");
+
+      case "compaction_start":
+        log_.info({ reason: e.reason }, "♻ compacting context");
         break;
+
+      case "compaction_end": {
+        const errMsg = e.errorMessage as string | undefined;
+        if (errMsg) {
+          log_.warn({ reason: e.reason, errorMessage: errMsg }, "♻ compaction failed");
+        } else {
+          log_.info({ reason: e.reason, aborted: e.aborted }, "♻ compaction complete");
+        }
+        break;
+      }
+
+      case "auto_retry_start":
+        // errorMessage goes in the message; attempt/delay stay as fields.
+        log_.warn(
+          { attempt: e.attempt, maxAttempts: e.maxAttempts, delayMs: e.delayMs },
+          `↻ retrying (attempt ${e.attempt}/${e.maxAttempts}) after: ${e.errorMessage}`,
+        );
+        break;
+
+      case "auto_retry_end":
+        log_.info(
+          { success: e.success, attempt: e.attempt },
+          e.success === true ? "↻ retry succeeded" : "↻ retry failed",
+        );
+        break;
+
       default:
-        // Other pi events (message_end, turn_end, compaction, …) are not logged
-        // here — they live in the session file. Errors surface as tool errors.
+        // Other events (message_start, message_update, tool_execution_update,
+        // queue_update, session_info_changed, thinking_level_changed) are too
+        // noisy to mirror — they're in the session file if needed.
     }
   });
 }
 
-function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + "…" : s;
+/**
+ * Pull the concatenated text out of a pi AgentMessage (an assistant message's
+ * content is an array of TextContent | ThinkingContent | ToolCall). Returns the
+ * full assistant reply text, or "" if there's no text content.
+ */
+function extractMessageText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const content = (message as { content?: unknown[] }).content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+    .map((b) => b.text)
+    .join("\n");
 }
 
 /**
- * Swap the cooking → cooked status label on an issue. Removal of `cooking` is
+ * Pull the returned text out of a pi AgentToolResult. The result's `content` is
+ * an array of TextContent | ImageContent — concatenate the text blocks.
+ */
+function extractToolResultText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const content = (result as { content?: unknown[] }).content;
+  if (!Array.isArray(content)) {
+    // Some tools return a plain string or other shape — coerce to string.
+    return String(result);
+  }
+  return content
+    .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + `… (+${s.length - max} more chars)` : s;
+}
+
+/**
+ * Terminal label state for a finished run: `cooked` (success / clean no-change)
+ * or `failed` (errored). Drives which label gets applied when cooking is removed.
+ */
+type TerminalLabel = "cooked" | "failed";
+
+/**
+ * Swap the cooking → terminal status label on an issue. Removal of `cooking` is
  * best-effort: if it fails (transient API error, label already gone, etc.) we
- * still add `cooked` and log the removal error rather than aborting — the run
- * has already produced its PR/comment, and a stuck cooking tag is preferable to
- * losing the cooked tag and a clean failure signal.
+ * still add the terminal label and log the removal error rather than aborting —
+ * the run has already produced its PR/comment, and a stuck cooking tag is
+ * preferable to losing the terminal tag and a clean outcome signal.
  */
 async function swapLabel(
   gh: GitHubClient,
   repo: string,
   issue: number,
+  labels: ReturnType<typeof labelsFor>,
+  terminal: TerminalLabel,
   log_ = log,
 ): Promise<void> {
   try {
-    await gh.removeIssueLabel(repo, issue, LABELS.cooking.name);
+    await gh.removeIssueLabel(repo, issue, labels.cooking.name);
   } catch (e) {
-    log_.warn({ err: e, label: LABELS.cooking.name }, "could not remove cooking label; cooked label will still be added");
+    log_.warn({ err: e, label: labels.cooking.name }, `could not remove cooking label; ${terminal} label will still be added`);
   }
-  await gh.addIssueLabel(repo, issue, LABELS.cooked.name);
+  await gh.addIssueLabel(repo, issue, labels[terminal].name);
 }
 
 // --- output builders (exported for testing) --------------------------------
 // The agent's final message IS the comment/PR body — posted verbatim, with a
-// one-line signature footer appended (who ran, on what model). When the agent
-// produced no final message, a short deterministic fallback keeps the run
-// useful instead of posting nothing.
+// rich footer appended: who ran on what model, timing, token usage, cost, and a
+// random dev-humor one-liner. When the agent produced no final message, a short
+// deterministic fallback keeps the run useful instead of posting nothing.
+
+/** PR link details shown in the footer when a PR was opened. */
+export interface CommentFooter {
+  /** PR number, when a PR was opened. */
+  prNumber?: number;
+  /** PR URL, when a PR was opened. */
+  prUrl?: string;
+}
 
 /**
- * Build the PR body: the agent's message, the changed files, and a signature.
+ * Generic dev-humor one-liners. One is picked at random per footer — a small
+ * bit of personality at the bottom of each comment. Kept G-rated and on-theme
+ * for a coding agent.
+ */
+const FUN_LINES: string[] = [
+  "Commit message written, coffee consumed, bug squashed.",
+  "100% more deterministic than my morning routine.",
+  "Powered by tokens, caffeine, and mild anxiety.",
+  "This code is definitely production-ready. Probably.",
+  "Plot twist: the tests passed on the first try.",
+  "rm -rf / was NOT run. You're welcome.",
+  "If it compiles, it ships. (Please review anyway.)",
+  "Semicolons: the cause of, and solution to, all of life's problems.",
+  "I've seen things you people wouldn't believe. Stack traces on fire.",
+  "There are 10 types of people: those who read this in binary, and the rest.",
+  "404: better punchline not found.",
+  "Optimism: deploying on a Friday.",
+];
+
+/** Format a millisecond duration as a human-readable "1m 23s" / "42s" string. */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = Math.round(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+/** Format an integer with thousands separators (1234567 → "1,234,567"). */
+function formatTokens(n: number): string {
+  return Math.round(n).toLocaleString("en-US");
+}
+
+/** Format a USD cost, trimming to cents for small amounts. */
+function formatCost(usd: number): string {
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+/**
+ * Build the rich footer block, one fact per line:
+ *
+ *   🤖 **Noodle-Agent**
+ *   Profile: claude (anthropic/claude-sonnet-4-20250514)
+ *   Cooked for: 4m 12s · 8 tool calls · 3 turns
+ *   Tokens: 45,210 in · 3,180 out · 61,190 total
+ *   Cost: $0.18
+ *   *<random fun line>*
+ *
+ * Token and cost lines are omitted when not applicable: local/custom models
+ * with no pricing show tokens but no cost; a missing stats object shows neither.
+ * The PR link (when a PR was opened) appends to the Profile line.
+ */
+export function buildFooter(
+  profile: { name: string; provider: string; model: string },
+  agentName: string,
+  stats?: RunStats,
+  footer?: CommentFooter,
+): string {
+  const lines: string[] = [];
+
+  // Line 1: agent name only.
+  lines.push(`🤖 **${agentName}**`);
+
+  // Line 2: profile + model, with the PR link if one was opened.
+  const prPart = footer?.prUrl && footer.prNumber ? ` · PR #${footer.prNumber}: ${footer.prUrl}` : "";
+  lines.push(`Profile: ${profile.name} (\`${profile.provider}/${profile.model}\`)${prPart}`);
+
+  // Line 3+: stats (only if we have something to show).
+  if (stats) {
+    // Cooked for: duration · tool calls · turns
+    const cooked: string[] = [`Cooked for: ${formatDuration(stats.durationMs)}`];
+    if (stats.toolCalls != null) cooked.push(`${stats.toolCalls} tool calls`);
+    if (stats.turns != null) cooked.push(`${stats.turns} turns`);
+    lines.push(cooked.join(" · "));
+
+    // Tokens (only if non-trivial).
+    if (stats.tokens && stats.tokens.total > 0) {
+      const t = stats.tokens;
+      const parts = [
+        `${formatTokens(t.input)} in`,
+        `${formatTokens(t.output)} out`,
+      ];
+      // Cache tokens only surface for providers that support prompt caching
+      // (Anthropic, an Anthropic-protocol proxy). Omitted when 0.
+      if (t.cacheRead > 0) parts.push(`${formatTokens(t.cacheRead)} cache read`);
+      if (t.cacheWrite > 0) parts.push(`${formatTokens(t.cacheWrite)} cache write`);
+      parts.push(`${formatTokens(t.total)} total`);
+      lines.push(`Tokens: ${parts.join(" · ")}`);
+
+      // Cost (only when priced — built-in providers, or custom endpoints with
+      // *_price fields set in the config).
+      if (stats.cost != null && stats.cost > 0) {
+        lines.push(`Cost: ${formatCost(stats.cost)}`);
+      }
+    }
+  }
+
+  // Random fun line.
+  lines.push(`*${FUN_LINES[Math.floor(Math.random() * FUN_LINES.length)]}*`);
+  return lines.join("\n");
+}
+
+/**
+ * Build the PR body: the agent's message, the changed files, and the footer.
  * When `agentMessage` is missing, a short notice asks the reviewer to check the
  * diff directly.
  */
 export function buildPrBody(
-  profile: string,
+  profile: { name: string; provider: string; model: string } | string,
   changedFiles: string[],
   issueUrl: string,
   agentMessage?: string,
+  agentName = "Noodle",
+  stats?: RunStats,
 ): string {
+  // Accept legacy callsites that pass the profile name as a string.
+  const prof = typeof profile === "string"
+    ? { name: profile, provider: "unknown", model: "unknown" }
+    : profile;
   const lines: string[] = [];
   if (agentMessage) {
     lines.push(agentMessage.trim(), "");
@@ -583,27 +978,12 @@ export function buildPrBody(
   if (changedFiles.length) {
     lines.push("**Changed files:**", ...changedFiles.map((f) => `- \`${f}\``), "");
   }
-  lines.push(
-    "---",
-    `🤖 Generated by **Noodle** — \`${profile}\` profile.`,
-    "",
-    `Closes ${issueUrl}`,
-  );
+  lines.push("---", buildFooter(prof, agentName, stats), "", `Closes ${issueUrl}`);
   return lines.join("\n");
 }
 
-export interface CommentFooter {
-  /** PR number, when a PR was opened. */
-  prNumber?: number;
-  /** PR URL, when a PR was opened. */
-  prUrl?: string;
-  /** Changed files, when a PR was opened. */
-  changedFiles?: string[];
-}
-
 /**
- * Build the issue comment: the agent's message verbatim, then a one-line
- * signature footer recording the run info (profile + model + optional PR link).
+ * Build the issue comment: the agent's message verbatim, then the rich footer.
  *
  * When the agent produced no message, a short generic note is used instead so
  * the issue still gets a response.
@@ -612,14 +992,31 @@ export function buildIssueComment(
   profile: { name: string; provider: string; model: string },
   agentMessage: string | undefined,
   footer?: CommentFooter,
+  agentName = "Noodle",
+  stats?: RunStats,
 ): string {
   const body = agentMessage?.trim() ||
-    "_Noodle ran but made no code changes and left no message. The issue may need clarification, or it may not be a code change._";
+    `_${agentName} ran but made no code changes and left no message. The issue may need clarification, or it may not be a code change._`;
+  return `${body}\n\n---\n${buildFooter(profile, agentName, stats, footer)}`;
+}
 
-  // One-line signature: who ran, on what model, and the PR link if any.
-  const sigParts = [`🤖 **Noodle** · ${profile.name} (\`${profile.provider}/${profile.model}\`)`];
-  if (footer?.prUrl && footer.prNumber) {
-    sigParts.push(`· PR #${footer.prNumber}: ${footer.prUrl}`);
-  }
-  return `${body}\n\n---\n${sigParts.join(" ")}`;
+/**
+ * Build the issue comment for an errored run. The reporter gets an honest,
+ * templated notice that the agent failed — with the actual error text quoted in
+ * a blockquote so the cause (quota, rate limit, server error) is visible for
+ * debugging — plus the rich footer (stats captured up to the point of failure).
+ */
+export function buildErrorComment(
+  profile: { name: string; provider: string; model: string },
+  errorMessage: string,
+  agentName = "Noodle",
+  stats?: RunStats,
+): string {
+  const err = errorMessage.trim() || "unknown error";
+  const body =
+    `⚠️ **${agentName}'s run on this issue errored out before finishing.**\n\n` +
+    `> \`${err}\`\n\n` +
+    `No changes were made. The run may be retried once the underlying issue ` +
+    `(API quota, rate limit, provider outage, etc.) is resolved.`;
+  return `${body}\n\n---\n${buildFooter(profile, agentName, stats)}`;
 }

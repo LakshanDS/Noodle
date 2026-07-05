@@ -25,10 +25,34 @@ export class Workspace {
     return new Workspace(dir);
   }
 
-  /** Create and checkout a new branch off the current HEAD. */
+  /** Create and checkout a new branch off the current HEAD (fresh attempt). */
   async branch(name: string): Promise<void> {
     await this.git.checkoutLocalBranch(name);
     log.debug({ dir: this.path, branch: name }, "created branch");
+  }
+
+  /**
+   * Reuse an existing remote branch: fetch it and hard-reset onto its tip so
+   * the agent's work stacks on top of the previous attempt's commits. Used
+   * when a follow-up run targets an issue that already has an OPEN PR — the
+   * caller has already confirmed the branch exists on the remote (via
+   * findOpenPRForIssue). After this, the working tree reflects the last run's
+   * state and a subsequent push (force-with-lease) updates the existing PR.
+   *
+   * `freshCloneUrl` embeds the (possibly re-minted) token; fetching from it
+   * instead of the stale `origin` avoids an auth failure on long runs.
+   */
+  async checkoutOrReuse(name: string, freshCloneUrl: string): Promise<void> {
+    // Fetch the remote feature branch so we have its commits + a FETCH_HEAD
+    // pointer to reset onto. simple-git's fetch(remote, ref) pulls just this ref.
+    await this.git.fetch(freshCloneUrl, name);
+    // Reset onto the fetched tip — agent now starts from where the last run
+    // left off, not from base. HEAD before reset is the freshly-cloned base,
+    // so there's nothing local to lose.
+    await this.git.raw(["reset", "--hard", "FETCH_HEAD"]);
+    // Check out the (now-current) branch so commits land on it by name.
+    await this.git.checkout(name);
+    log.debug({ dir: this.path, branch: name }, "reused existing remote branch");
   }
 
   /** Remove only the skills Noodle copied (not user-owned skills). */
@@ -63,10 +87,25 @@ export class Workspace {
     return diff.split("\n").filter(Boolean);
   }
 
-  /** Push the current branch to origin. */
-  async push(branch: string): Promise<void> {
-    await this.git.push("origin", branch, ["--set-upstream"]);
-    log.debug({ dir: this.path, branch }, "pushed");
+  /**
+   * Push the current branch to origin. If `freshCloneUrl` is given, the origin
+   * remote is re-pointed first — used on long agent runs where the token baked
+   * into the clone-time URL has since expired.
+   *
+   * Uses `--force-with-lease` instead of a plain push: a reused branch's local
+   * history is rebased on top of the previous attempt by `checkoutOrReuse`, so
+   * the remote tip has diverged and a fast-forward push would be rejected. The
+   * lease protects against clobbering commits pushed by anything else since our
+   * fetch (e.g. a concurrent same-issue run) — it refuses rather than
+   * overwriting. On a fresh branch (first attempt) it's a no-op: nothing to
+   * lease against, nothing to clobber.
+   */
+  async push(branch: string, freshCloneUrl?: string): Promise<void> {
+    if (freshCloneUrl) {
+      await this.git.remote(["set-url", "origin", freshCloneUrl]);
+    }
+    await this.git.push("origin", branch, ["--force-with-lease", "--set-upstream"]);
+    log.debug({ dir: this.path, branch, refreshed: !!freshCloneUrl }, "pushed");
   }
 
   /** Remove the temp dir. Safe to call multiple times. */
