@@ -1,6 +1,6 @@
 services:
   noodle:
-    image: ghcr.io/lakshands/noodle:latest
+    image: ghcr.io/lakshands/noodle-agent:latest
     container_name: noodle-bot
     restart: unless-stopped
     ports:
