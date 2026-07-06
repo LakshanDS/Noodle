@@ -31,6 +31,35 @@ retry after the PR was closed or merged gets a fresh branch.
 Noodle owns the GitHub/git/routing/scheduling layer; pi owns the coding task
 (LLM calls, file edits, tool use). One process, one runtime.
 
+### Waking the agent (opt-in)
+
+Noodle is **opt-in by default**: it only runs an issue when explicitly asked.
+A bare new issue does **not** wake it. Any of these wake signals trigger a run:
+
+| Signal | Example | Notes |
+|--------|---------|-------|
+| `@<agent>` mention | `@noodle`, `@noodle-agent`, `@noodle[bot]` | In the issue body or a comment |
+| `/<agent>` slash command | `/noodle fix this` | Classic command form |
+| `#<profile>` tag | `#claude rerun with claude` | **Also selects that profile** |
+| Assignment | assign the issue to the agent | Always honored |
+
+To pick a **specific profile** from a comment, use a `#tag`: `#claude fix the
+build` wakes the agent *and* routes it to the `claude` profile (overriding the
+default/label/keyword routing). `@noodle fix this` uses the default profile;
+`#claude fix this` uses claude — no need to combine them. `#123` issue refs
+never collide (tags only match configured profile names).
+
+The wake behavior is configurable under `triggers:` in the config
+(`trigger_on_mention`, `trigger_keywords`, `trigger_on_open`). Set
+`trigger_on_open: true` to restore "fire on every new issue" (legacy behavior).
+
+### Concurrency — one run per issue at a time
+
+If the agent is already cooking on an issue (the `<name> is cooking` label is
+present), a second wake signal is held off until the current run finishes —
+Noodle posts a short "already cooking" note and skips. The terminal labels
+(`<name> cooked here` / `<name> got Cooked`) do **not** block a follow-up.
+
 ## What's built
 
 - **Profile routing** — slash commands (`/claude`), labels, keyword regex, or a
@@ -232,7 +261,9 @@ is the simplest way to start.)
        if: |
          github.event_name == 'issues' ||
          (github.event_name == 'issue_comment' &&
-          startsWith(github.event.comment.body, '/noodle'))
+          (startsWith(github.event.comment.body, '/noodle') ||
+           contains(github.event.comment.body, '@noodle') ||
+           contains(github.event.comment.body, '#claude')))
        runs-on: ubuntu-latest
        steps:
          - uses: actions/checkout@v4

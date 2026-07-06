@@ -73,6 +73,12 @@ profiles:
   # Rate-limited provider example. Set api_rpm when a provider caps requests per
   # minute (e.g. NVIDIA NIM's free tier = 40). Noodle installs a pre-request
   # throttle so the agent loop never exceeds it. 0 = unlimited. Default: 30.
+  #
+  # max_concurrent (optional) caps how many jobs of THIS profile run at once.
+  # Useful when profiles use separate API keys: set queue.concurrency to the
+  # total pool size (e.g. 2), then max_concurrent per profile (e.g. 1 each) so
+  # they run in parallel up to each key's budget without a single key being
+  # split across N runs. Unset → limited only by the global queue.concurrency.
   nim:
     provider: nvidia
     api: openai-completions
@@ -82,6 +88,7 @@ profiles:
     api_rpm: 40
     context_window: 131072
     max_tokens: 8192
+    # max_concurrent: 1
     thinking_level: medium
     tools: [read, bash, edit, write, grep, find, ls]
 
@@ -168,3 +175,20 @@ repos:
 #   # Base backoff seconds for retries. Doubles each attempt, capped at 10 min:
 #   # attempt 1→60s, 2→120s, 3→240s, …
 #   retry_backoff_seconds: 60
+
+# --- Wake triggers (opt-in by default) --------------------------------------
+# By default Noodle is opt-in: it ONLY runs an issue when the issue body or a
+# comment carries an explicit wake signal. A bare new issue does NOT wake it.
+# Wake signals (always honored regardless of this block):
+#   @<agent>           mention, e.g. @noodle / @noodle-agent / @noodle[bot]
+#   /<agent>            slash command, e.g. /noodle fix this
+#   #<profile>          tag, e.g. #claude — also SELECTS that profile
+#   assignment          assigning the issue to the agent
+# triggers:
+#   # Fire when body/comments @-mention the agent. Default: true.
+#   trigger_on_mention: true
+#   # Extra substrings (case-insensitive) that also wake the agent.
+#   trigger_keywords: []
+#   # Restore "fire on every new/reopened/labeled issue" (legacy behavior).
+#   # Default: false. Set true to opt out of the mention/keyword filter entirely.
+#   trigger_on_open: false
