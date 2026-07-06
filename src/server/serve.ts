@@ -121,7 +121,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const uiPassword = process.env.NOODLE_UI_PASSWORD;
   if (uiPassword) {
     const { registerUiRoutes } = await import("./ui-routes.js");
-    registerUiRoutes(app, { runStore, secret: uiPassword });
+    registerUiRoutes(app, { runStore, secret: uiPassword, queue, authProvider, agentName: config.agent_name });
     log.info("web UI enabled (password-protected)");
   } else {
     log.warn("NOODLE_UI_PASSWORD not set — web UI disabled (/health + /webhook only)");

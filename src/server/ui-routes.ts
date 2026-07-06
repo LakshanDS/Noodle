@@ -3,6 +3,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { RunStore } from "./run-store.js";
+import type { JobQueue } from "./queue.js";
+import type { AuthProvider } from "../github/auth-provider.js";
+import { labelsFor } from "../engine/run.js";
 import { readSession, type ParsedMessage } from "./session-reader.js";
 import {
   clearCookieValue,
@@ -10,6 +13,7 @@ import {
   requireAuth,
   verifyPassword,
 } from "./ui-auth.js";
+import { log } from "../util/log.js";
 
 /**
  * Register the web UI routes on an existing Fastify app: the HTML shell at
@@ -33,10 +37,13 @@ export interface UiDeps {
   runStore: RunStore;
   /** The operator password (NOODLE_UI_PASSWORD). Also the token-signing secret. */
   secret: string;
+  queue: JobQueue;
+  authProvider: AuthProvider;
+  agentName: string;
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, secret } = deps;
+  const { runStore, secret, queue, authProvider, agentName } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   const auth = async (req: FastifyRequest, reply: FastifyReply) => requireAuth(req, reply, secret);
@@ -84,6 +91,44 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     // temp paths that leak from pi's session records.
     const messages: ParsedMessage[] = run.session_path ? readSession(run.session_path) : [];
     return { run, messages };
+  });
+
+  // --- Cancel a running job. Marks the queue job as failed, updates the run
+  // store, and best-effort removes the "cooking" label from the issue. ---
+  app.post("/api/runs/:id/cancel", { preHandler: auth }, async (req, reply) => {
+    const { id } = req.params as { id: string }; // e.g. "job-19"
+    let run;
+    try {
+      run = runStore.getRun(id);
+    } catch {
+      return reply.code(404).send({ error: "run not found" });
+    }
+    if (run.status !== "running") {
+      return reply.code(409).send({ error: "run is not running", status: run.status });
+    }
+    // Parse numeric job id from "job-19" → 19.
+    const numericId = parseInt(id.replace(/^job-/, ""), 10);
+    if (isNaN(numericId)) {
+      return reply.code(400).send({ error: "invalid job id" });
+    }
+    // Mark the queue job failed so the worker won't pick it up again.
+    try {
+      queue.markFailed(numericId, "cancelled by operator");
+    } catch (e) {
+      log.warn({ err: e, jobId: id }, "could not mark queue job as failed (may already be done)");
+    }
+    // Update the run store.
+    runStore.updateRun(id, { status: "failed", error: "cancelled by operator", finished_at: new Date().toISOString() });
+    // Best-effort: remove the "cooking" label so future runs aren't blocked.
+    try {
+      const lbls = labelsFor(agentName);
+      const instId = queue.getById(numericId).installation_id ?? undefined;
+      const { gh } = await authProvider.forRepo(run.repo, instId);
+      await gh.removeIssueLabel(run.repo, run.issue, lbls.cooking.name);
+    } catch (e) {
+      log.warn({ err: e, jobId: id }, "could not remove cooking label after cancel");
+    }
+    return { ok: true };
   });
 }
 

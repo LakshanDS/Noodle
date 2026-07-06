@@ -122,7 +122,14 @@
   .run .meta { flex: 1 1 auto; min-width: 0; }
   .run .repo { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .run .issue { color: var(--text-dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .run .badge { flex: 0 0 auto; font-size: 12px; color: var(--text-dim); text-align: right; white-space: nowrap; }
+  .run .badge { flex: 0 0 auto; font-size: 12px; color: var(--text-dim); text-align: right; white-space: nowrap; display: flex; align-items: center; gap: 8px; }
+  .cancel-btn {
+    padding: 4px 10px; border: 1px solid var(--fail); border-radius: 6px;
+    background: transparent; color: var(--fail); font-size: 11px; font-weight: 600;
+    white-space: nowrap; min-height: 28px;
+  }
+  .cancel-btn:active { background: rgba(248,81,73,0.15); }
+  .cancel-btn:disabled { opacity: 0.5; cursor: default; }
   .list-empty { padding: 60px 24px; text-align: center; color: var(--text-dim); font-size: 14px; }
   .list-empty .emoji { font-size: 36px; display: block; margin-bottom: 8px; }
 
@@ -222,6 +229,7 @@
     <div class="topbar">
       <button class="icon-btn" id="back-btn" title="Back" aria-label="Back">‹</button>
       <span class="title" id="chat-title">Run</span>
+      <button class="cancel-btn hidden" id="chat-cancel-btn">Cancel</button>
       <button class="icon-btn" id="refresh-chat" title="Refresh" aria-label="Refresh">↻</button>
     </div>
     <div class="scroll" id="chat-scroll">
@@ -327,13 +335,40 @@ function renderRuns(runs) {
       '<div class="badge"></div>';
     row.querySelector(".repo").textContent = repoName + " #" + r.issue;
     row.querySelector(".issue").textContent = r.repo;
-    row.querySelector(".badge").textContent = statusText(r.status);
+    const badge = row.querySelector(".badge");
+    badge.textContent = statusText(r.status);
+    if (r.status === "running") {
+      const btn = document.createElement("button");
+      btn.className = "cancel-btn";
+      btn.textContent = "Cancel";
+      btn.addEventListener("click", (e) => { e.stopPropagation(); cancelRun(r.job_id, btn); });
+      badge.appendChild(btn);
+    }
     row.addEventListener("click", () => openChat(r.job_id));
     el.appendChild(row);
   }
 }
 
 $("refresh-runs").addEventListener("click", openRuns);
+
+async function cancelRun(jobId, btn) {
+  btn.disabled = true;
+  btn.textContent = "Cancelling…";
+  try {
+    const res = await api("/api/runs/" + encodeURIComponent(jobId) + "/cancel", { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      btn.textContent = body.error || "Failed";
+      btn.disabled = false;
+      return;
+    }
+    // Refresh the list to reflect the updated status.
+    await openRuns();
+  } catch {
+    btn.textContent = "Error";
+    btn.disabled = false;
+  }
+}
 
 // ---------- Chat ----------
 async function openChat(jobId) {
@@ -357,6 +392,33 @@ async function loadChat(jobId) {
 
 function renderChat(run, messages) {
   $("chat-title").textContent = (run.repo.split("/").pop() || run.repo) + " #" + run.issue;
+
+  // Show cancel button only for running jobs.
+  const cancelBtn = $("chat-cancel-btn");
+  if (run.status === "running") {
+    cancelBtn.classList.remove("hidden");
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = async () => {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = "Cancelling…";
+      try {
+        const res = await api("/api/runs/" + encodeURIComponent(run.job_id) + "/cancel", { method: "POST" });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          cancelBtn.textContent = body.error || "Failed";
+          cancelBtn.disabled = false;
+          return;
+        }
+        await loadChat(run.job_id);
+      } catch {
+        cancelBtn.textContent = "Error";
+        cancelBtn.disabled = false;
+      }
+    };
+  } else {
+    cancelBtn.classList.add("hidden");
+  }
 
   const statusEl = $("chat-status");
   const colors = { succeeded: "var(--ok)", failed: "var(--fail)", running: "var(--running)", no_changes: "var(--none)" };
