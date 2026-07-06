@@ -1,20 +1,27 @@
 # --- Build stage ---
-FROM node:22-bookworm-slim AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+# alpine = musl libc. better-sqlite3 has no reliable musl prebuild, so it
+# compiles from source via node-gyp: build-base + python3 + make are required.
+FROM node:22-alpine AS builder
+RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
+
 COPY tsconfig.json ./
 COPY src/ src/
 RUN npm run build
 
-# --- Runtime stage ---
-FROM node:22-bookworm-slim
+# Drop dev deps so only what the runtime needs is copied to the next stage.
+# Native modules (.node) built above against musl carry through untouched.
+RUN npm prune --omit=dev
 
-# git needed for clone/push; ca-certificates for HTTPS
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+# --- Runtime stage ---
+# alpine: ~50MB base vs ~150MB for slim. git + ca-certificates are the only
+# extras needed (clone/push + HTTPS). node_modules is copied from the builder,
+# so no toolchain is needed here.
+FROM node:22-alpine
+RUN apk add --no-cache git ca-certificates
 
 # Default git identity for agent commits
 RUN git config --global user.name "noodle-agent" && \
@@ -23,8 +30,7 @@ RUN git config --global user.name "noodle-agent" && \
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
-
+COPY --from=builder /app/node_modules/ node_modules/
 COPY --from=builder /app/dist/ dist/
 COPY skills/ skills/
 

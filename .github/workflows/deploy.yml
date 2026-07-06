@@ -34,15 +34,3 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.vars.outputs.image }}
-
-      - name: Deploy to VPS
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            cd /opt/noodle-agent
-            docker compose pull
-            docker compose up -d --force-recreate
-            docker image prune -f
