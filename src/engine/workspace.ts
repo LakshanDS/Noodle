@@ -45,13 +45,14 @@ export class Workspace {
   async checkoutOrReuse(name: string, freshCloneUrl: string): Promise<void> {
     // Fetch the remote feature branch so we have its commits + a FETCH_HEAD
     // pointer to reset onto. simple-git's fetch(remote, ref) pulls just this ref.
+    // Fetching from a raw URL (not "origin") only sets FETCH_HEAD — it does NOT
+    // create a refs/remotes/origin/<name> tracking ref.
     await this.git.fetch(freshCloneUrl, name);
-    // Reset onto the fetched tip — agent now starts from where the last run
-    // left off, not from base. HEAD before reset is the freshly-cloned base,
-    // so there's nothing local to lose.
-    await this.git.raw(["reset", "--hard", "FETCH_HEAD"]);
-    // Check out the (now-current) branch so commits land on it by name.
-    await this.git.checkout(name);
+    // Create-or-reset the local branch at FETCH_HEAD, then check it out. The
+    // old sequence (reset --hard FETCH_HEAD; checkout name) left HEAD detached
+    // with no local branch named <name>, so the checkout failed with
+    // "pathspec did not match". `checkout -B` resolves both in one step.
+    await this.git.checkout(["-B", name, "FETCH_HEAD"]);
     log.debug({ dir: this.path, branch: name }, "reused existing remote branch");
   }
 
@@ -92,20 +93,25 @@ export class Workspace {
    * remote is re-pointed first — used on long agent runs where the token baked
    * into the clone-time URL has since expired.
    *
-   * Uses `--force-with-lease` instead of a plain push: a reused branch's local
-   * history is rebased on top of the previous attempt by `checkoutOrReuse`, so
-   * the remote tip has diverged and a fast-forward push would be rejected. The
-   * lease protects against clobbering commits pushed by anything else since our
-   * fetch (e.g. a concurrent same-issue run) — it refuses rather than
-   * overwriting. On a fresh branch (first attempt) it's a no-op: nothing to
-   * lease against, nothing to clobber.
+   * `reuse` selects the push mode:
+   *  - false (fresh branch, first attempt): plain `--set-upstream`. A fresh
+   *    branch has no remote-tracking ref for `--force-with-lease` to verify
+   *    against, so git rejects it with "[rejected] (stale info)".
+   *  - true (reused branch, follow-up run): `--force-with-lease`. checkoutOrReuse
+   *    stacked this run's commits on top of the previous attempt's branch, so
+   *    the remote tip has diverged and a fast-forward would be rejected. The
+   *    lease refuses rather than clobbering commits pushed by anything else
+   *    since our fetch (e.g. a concurrent same-issue run).
    */
-  async push(branch: string, freshCloneUrl?: string): Promise<void> {
+  async push(branch: string, freshCloneUrl?: string, reuse = false): Promise<void> {
     if (freshCloneUrl) {
       await this.git.remote(["set-url", "origin", freshCloneUrl]);
     }
-    await this.git.push("origin", branch, ["--force-with-lease", "--set-upstream"]);
-    log.debug({ dir: this.path, branch, refreshed: !!freshCloneUrl }, "pushed");
+    const flags = reuse
+      ? ["--force-with-lease", "--set-upstream"]
+      : ["--set-upstream"];
+    await this.git.push("origin", branch, flags);
+    log.debug({ dir: this.path, branch, refreshed: !!freshCloneUrl, reuse }, "pushed");
   }
 
   /** Remove the temp dir. Safe to call multiple times. */

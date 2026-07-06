@@ -28,7 +28,7 @@ vi.mock("simple-git", () => ({
 
 import { Workspace } from "../src/engine/workspace.js";
 
-describe("Workspace.push token refresh", () => {
+describe("Workspace.push token refresh + push mode", () => {
   beforeEach(() => {
     Object.values(spies).forEach((s) => s.mockReset());
     spies.clone.mockResolvedValue(undefined);
@@ -42,7 +42,7 @@ describe("Workspace.push token refresh", () => {
   it("re-points origin to the fresh clone URL before pushing", async () => {
     const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
     const fresh = "https://x-access-token:FRESH-TOKEN@github.com/o/r.git";
-    await ws.push("feature", fresh);
+    await ws.push("feature", fresh, true);
 
     expect(spies.remote).toHaveBeenCalledWith(["set-url", "origin", fresh]);
     expect(spies.push).toHaveBeenCalledWith("origin", "feature", ["--force-with-lease", "--set-upstream"]);
@@ -53,12 +53,24 @@ describe("Workspace.push token refresh", () => {
     );
   });
 
+  it("uses plain push for a fresh branch (no remote-tracking ref to lease against)", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    const fresh = "https://x-access-token:FRESH-TOKEN@github.com/o/r.git";
+    await ws.push("feature", fresh, false);
+
+    expect(spies.push).toHaveBeenCalledWith("origin", "feature", ["--set-upstream"]);
+    expect(spies.push).not.toHaveBeenCalledWith(
+      "origin", "feature", ["--force-with-lease", "--set-upstream"],
+    );
+  });
+
   it("leaves origin untouched when no fresh URL is supplied (legacy/CLI path)", async () => {
     const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
     await ws.push("feature");
 
     expect(spies.remote).not.toHaveBeenCalled();
-    expect(spies.push).toHaveBeenCalledWith("origin", "feature", ["--force-with-lease", "--set-upstream"]);
+    // Default reuse=false → plain push.
+    expect(spies.push).toHaveBeenCalledWith("origin", "feature", ["--set-upstream"]);
   });
 });
 
@@ -71,25 +83,24 @@ describe("Workspace.checkoutOrReuse", () => {
     spies.checkout.mockResolvedValue(undefined);
   });
 
-  it("fetches the remote branch, hard-resets to FETCH_HEAD, then checks it out", async () => {
+  it("fetches the remote branch, then checks out -B at FETCH_HEAD", async () => {
     const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
     const fresh = "https://x-access-token:FRESH-TOKEN@github.com/o/r.git";
     await ws.checkoutOrReuse("noodle/issue-42", fresh);
 
     // Fetch pulls the single feature ref from the tokenized URL (not origin,
-    // which still carries the clone-time token).
+    // which still carries the clone-time token). Fetching from a raw URL only
+    // sets FETCH_HEAD — no refs/remotes/origin/<name> tracking ref.
     expect(spies.fetch).toHaveBeenCalledWith(fresh, "noodle/issue-42");
-    // Reset onto the fetched tip so the agent's work stacks on the previous
-    // attempt's commits.
-    expect(spies.raw).toHaveBeenCalledWith(["reset", "--hard", "FETCH_HEAD"]);
-    expect(spies.checkout).toHaveBeenCalledWith("noodle/issue-42");
-    // Ordering: fetch → reset → checkout. Reset before checkout means the
-    // working tree already reflects the reused tip when we switch onto it.
+    // checkout -B creates/resets the local branch at FETCH_HEAD in one step.
+    // The old sequence (reset --hard FETCH_HEAD; checkout name) left HEAD
+    // detached with no local branch, so the checkout failed with
+    // "pathspec did not match".
+    expect(spies.checkout).toHaveBeenCalledWith(["-B", "noodle/issue-42", "FETCH_HEAD"]);
+    // Ordering: fetch → checkout. No raw reset anymore.
     expect(spies.fetch.mock.invocationCallOrder[0]).toBeLessThan(
-      spies.raw.mock.invocationCallOrder[0],
-    );
-    expect(spies.raw.mock.invocationCallOrder[0]).toBeLessThan(
       spies.checkout.mock.invocationCallOrder[0],
     );
+    expect(spies.raw).not.toHaveBeenCalled();
   });
 });

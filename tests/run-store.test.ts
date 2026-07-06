@@ -115,4 +115,28 @@ describe("RunStore", () => {
     const after = store.getRun("job-1");
     expect(after).toEqual(before);
   });
+
+  it("createRun is idempotent on job_id (retried job reuses the same row)", () => {
+    // A retried job reuses the same job row (same job_id), so runJob calls
+    // createRun again with the same key. This must reset the row to 'running'
+    // and clear the prior attempt's terminal fields, not throw a PRIMARY KEY
+    // violation — otherwise every retried job dies at the first DB write.
+    store.createRun({ job_id: "job-1", repo: "o/r", issue: 1, branch: "b" });
+    store.updateRun("job-1", {
+      status: "failed",
+      error: "push rejected",
+      profile: "nim",
+      pr_url: "https://x/p/1",
+      finished_at: "2026-01-01T00:00:00Z",
+    });
+    // Retry: same job_id, possibly new branch.
+    const row = store.createRun({ job_id: "job-1", repo: "o/r", issue: 1, branch: "b2" });
+    expect(row.status).toBe("running");
+    expect(row.branch).toBe("b2");
+    expect(row.profile).toBeNull();        // prior attempt's profile cleared
+    expect(row.error).toBeNull();          // prior error cleared
+    expect(row.pr_url).toBeNull();         // prior PR cleared
+    expect(row.finished_at).toBeNull();    // ready for a fresh finish
+    expect(store.listRuns()).toHaveLength(1); // still one row, not two
+  });
 });

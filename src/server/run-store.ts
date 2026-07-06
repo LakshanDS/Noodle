@@ -83,12 +83,33 @@ export class RunStore {
     return new RunStore(db);
   }
 
-  /** Insert a new run row (status 'running', started_at = now). */
+  /**
+   * Insert a new run row (status 'running', started_at = now). Idempotent on
+   * job_id: a retried job reuses the same job row (and thus the same job_id),
+   * so a retry calls createRun again with the same key. ON CONFLICT resets the
+   * row to 'running' and clears the prior attempt's terminal fields instead of
+   * throwing a PRIMARY KEY violation — without this every retried job would die
+   * at the first DB write.
+   */
   createRun(run: NewRun): RunRow {
     this.db
       .prepare(
         `INSERT INTO runs (job_id, repo, issue, branch, session_path, status)
-         VALUES (@job_id, @repo, @issue, @branch, @session_path, 'running')`,
+         VALUES (@job_id, @repo, @issue, @branch, @session_path, 'running')
+         ON CONFLICT(job_id) DO UPDATE SET
+           repo = excluded.repo,
+           issue = excluded.issue,
+           branch = excluded.branch,
+           profile = NULL,
+           model = NULL,
+           status = 'running',
+           pr_url = NULL,
+           comment_url = NULL,
+           summary = NULL,
+           error = NULL,
+           session_path = NULL,
+           started_at = datetime('now'),
+           finished_at = NULL`,
       )
       .run({ session_path: null, ...run });
     return this.getRun(run.job_id);

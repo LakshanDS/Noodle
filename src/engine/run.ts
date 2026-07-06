@@ -14,6 +14,7 @@ import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
 import { slugify } from "../util/slugify.js";
+import { extractProfileTag } from "../triggers/check.js";
 import {
   AuthStorage,
   ModelRegistry,
@@ -131,6 +132,14 @@ export async function runJob(
      */
     tokenProvider?: () => Promise<string>;
     ghProvider?: () => Promise<GitHubClient>;
+    /**
+     * Called once after the authoritative profile is resolved, so the caller
+     * (serve) can correct the job row's enqueue-time profile hint. The hint
+     * (from a #tag or default) is usually right, but label/keyword routing can
+     * resolve differently — keeping the row accurate matters for per-profile
+     * concurrency gating. CLI runs don't set this (no queue).
+     */
+    onProfileResolved?: (profile: string) => void;
   },
 ): Promise<RunResult> {
   const agentName = config.agent_name;
@@ -186,9 +195,32 @@ export async function runJob(
   const comments = await gh.getIssueComments(input.repo, input.issueNumber);
   log_.info({ title: issue.title, labels: issue.labels }, "fetched issue");
 
-  // Ensure both status labels exist in the repo (creates them if missing), then
-  // mark the issue as being worked on.
+  // 1a. Concurrency gate: if the "cooking" label is already on the issue, a run
+  // is in progress — don't start a second one. Post a short no-op comment and
+  // return a clean result (NOT an error, so the worker doesn't retry). Terminal
+  // labels (cooked/failed) do NOT block: they signal a finished run and allow a
+  // follow-up. This makes the label the visible source of truth for "is the
+  // agent busy here?".
   const labels = labelsFor(agentName);
+  const lowerLabels = new Set(issue.labels.map((l) => l.toLowerCase()));
+  if (lowerLabels.has(labels.cooking.name.toLowerCase())) {
+    log_.info("skipping — issue already has the cooking label (a run is in progress)");
+    await gh.createIssueComment(
+      input.repo,
+      input.issueNumber,
+      `_${displayName(agentName)} is already cooking on this issue — the new request will start once the current run finishes._`,
+    );
+    return {
+      profile: "",
+      model: "",
+      changedFiles: [],
+      commentUrl: "",
+    };
+  }
+
+  // Ensure both status labels exist in the repo (creates them if missing), then
+  // mark the issue as being worked on. (The `labels` const is already defined
+  // above, before the concurrency gate.)
   await gh.ensureLabel(
     input.repo,
     labels.cooking.name,
@@ -210,17 +242,29 @@ export async function runJob(
   await gh.addIssueLabel(input.repo, input.issueNumber, labels.cooking.name);
   log_.info({ label: labels.cooking.name }, "added status label");
 
-  // 2. Route to a profile.
-  const profile = resolveProfile(config, {
-    title: issue.title,
-    body: issue.body,
-    labels: issue.labels,
-    comments: comments.map((c) => c.body),
-  });
-  log_.info({ profile: profile.name, model: profile.model }, "routed profile");
+  // 2. Route to a profile. A `#<profile>` tag in body or a comment is the
+  // highest-priority selector — it wins over label/keyword/default routing.
+  // Otherwise fall back to resolveProfile (slash/label/keyword/default).
+  const profileNames = Object.keys(config.profiles);
+  const tagProfile = extractProfileTag(issue.body ?? "", profileNames)
+    ?? comments.map((c) => extractProfileTag(c.body ?? "", profileNames)).find((p) => p !== null)
+    ?? null;
+  const profile = tagProfile && config.profiles[tagProfile]
+    ? { name: tagProfile, ...config.profiles[tagProfile] }
+    : resolveProfile(config, {
+        title: issue.title,
+        body: issue.body,
+        labels: issue.labels,
+        comments: comments.map((c) => c.body),
+      });
+  log_.info({ profile: profile.name, model: profile.model, via: tagProfile ? "#tag" : "routing" }, "routed profile");
   if (runStore) {
     runStore.updateRun(jobId, { profile: profile.name, model: profile.model });
   }
+  // Correct the job row's enqueue-time profile hint if authoritative resolution
+  // differed (e.g. label routing overrode the default). Keeps per-profile
+  // concurrency gating accurate.
+  deps?.onProfileResolved?.(profile.name);
 
   // 3. Resolve the model via the registry.
   const authStorage = deps?.authStorage ?? AuthStorage.create();
@@ -434,7 +478,7 @@ export async function runJob(
         if (committed) {
           // Re-mint credentials right before push — a long agent run can
           // exceed the token's TTL (1h for GitHub-App installation tokens).
-          await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()));
+          await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()), reuseBranch);
           const changedFiles = await ws.changedFiles();
           const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
           // Re-resolve the gh client too — same expiry risk on the post-run
@@ -464,10 +508,7 @@ export async function runJob(
 
           await swapLabel(ghNow, input.repo, input.issueNumber, labels, "cooked", log_);
 
-          const commentBody = buildIssueComment(profile, agentAnswer, {
-            prNumber: pr.number,
-            prUrl: pr.html_url,
-          }, agentName, runStats);
+          const commentBody = buildIssueComment(profile, agentAnswer, agentName, runStats);
           const commentUrl = await ghNow.createIssueComment(input.repo, input.issueNumber, commentBody);
           if (runStore) {
             runStore.updateRun(jobId, {
@@ -499,7 +540,7 @@ export async function runJob(
       await swapLabel(ghNow, input.repo, input.issueNumber, labels, errored ? "failed" : "cooked", log_);
       const commentBody = errored
         ? buildErrorComment(profile, stopReason.errorMessage ?? "unknown error", agentName, runStats)
-        : buildIssueComment(profile, agentAnswer, undefined, agentName, runStats);
+        : buildIssueComment(profile, agentAnswer, agentName, runStats);
       const commentUrl = await ghNow.createIssueComment(input.repo, input.issueNumber, commentBody);
       if (errored) {
         log_.warn({ hasAnswer: !!agentAnswer }, "agent errored; posted error comment");
@@ -529,7 +570,17 @@ export async function runJob(
       teardownDisposeGuard();
     }
   } catch (e) {
-    // Mark the run failed (rethrow so the caller still sees the error).
+    // Mark the run failed (rethrow so the caller still sees the error). Also
+    // swap the cooking → failed label: the run added the cooking label at the
+    // start, and a thrown error skips the normal terminal-label path. Without
+    // this cleanup the cooking label would linger, and the concurrency gate
+    // above would block every retry of this failed run forever. Best-effort —
+    // a transient API failure here must not mask the original error.
+    try {
+      await swapLabel(gh, input.repo, input.issueNumber, labels, "failed", log_);
+    } catch (cleanupErr) {
+      log_.warn({ err: cleanupErr }, "could not swap cooking→failed label after error");
+    }
     if (runStore) {
       runStore.updateRun(jobId, { status: "failed", error: (e as Error).message ?? String(e), finished_at: nowIso() });
     }
@@ -845,14 +896,6 @@ async function swapLabel(
 // random dev-humor one-liner. When the agent produced no final message, a short
 // deterministic fallback keeps the run useful instead of posting nothing.
 
-/** PR link details shown in the footer when a PR was opened. */
-export interface CommentFooter {
-  /** PR number, when a PR was opened. */
-  prNumber?: number;
-  /** PR URL, when a PR was opened. */
-  prUrl?: string;
-}
-
 /**
  * Generic dev-humor one-liners. One is picked at random per footer — a small
  * bit of personality at the bottom of each comment. Kept G-rated and on-theme
@@ -882,9 +925,20 @@ export function formatDuration(ms: number): string {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
-/** Format an integer with thousands separators (1234567 → "1,234,567"). */
+/**
+ * Compact token count with a magnitude suffix: 842 → "842", 45210 → "45.21K",
+ * 6154663 → "6.15M", 12017498 → "12.02B". Trailing zeros are trimmed so 10000
+ * renders as "10K" not "10.00K". Sub-1000 counts stay as plain integers.
+ */
 function formatTokens(n: number): string {
-  return Math.round(n).toLocaleString("en-US");
+  const abs = Math.abs(n);
+  if (abs < 1000) return String(Math.round(n));
+  for (const [div, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]] as const) {
+    if (abs >= div) {
+      return `${(n / div).toFixed(2).replace(/\.?0+$/, "")}${suffix}`;
+    }
+  }
+  return String(Math.round(n));
 }
 
 /** Format a USD cost, trimming to cents for small amounts. */
@@ -894,33 +948,42 @@ function formatCost(usd: number): string {
 }
 
 /**
+ * Display name for human-facing output (comments/PR body): the configured agent
+ * name with an `-Agent` suffix, e.g. "Noodle" → "Noodle-Agent". No-op if the
+ * name already ends in "Agent" (case-insensitive). Internal uses (git identity,
+ * labels, prompts) keep the raw config name.
+ */
+function displayName(agentName: string): string {
+  return /agent$/i.test(agentName) ? agentName : `${agentName}-Agent`;
+}
+
+/**
  * Build the rich footer block, one fact per line:
  *
  *   🤖 **Noodle-Agent**
  *   Profile: claude (anthropic/claude-sonnet-4-20250514)
  *   Cooked for: 4m 12s · 8 tool calls · 3 turns
- *   Tokens: 45,210 in · 3,180 out · 61,190 total
+ *   Tokens: 45.21K in · 3.18K out · 48.39K total
  *   Cost: $0.18
  *   *<random fun line>*
  *
  * Token and cost lines are omitted when not applicable: local/custom models
  * with no pricing show tokens but no cost; a missing stats object shows neither.
- * The PR link (when a PR was opened) appends to the Profile line.
  */
 export function buildFooter(
   profile: { name: string; provider: string; model: string },
   agentName: string,
   stats?: RunStats,
-  footer?: CommentFooter,
 ): string {
   const lines: string[] = [];
 
   // Line 1: agent name only.
-  lines.push(`🤖 **${agentName}**`);
+  lines.push(`🤖 **${displayName(agentName)}**`);
 
-  // Line 2: profile + model, with the PR link if one was opened.
-  const prPart = footer?.prUrl && footer.prNumber ? ` · PR #${footer.prNumber}: ${footer.prUrl}` : "";
-  lines.push(`Profile: ${profile.name} (\`${profile.provider}/${profile.model}\`)${prPart}`);
+  // Line 2: profile + model. The PR link is intentionally not repeated here —
+  // the issue already shows the linked PR in its timeline, and the PR body has
+  // its own footer without this line.
+  lines.push(`Profile: ${profile.name} (\`${profile.provider}/${profile.model}\`)`);
 
   // Line 3+: stats (only if we have something to show).
   if (stats) {
@@ -996,13 +1059,12 @@ export function buildPrBody(
 export function buildIssueComment(
   profile: { name: string; provider: string; model: string },
   agentMessage: string | undefined,
-  footer?: CommentFooter,
   agentName = "Noodle",
   stats?: RunStats,
 ): string {
   const body = agentMessage?.trim() ||
-    `_${agentName} ran but made no code changes and left no message. The issue may need clarification, or it may not be a code change._`;
-  return `${body}\n\n---\n${buildFooter(profile, agentName, stats, footer)}`;
+    `_${displayName(agentName)} ran but made no code changes and left no message. The issue may need clarification, or it may not be a code change._`;
+  return `${body}\n\n---\n${buildFooter(profile, agentName, stats)}`;
 }
 
 /**
@@ -1018,8 +1080,9 @@ export function buildErrorComment(
   stats?: RunStats,
 ): string {
   const err = errorMessage.trim() || "unknown error";
+  const name = displayName(agentName);
   const body =
-    `⚠️ **${agentName}'s run on this issue errored out before finishing.**\n\n` +
+    `⚠️ **${name}'s run on this issue errored out before finishing.**\n\n` +
     `> \`${err}\`\n\n` +
     `No changes were made. The run may be retried once the underlying issue ` +
     `(API quota, rate limit, provider outage, etc.) is resolved.`;
