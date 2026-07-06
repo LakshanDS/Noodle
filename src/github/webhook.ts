@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { slugify } from "../util/slugify.js";
+import { extractProfileTag, mentionsAgent, shouldTrigger, type TriggerConfig } from "../triggers/check.js";
 
 /**
  * Pure webhook helpers — HMAC signature verification and event parsing.
@@ -20,6 +21,13 @@ export interface WebhookIntent {
   issueNumber: number;
   /** App installation id, when present (App auth mode). */
   installationId?: number;
+  /**
+   * Profile hint from a `#<profile>` tag in the body/comment, when present.
+   * Used as the enqueue-time profile for per-profile concurrency gating. The
+   * authoritative profile is still resolved inside runJob (which sees the full
+   * issue + comments), but the hint is enough for the gate.
+   */
+  profileHint?: string;
 }
 
 /**
@@ -40,15 +48,21 @@ export function verifySignature(body: string, signature: string | undefined, sec
  * is not one Noodle should act on (ping, unrelated actions, PR events, etc.).
  *
  * Recognized events:
- * - `issues` with action opened | reopened | labeled
+ * - `issues` with action opened | reopened | labeled — only when the issue
+ *   body PASSES the configured `triggers` wake filter (default: opt-in, so the
+ *   body must @-mention the agent or carry a keyword / slash / #profile tag).
+ *   Set `triggers.trigger_on_open: true` to restore "fire on every issue".
  * - `issues` with action assigned — but only when the issue was assigned to
  *   Noodle itself (`selfLogin` matches the new assignee's login). Assignment
+ *   is unconditional wake; it does NOT go through the trigger filter. Assignment
  *   to a human teammate is ignored so Noodle doesn't run on every reshuffle.
- * - `issue_comment` with action created, when the comment body starts with `/noodle`
+ * - `issue_comment` with action created, when the comment body explicitly
+ *   wakes the agent: `/<agent>` slash command, `@<agent>` mention, or a
+ *   `#<configured-profile>` tag.
  *
  * `label`-on-`labeled` is handled by `resolveProfile` later (it reads labels
  * from the issue, not the webhook), so we don't filter by which label was added
- * here — just confirm a label event happened.
+ * here — but the labeled event still must pass the wake filter to fire.
  *
  * `selfLogin` is Noodle's own login (e.g. the bot user). Required to scope the
  * `assigned` trigger; when omitted, `assigned` events are ignored.
@@ -58,6 +72,8 @@ export function parseWebhookEvent(
   payload: unknown,
   selfLogin?: string,
   agentName = "Noodle",
+  triggers?: TriggerConfig,
+  profileNames: string[] = [],
 ): WebhookIntent | null {
   const p = payload as {
     action?: string;
@@ -81,11 +97,29 @@ export function parseWebhookEvent(
   const issueNumber = p.issue.number;
   const installationId = p.installation?.id;
 
+  // Default to opt-in (mention-only) when the caller passes no triggers config.
+  // To restore "fire-on-everything", set triggers.trigger_on_open: true.
+  const cfg: TriggerConfig = triggers ?? {
+    trigger_on_mention: true,
+    trigger_keywords: [],
+    trigger_on_open: false,
+  };
+
   if (event === "issues") {
     if (p.action === "opened" || p.action === "reopened" || p.action === "labeled") {
-      return { kind: "issue", repo, issueNumber, installationId };
+      // Opt-in wake filter: the issue body must carry a wake signal (mention,
+      // keyword, slash, or #profile). The webhook payload carries the body but
+      // NOT the comment thread, so the gate runs on body alone here; a wake
+      // posted as a comment on an existing issue is caught by the dedicated
+      // `issue_comment.created` branch below.
+      const body = (p.issue.body ?? "") as string;
+      const { wake } = shouldTrigger({ agentName, body, comments: [], triggers: cfg, profileNames });
+      if (!wake) return null;
+      return { kind: "issue", repo, issueNumber, installationId, profileHint: extractProfileTag(body, profileNames) ?? undefined };
     }
     // Only trigger on assignment when Noodle itself is the new assignee.
+    // Assignment is unconditional wake (being assigned IS the signal) — it
+    // doesn't go through the trigger filter.
     if (p.action === "assigned" && selfLogin) {
       const newAssignee = p.assignee?.login?.toLowerCase();
       if (newAssignee && newAssignee === selfLogin.toLowerCase()) {
@@ -97,11 +131,22 @@ export function parseWebhookEvent(
 
   if (event === "issue_comment") {
     if (p.action !== "created") return null;
-    // Slash-command rerun: only react to comments starting with /<agent>.
+    // A new comment wakes the agent when it explicitly invites it:
+    //   - `/<agent>` slash command (e.g. /noodle fix this), OR
+    //   - `@<agent>` mention (e.g. @noodle can you look?), OR
+    //   - `#<profile>` tag (e.g. #claude rerun with claude)
+    // trigger_keywords / trigger_on_open are body-level concerns handled by
+    // the scheduler scan; the webhook only needs to react to explicit nudges.
     const body = (p.comment?.body ?? "").trim();
-    const cmd = slugify(agentName);
-    if (!new RegExp(`^\\/${cmd}\\b`, "i").test(body)) return null;
-    return { kind: "comment", repo, issueNumber, installationId };
+    if (!body) return null;
+    const slug = slugify(agentName);
+    const isSlash = new RegExp(`^\\/${slug}\\b`, "i").test(body);
+    const isMention = mentionsAgent(body, agentName);
+    const hasProfileTag = profileNames.some(
+      (name) => name && new RegExp(`(?:^|\\s)#${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(body),
+    );
+    if (!isSlash && !isMention && !hasProfileTag) return null;
+    return { kind: "comment", repo, issueNumber, installationId, profileHint: extractProfileTag(body, profileNames) ?? undefined };
   }
 
   return null;

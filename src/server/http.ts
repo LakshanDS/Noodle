@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { verifySignature, parseWebhookEvent } from "../github/webhook.js";
 import { log } from "../util/log.js";
+import type { TriggerConfig } from "../triggers/check.js";
 
 /**
  * fastify webhook receiver. POST /webhook:
@@ -14,7 +15,12 @@ import { log } from "../util/log.js";
 
 export interface WebhookHandlerDeps {
   /** Enqueue a parsed intent. The http layer never runs the agent. */
-  enqueue(intent: { repo: string; issueNumber: number; installationId?: number }): Promise<void> | void;
+  enqueue(intent: {
+    repo: string;
+    issueNumber: number;
+    installationId?: number;
+    profileHint?: string;
+  }): Promise<void> | void;
   /**
    * Noodle's own login, used to scope `assigned` events to assignments that
    * target Noodle (ignored when unset — assignments then do nothing).
@@ -22,6 +28,15 @@ export interface WebhookHandlerDeps {
   selfLogin?: string;
   /** Configurable agent display name (default "Noodle"). Used for slash-command trigger. */
   agentName?: string;
+  /**
+   * Opt-in wake filter for `issues.*` events (mention / keyword / always).
+   * When omitted, `parseWebhookEvent` falls back to a safe default
+   * (mention-only). Production callers should pass the config's triggers
+   * block so the user-configured trigger set is honored.
+   */
+  triggers?: TriggerConfig;
+  /** Configured profile names — enables `#<profile>` tag wake/routing. */
+  profileNames?: string[];
 }
 
 export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): FastifyInstance {
@@ -61,7 +76,14 @@ export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): Fast
       return reply.code(400).send({ error: "invalid json" });
     }
 
-    const intent = parseWebhookEvent(event ?? "", payload, deps.selfLogin, deps.agentName);
+    const intent = parseWebhookEvent(
+      event ?? "",
+      payload,
+      deps.selfLogin,
+      deps.agentName,
+      deps.triggers,
+      deps.profileNames ?? [],
+    );
     if (!intent) {
       // Acknowledge but ignore — not an event Noodle acts on.
       return reply.code(202).send({ ok: true, ignored: true });

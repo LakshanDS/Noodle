@@ -89,6 +89,17 @@ export const ProfileSchema = z.object({
    * `0` = unlimited. Default: 30.
    */
   api_rpm: z.number().int().min(0).default(30),
+  /**
+   * Max jobs of this profile that may run at the same time. Optional — when
+   * unset, the profile is limited only by the global `queue.concurrency`.
+   *
+   * Set this when profiles use separate API keys (e.g. one NVIDIA key per
+   * profile) so they can run in parallel up to each key's budget, while still
+   * preventing N jobs of the same profile from splitting a single key's rate
+   * limit. The global `queue.concurrency` stays the hard total ceiling across
+   * ALL profiles.
+   */
+  max_concurrent: z.number().int().min(1).optional(),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
 
@@ -178,6 +189,34 @@ export const QueueConfigSchema = z.object({
 });
 export type QueueConfig = z.infer<typeof QueueConfigSchema>;
 
+/**
+ * How the agent wakes up on an issue. By default Noodle is opt-in: it ONLY
+ * runs when the issue or a comment carries an explicit wake signal (an
+ * `@<agent>` mention, a listed keyword, a `/<agent>` slash command, or a
+ * `#<profile>` tag). Without these filters the agent would fire on every new
+ * issue in an installed repo — burning tokens on issues the reporter never
+ * intended for it. Opt-in eliminates that.
+ *
+ *   - `trigger_on_mention: true` (default) — fires when body/comments @-mention
+ *     the agent (e.g. `@Noodle`, `@noodle`, `@noodle-agent`). Case-insensitive,
+ *     word-boundary-aware so `@noodles` does NOT match.
+ *   - `trigger_keywords: [...]` — extra substrings (compared case-insensitive)
+ *     that also fire when present in body or a comment.
+ *   - `trigger_on_open: false` (default) — when `true`, the agent ALSO fires on
+ *     any new/reopened/labeled issue regardless of mention/keyword; this
+ *     restores the pre-opt-in behavior for users who want it.
+ *
+ * Slash commands (`/<agent>` in a comment), assignment to the agent, and a
+ * `#<profile-name>` tag are always honored — they're explicit user intent
+ * regardless of this config.
+ */
+export const TriggersConfigSchema = z.object({
+  trigger_on_mention: z.boolean().default(true),
+  trigger_keywords: z.array(z.string().min(1)).default([]),
+  trigger_on_open: z.boolean().default(false),
+});
+export type TriggersConfig = z.infer<typeof TriggersConfigSchema>;
+
 export const NoodleConfigSchema = z.object({
   /** Display name used in issue labels, comments, PR bodies, branch names, etc. */
   agent_name: z.string().min(1).default("Noodle"),
@@ -197,6 +236,16 @@ export const NoodleConfigSchema = z.object({
     concurrency: 1,
     max_attempts: 3,
     retry_backoff_seconds: 60,
+  }),
+  /**
+   * Wakeup filters for `issues.*` events (webhooks, scheduler scan). See
+   * `TriggersConfigSchema` above. Slash commands, assignment, and `#<profile>`
+   * tags are always honored regardless of this block.
+   */
+  triggers: TriggersConfigSchema.nullish().transform((v) => v ?? {
+    trigger_on_mention: true,
+    trigger_keywords: [],
+    trigger_on_open: false,
   }),
 });
 export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;

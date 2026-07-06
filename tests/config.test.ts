@@ -43,6 +43,18 @@ describe("config schema", () => {
     expect(c.profiles.unlimited.api_rpm).toBe(0);
   });
 
+  it("accepts an optional per-profile max_concurrent (undefined by default)", () => {
+    const c = NoodleConfigSchema.parse({
+      ...validBase,
+      profiles: {
+        cheap: { provider: "openrouter", model: "haiku" }, // omitted → undefined
+        capped: { provider: "openrouter", model: "haiku", max_concurrent: 2 },
+      },
+    });
+    expect(c.profiles.cheap.max_concurrent).toBeUndefined();
+    expect(c.profiles.capped.max_concurrent).toBe(2);
+  });
+
   it("rejects an unknown thinking_level", () => {
     const r = NoodleConfigSchema.safeParse({
       ...validBase,
@@ -99,6 +111,31 @@ describe("Phase 2 config blocks", () => {
     expect(c.storage.sqlite_path).toBe("/var/noodle.db");
     expect(c.scheduler.enabled).toBe(true);
     expect(c.scheduler.repos).toEqual(["owner/name"]);
+  });
+
+  it("applies opt-in trigger defaults", () => {
+    const c = NoodleConfigSchema.parse(validBase);
+    expect(c.triggers).toEqual({
+      trigger_on_mention: true,
+      trigger_keywords: [],
+      trigger_on_open: false,
+    });
+  });
+
+  it("accepts an explicit triggers block (legacy always-fire mode)", () => {
+    const c = NoodleConfigSchema.parse({
+      ...validBase,
+      triggers: {
+        trigger_on_mention: false,
+        trigger_keywords: ["agent-fix"],
+        trigger_on_open: true,
+      },
+    });
+    expect(c.triggers).toEqual({
+      trigger_on_mention: false,
+      trigger_keywords: ["agent-fix"],
+      trigger_on_open: true,
+    });
   });
 
   it("flags scheduler enabled with no repos", () => {

@@ -49,6 +49,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       runStore,
       tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
       ghProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.gh),
+      // Correct the job row's profile hint once the authoritative profile is
+      // known, so per-profile concurrency gating stays accurate.
+      onProfileResolved: (profile) => queue.setJobProfile(job.id, profile),
     });
   };
 
@@ -57,12 +60,22 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // 1 (safe for a small VPS — each agent run holds a workspace + pi session in
   // memory); raise via `queue.concurrency` only with headroom.
   const concurrency = config.queue.concurrency;
+  // Per-profile concurrency cap: profiles with `max_concurrent` set are limited
+  // to that many simultaneous runs (so profiles on separate API keys can run in
+  // parallel without a single key being split). Profiles without it fall back to
+  // the global ceiling. The global pool size is still the hard total cap.
+  const capacityFor = (profile: string): number =>
+    config.profiles[profile]?.max_concurrent ?? concurrency;
   const workerOpts = {
     maxAttempts: config.queue.max_attempts,
     retryBackoffSec: config.queue.retry_backoff_seconds,
+    capacityFor,
   };
   const workers = Array.from({ length: concurrency }, () => new QueueWorker(queue, runJobFn, workerOpts));
-  log.info({ concurrency, maxAttempts: workerOpts.maxAttempts }, "worker pool configured");
+  log.info(
+    { concurrency, maxAttempts: workerOpts.maxAttempts, perProfile: Object.fromEntries(Object.entries(config.profiles).filter(([, p]) => p.max_concurrent).map(([k, p]) => [k, p.max_concurrent])) },
+    "worker pool configured",
+  );
 
   // Webhook handler → enqueue into the queue.
   const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET ?? "";
@@ -86,15 +99,33 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const app = createWebhookApp(webhookSecret, {
     selfLogin,
     agentName: config.agent_name,
+    // Opt-in wake filter for `issues.*` events — see src/triggers/check.ts.
+    // Slash commands (`/<agent>`), assignment, and `#<profile>` tags are always
+    // honored and don't go through this filter.
+    triggers: config.triggers,
+    profileNames: Object.keys(config.profiles),
     enqueue: async (intent) => {
       queue.enqueue({
         repo: intent.repo,
         issueNumber: intent.issueNumber,
         installationId: intent.installationId,
         source: "webhook",
+        profile: intent.profileHint ?? config.default_profile,
       });
     },
   });
+
+  // Web UI (Phase 3): fail-closed — only registered when NOODLE_UI_PASSWORD is
+  // set, so an unconfigured deployment exposes nothing beyond /health + /webhook.
+  // The password doubles as the signed-cookie secret (see ui-auth.ts).
+  const uiPassword = process.env.NOODLE_UI_PASSWORD;
+  if (uiPassword) {
+    const { registerUiRoutes } = await import("./ui-routes.js");
+    registerUiRoutes(app, { runStore, secret: uiPassword });
+    log.info("web UI enabled (password-protected)");
+  } else {
+    log.warn("NOODLE_UI_PASSWORD not set — web UI disabled (/health + /webhook only)");
+  }
 
   // Scheduler (optional). Shares the queue + scan state.
   let scheduler: Scheduler | null = null;
@@ -113,8 +144,8 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         const { gh } = await authProvider.forRepo(repo, instId ?? undefined);
         return gh.listOpenIssues(repo, since);
       },
-      enqueue: async (repo, issueNumber) => {
-        queue.enqueue({ repo, issueNumber, source: "scheduler" });
+      enqueue: async (repo, issueNumber, profile) => {
+        queue.enqueue({ repo, issueNumber, source: "scheduler", profile });
       },
       state: scanState,
     };
@@ -190,8 +221,8 @@ export async function scanOnce(configPath: string | undefined, repo: string): Pr
       const { gh } = await authProvider.forRepo(r);
       return gh.listOpenIssues(r, since);
     },
-    enqueue: async (r, n) => {
-      console.log(`  → would enqueue ${r}#${n}`);
+    enqueue: async (r, n, profile) => {
+      console.log(`  → would enqueue ${r}#${n} (profile: ${profile})`);
     },
     state: scanState,
   };

@@ -1,8 +1,12 @@
 import { describe, it, expect, afterEach } from "vitest";
 import crypto from "node:crypto";
 import { createWebhookApp } from "../src/server/http.js";
+import type { TriggerConfig } from "../src/triggers/check.js";
 
 const SECRET = "whodunit";
+
+/** Legacy triggers: fire on every issue (used by tests that don't care about the wake filter). */
+const openAll: TriggerConfig = { trigger_on_mention: false, trigger_keywords: [], trigger_on_open: true };
 
 /** Sign a JSON payload the way GitHub does. */
 function sign(body: string, secret = SECRET): string {
@@ -14,7 +18,8 @@ const issueOpenedPayload = (issueNumber = 7) =>
     action: "opened",
     installation: { id: 42 },
     repository: { full_name: "owner/name" },
-    issue: { number: issueNumber },
+    // Body @-mentions the agent so the opt-in wake filter lets it through.
+    issue: { number: issueNumber, body: "@noodle please fix" },
   });
 
 const apps = new Set<{ close: () => Promise<unknown> }>();
@@ -28,9 +33,14 @@ async function postWebhook(opts: {
   body: string;
   sig?: string;
   selfLogin?: string;
+  triggers?: TriggerConfig;
   enqueue: (i: { kind: string; repo: string; issueNumber: number; installationId?: number }) => Promise<void> | void;
 }) {
-  const app = createWebhookApp(SECRET, { enqueue: opts.enqueue, selfLogin: opts.selfLogin });
+  const app = createWebhookApp(SECRET, {
+    enqueue: opts.enqueue,
+    selfLogin: opts.selfLogin,
+    triggers: opts.triggers,
+  });
   apps.add(app);
   return app.inject({
     method: "POST",

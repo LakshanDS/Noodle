@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   selectIssuesToEnqueue,
+  filterTriggered,
   runScanOnce,
   type ScanStateStore,
 } from "../src/server/scheduler.js";
@@ -9,6 +10,15 @@ import type { IssueData } from "../src/github/client.js";
 
 const config: NoodleConfig = {
   default_profile: "cheap",
+  // Opt-in trigger filter: require an @-mention / keyword / slash / #profile
+  // to wake the agent. Tests that don't care about the filter use
+  // trigger_on_open: true (legacy always-fire) so routing assertions stand.
+  triggers: {
+    trigger_on_mention: true,
+    trigger_keywords: [],
+    trigger_on_open: true,
+  },
+  agent_name: "Noodle",
   profiles: {
     cheap: { provider: "openrouter", model: "haiku", thinking_level: "off", tools: ["read"] },
     claude: { provider: "anthropic", model: "sonnet", thinking_level: "off", tools: ["read"] },
@@ -21,6 +31,8 @@ const config: NoodleConfig = {
   server: { host: "0.0.0.0", port: 3000 },
   storage: { sqlite_path: "./noodle.db" },
   scheduler: { enabled: true, interval_minutes: 30, repos: ["owner/repo"] },
+  run: { stall_timeout_minutes: 15, tool_stall_minutes: 60 },
+  queue: { concurrency: 1, max_attempts: 3, retry_backoff_seconds: 60 },
 };
 
 const issue = (n: number, over: Partial<IssueData> = {}): IssueData => ({
@@ -55,6 +67,31 @@ describe("selectIssuesToEnqueue", () => {
     };
     const selected = selectIssuesToEnqueue([issue(1)], cfg, "owner/repo");
     expect(selected[0].profile).toBe("claude");
+  });
+
+  it("drops issues that don't carry a wake signal under opt-in (filterTriggered)", () => {
+    // Strict opt-in config: no trigger_on_open, mention-only.
+    const strict: NoodleConfig = {
+      ...config,
+      triggers: { trigger_on_mention: true, trigger_keywords: [], trigger_on_open: false },
+    };
+    const bare = issue(1, { body: "it just broke" });              // no wake signal
+    const mentioned = issue(2, { body: "@noodle please fix" });     // @mention wakes
+    const labeled = issue(3, { labels: ["bug"] });                 // label only, no wake
+    const allReturned = selectIssuesToEnqueue([bare, mentioned, labeled], strict, "owner/repo");
+    // All three are returned (with their routing result + triggered flag) so a
+    // dry-run can show why each was held; filterTriggered slices the accepted subset.
+    expect(allReturned.map((s) => s.issue.number)).toEqual([1, 2, 3]);
+    expect(filterTriggered(allReturned).map((s) => s.issue.number)).toEqual([2]);
+
+    // With a trigger_keyword configured, a keyword match also passes.
+    const withKw: NoodleConfig = {
+      ...config,
+      triggers: { trigger_on_mention: true, trigger_keywords: ["agent-fix"], trigger_on_open: false },
+    };
+    const kwIssue = issue(4, { body: "agent-fix: take this" });
+    const kwResult = selectIssuesToEnqueue([bare, mentioned, kwIssue], withKw, "owner/repo");
+    expect(filterTriggered(kwResult).map((s) => s.issue.number)).toEqual([2, 4]);
   });
 });
 

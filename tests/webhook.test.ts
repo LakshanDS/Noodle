@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import crypto from "node:crypto";
 import { verifySignature, parseWebhookEvent } from "../src/github/webhook.js";
+import type { TriggerConfig } from "../src/triggers/check.js";
 
 const SECRET = "supersecret";
 
@@ -9,11 +10,17 @@ function sign(body: string, secret = SECRET): string {
   return "sha256=" + crypto.createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
 
+/** Opt-in triggers: mention-only (the new default). */
+const optIn: TriggerConfig = { trigger_on_mention: true, trigger_keywords: [], trigger_on_open: false };
+/** Legacy triggers: fire on every issue regardless of body. */
+const openAll: TriggerConfig = { trigger_on_mention: false, trigger_keywords: [], trigger_on_open: true };
+
+/** Payload whose body @-mentions the agent — passes the opt-in wake filter. */
 const basePayload = {
   action: "opened",
   installation: { id: 42 },
   repository: { full_name: "owner/name" },
-  issue: { number: 7, title: "boom", body: "it broke", labels: [] },
+  issue: { number: 7, title: "boom", body: "@noodle it broke", labels: [] },
 };
 
 describe("verifySignature", () => {
@@ -63,6 +70,33 @@ describe("parseWebhookEvent", () => {
     expect(parseWebhookEvent("issues", { ...basePayload, action: "edited" })).toBeNull();
   });
 
+  // --- opt-in wake filter (issues.* body gate) ---------------------------
+  it("ignores a bare issue body under opt-in (no wake signal)", () => {
+    const payload = { ...basePayload, issue: { number: 7, body: "it just broke", labels: [] } };
+    expect(parseWebhookEvent("issues", payload, undefined, "Noodle", optIn)).toBeNull();
+  });
+
+  it("fires on a @mention in the body under opt-in", () => {
+    const payload = { ...basePayload, issue: { number: 7, body: "@noodle please fix", labels: [] } };
+    expect(parseWebhookEvent("issues", payload, undefined, "Noodle", optIn)?.kind).toBe("issue");
+  });
+
+  it("fires on a trigger_keyword in the body under opt-in", () => {
+    const payload = { ...basePayload, issue: { number: 7, body: "this is agent-fix work", labels: [] } };
+    const kw: TriggerConfig = { trigger_on_mention: true, trigger_keywords: ["agent-fix"], trigger_on_open: false };
+    expect(parseWebhookEvent("issues", payload, undefined, "Noodle", kw)?.kind).toBe("issue");
+  });
+
+  it("fires on a #profile tag in the body under opt-in", () => {
+    const payload = { ...basePayload, issue: { number: 7, body: "#claude fix the build", labels: [] } };
+    expect(parseWebhookEvent("issues", payload, undefined, "Noodle", optIn, ["claude"])?.kind).toBe("issue");
+  });
+
+  it("fires on every issue under trigger_on_open (legacy mode)", () => {
+    const payload = { ...basePayload, issue: { number: 7, body: "it just broke", labels: [] } };
+    expect(parseWebhookEvent("issues", payload, undefined, "Noodle", openAll)?.kind).toBe("issue");
+  });
+
   it("fires on issues.assigned when assigned to Noodle (selfLogin match, case-insensitive)", () => {
     const payload = { ...basePayload, action: "assigned", assignee: { login: "noodle-bot" } };
     expect(parseWebhookEvent("issues", payload, "noodle-bot")?.kind).toBe("issue");
@@ -102,7 +136,50 @@ describe("parseWebhookEvent", () => {
     });
   });
 
-  it("ignores comments that don't start with /noodle", () => {
+  it("wakes on a @noodle mention in a comment", () => {
+    const payload = {
+      action: "created",
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "@noodle can you look at this?" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload)?.kind).toBe("comment");
+  });
+
+  it("wakes on a #profile tag in a comment", () => {
+    const payload = {
+      action: "created",
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "#claude rerun with claude" },
+    };
+    const intent = parseWebhookEvent("issue_comment", payload, undefined, "Noodle", optIn, ["claude"]);
+    expect(intent?.kind).toBe("comment");
+    expect(intent?.profileHint).toBe("claude");
+  });
+
+  it("carries the #profile hint on an issues.opened event", () => {
+    const payload = {
+      ...basePayload,
+      action: "opened",
+      issue: { number: 9, body: "#nim take this", labels: [] },
+    };
+    const intent = parseWebhookEvent("issues", payload, undefined, "Noodle", optIn, ["nim"]);
+    expect(intent?.kind).toBe("issue");
+    expect(intent?.profileHint).toBe("nim");
+  });
+
+  it("ignores a #profile tag that names no configured profile", () => {
+    const payload = {
+      action: "created",
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "#unknown fix this" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle", optIn, ["claude"])).toBeNull();
+  });
+
+  it("ignores comments that don't wake the agent", () => {
     const payload = {
       action: "created",
       repository: { full_name: "owner/name" },
