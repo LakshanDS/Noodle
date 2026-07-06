@@ -54,11 +54,11 @@ describe("buildFooter", () => {
     expect(f).toContain("3 turns");
   });
 
-  it("includes token usage with thousands separators", () => {
-    const f = buildFooter(profile, "Noodle-Agent", stats);
-    expect(f).toContain("45,210 in");
-    expect(f).toContain("3,180 out");
-    expect(f).toContain("48,390 total");
+  it("includes token usage with compact K/M/B suffixes", () => {
+    const f = buildFooter(profile, "Noodle", stats);
+    expect(f).toContain("45.21K in");
+    expect(f).toContain("3.18K out");
+    expect(f).toContain("48.39K total");
   });
 
   it("omits cache tokens when cacheRead/cacheWrite are 0", () => {
@@ -72,10 +72,10 @@ describe("buildFooter", () => {
       ...stats,
       tokens: { input: 45210, output: 3180, cacheRead: 12800, cacheWrite: 5000, total: 66190 },
     };
-    const f = buildFooter(profile, "Noodle-Agent", cacheStats);
-    expect(f).toContain("12,800 cache read");
-    expect(f).toContain("5,000 cache write");
-    expect(f).toContain("66,190 total");
+    const f = buildFooter(profile, "Noodle", cacheStats);
+    expect(f).toContain("12.8K cache read");
+    expect(f).toContain("5K cache write");
+    expect(f).toContain("66.19K total");
   });
 
   it("includes cost for priced providers", () => {
@@ -85,14 +85,14 @@ describe("buildFooter", () => {
 
   it("omits cost line when cost is 0 (local/custom models)", () => {
     const localStats: RunStats = { ...stats, cost: 0 };
-    const f = buildFooter(profile, "Noodle-Agent", localStats);
+    const f = buildFooter(profile, "Noodle", localStats);
     expect(f).not.toMatch(/^Cost:/m);
     // tokens still present
-    expect(f).toContain("48,390 total");
+    expect(f).toContain("48.39K total");
   });
 
   it("omits Cooked-for/Tokens/Cost lines when stats missing", () => {
-    const f = buildFooter(profile, "Noodle-Agent", undefined);
+    const f = buildFooter(profile, "Noodle", undefined);
     expect(f).not.toMatch(/Cooked for:/);
     expect(f).not.toMatch(/^Tokens:/m);
     expect(f).not.toMatch(/^Cost:/m);
@@ -102,14 +102,13 @@ describe("buildFooter", () => {
     expect(f).toMatch(/^\*.+\*$/m);
   });
 
-  it("includes the PR link on the Profile line when provided", () => {
-    const f = buildFooter(profile, "Noodle-Agent", stats, { prNumber: 58, prUrl: "https://x/pull/58" });
-    expect(f).toContain("PR #58");
-    expect(f).toContain("https://x/pull/58");
+  it("does not include a PR link (PR is shown in the issue timeline)", () => {
+    const f = buildFooter(profile, "Noodle", stats);
+    expect(f).not.toContain("PR #");
   });
 
   it("includes a fun one-liner in italics as the last line", () => {
-    const f = buildFooter(profile, "Noodle-Agent", stats);
+    const f = buildFooter(profile, "Noodle", stats);
     expect(f).toMatch(/\*[^*]+\*$/m);
   });
 });
@@ -125,7 +124,7 @@ describe("buildPrBody", () => {
   it("includes the footer with stats", () => {
     const body = buildPrBody(profile, changedFiles, "https://x/#42", agentMessage, "Noodle", stats);
     expect(body).toContain("4m 12s");
-    expect(body).toContain("48,390 total");
+    expect(body).toContain("48.39K total");
     expect(body).toContain("$0.18");
   });
 
@@ -138,34 +137,25 @@ describe("buildPrBody", () => {
   it("accepts legacy callsites passing profile name as a string", () => {
     const body = buildPrBody("claude", changedFiles, "https://x/#42", agentMessage);
     expect(body).toContain(agentMessage);
-    expect(body).toContain("**Noodle**");
+    expect(body).toContain("**Noodle-Agent**");
   });
 });
 
 describe("buildIssueComment", () => {
   it("posts the agent message verbatim with the footer", () => {
-    const c = buildIssueComment(profile, agentMessage, undefined, "Noodle", stats);
+    const c = buildIssueComment(profile, agentMessage, "Noodle", stats);
     expect(c.startsWith(agentMessage)).toBe(true);
-    expect(c).toContain("**Noodle**");
+    expect(c).toContain("**Noodle-Agent**");
     expect(c).toContain("anthropic/claude-sonnet-4-20250514");
     expect(c).toContain("4m 12s");
-    // no PR link when none provided
+    // no PR link — shown in the issue timeline, not the footer
     expect(c).not.toContain("PR #");
-  });
-
-  it("includes the PR link in the footer when a PR was opened", () => {
-    const c = buildIssueComment(profile, agentMessage, {
-      prNumber: 58,
-      prUrl: "https://x/pull/58",
-    });
-    expect(c).toContain("PR #58");
-    expect(c).toContain("https://x/pull/58");
   });
 
   it("uses a generic note when the agent produced no message", () => {
     const c = buildIssueComment(profile, undefined);
     expect(c).toMatch(/made no code changes and left no message/i);
-    expect(c).toContain("Noodle");
+    expect(c).toContain("Noodle-Agent");
   });
 
   it("preserves the agent's markdown formatting", () => {
@@ -187,13 +177,13 @@ describe("buildErrorComment", () => {
   it("includes the footer with stats captured up to failure", () => {
     const c = buildErrorComment(profile, "rate limited (429)", "Noodle", stats);
     expect(c).toContain("4m 12s");
-    expect(c).toContain("48,390 total");
+    expect(c).toContain("48.39K total");
   });
 
   it("works without stats", () => {
     const c = buildErrorComment(profile, "boom");
     expect(c).toContain("boom");
-    expect(c).toContain("**Noodle**");
+    expect(c).toContain("**Noodle-Agent**");
     expect(c).not.toContain("📊");
   });
 
@@ -204,27 +194,33 @@ describe("buildErrorComment", () => {
 });
 
 describe("custom agent name", () => {
-  it("uses the custom name in PR body", () => {
+  it("uses the custom name (-Agent suffix) in PR body", () => {
     const body = buildPrBody(profile, changedFiles, "https://x/#42", agentMessage, "MyBot", stats);
-    expect(body).toContain("**MyBot**");
-    expect(body).not.toContain("**Noodle**");
+    expect(body).toContain("**MyBot-Agent**");
+    expect(body).not.toContain("**Noodle");
   });
 
-  it("uses the custom name in issue comment", () => {
-    const c = buildIssueComment(profile, agentMessage, undefined, "MyBot");
-    expect(c).toContain("**MyBot**");
-    expect(c).not.toContain("**Noodle**");
+  it("uses the custom name (-Agent suffix) in issue comment", () => {
+    const c = buildIssueComment(profile, agentMessage, "MyBot");
+    expect(c).toContain("**MyBot-Agent**");
+    expect(c).not.toContain("**Noodle");
   });
 
-  it("uses the custom name in error comment", () => {
+  it("uses the custom name (-Agent suffix) in error comment", () => {
     const c = buildErrorComment(profile, "boom", "MyBot");
-    expect(c).toContain("MyBot's run");
-    expect(c).toContain("**MyBot**");
+    expect(c).toContain("MyBot-Agent's run");
+    expect(c).toContain("**MyBot-Agent**");
   });
 
-  it("uses the custom name in fallback message", () => {
-    const c = buildIssueComment(profile, undefined, undefined, "MyBot");
-    expect(c).toMatch(/MyBot ran but made no code changes/);
+  it("uses the custom name (-Agent suffix) in fallback message", () => {
+    const c = buildIssueComment(profile, undefined, "MyBot");
+    expect(c).toMatch(/MyBot-Agent ran but made no code changes/);
+  });
+
+  it("does not double-suffix a name that already ends in Agent", () => {
+    const c = buildIssueComment(profile, agentMessage, "Noodle-Agent");
+    expect(c).toContain("**Noodle-Agent**");
+    expect(c).not.toContain("**Noodle-Agent-Agent**");
   });
 });
 
