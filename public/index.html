@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#0d1117">
+<meta name="color-scheme" content="dark light">
+<title>Noodle</title>
+<style>
+  /* Mobile-first: dark theme by default, large tap targets, system fonts.
+     No build step — plain CSS, no framework. Layout uses 100dvh + sticky
+     header/footer so the message list scrolls on its own. */
+  :root {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-elev2: #21262d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #2f81f7;
+    --ok: #3fb950;
+    --fail: #f85149;
+    --running: #d29922;
+    --none: #8b949e;
+    --bubble-user: #1f6feb;
+    --bubble-bot: #21262d;
+    --radius: 14px;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff;
+      --bg-elev: #f6f8fa;
+      --bg-elev2: #eaeef2;
+      --border: #d0d7de;
+      --text: #1f2328;
+      --text-dim: #636c76;
+      --bubble-bot: #f0f3f6;
+      --bubble-user: #2f81f7;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: none;
+  }
+  body { min-height: 100dvh; }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  .hidden { display: none !important; }
+
+  /* ---------- App shell ---------- */
+  #app { display: flex; flex-direction: column; height: 100dvh; }
+
+  .topbar {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 8px;
+    padding: calc(8px + var(--safe-top)) 12px 8px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+    min-height: calc(52px + var(--safe-top));
+  }
+  .topbar .title { font-weight: 600; font-size: 16px; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar .emoji { font-size: 20px; }
+  .topbar .sub { font-size: 12px; color: var(--text-dim); font-weight: 400; }
+  .icon-btn {
+    flex: 0 0 auto; width: 40px; height: 40px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; border: 1px solid var(--border); border-radius: 10px;
+    font-size: 18px; color: var(--text);
+  }
+  .icon-btn:active { background: var(--bg-elev2); }
+
+  .scroll {
+    flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: calc(16px + var(--safe-bottom));
+  }
+
+  /* ---------- Login ---------- */
+  #login-view { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100dvh; padding: 24px; }
+  .login-card {
+    width: 100%; max-width: 360px;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 28px 22px; text-align: center;
+  }
+  .login-card .logo { font-size: 44px; margin-bottom: 8px; }
+  .login-card h1 { margin: 0 0 4px; font-size: 22px; }
+  .login-card p { margin: 0 0 20px; color: var(--text-dim); font-size: 14px; }
+  .login-card input {
+    width: 100%; padding: 13px 14px; margin-bottom: 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    font-size: 16px; /* 16px prevents iOS zoom-on-focus */
+  }
+  .login-card input:focus { outline: none; border-color: var(--accent); }
+  .login-card button {
+    width: 100%; padding: 13px; border: none; border-radius: 10px;
+    background: var(--accent); color: #fff; font-weight: 600; font-size: 16px;
+    min-height: 44px;
+  }
+  .login-card button:active { opacity: 0.85; }
+  .login-card button:disabled { opacity: 0.6; }
+  .login-error { color: var(--fail); font-size: 13px; min-height: 18px; margin-bottom: 8px; }
+
+  /* ---------- Runs list ---------- */
+  .run {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+    min-height: 44px;
+  }
+  .run:active { background: var(--bg-elev); }
+  .run .dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%; margin-top: 2px; }
+  .run.succeeded .dot { background: var(--ok); }
+  .run.failed .dot { background: var(--fail); }
+  .run.running .dot { background: var(--running); animation: pulse 1.4s ease-in-out infinite; }
+  .run.no_changes .dot { background: var(--none); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .run .meta { flex: 1 1 auto; min-width: 0; }
+  .run .repo { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .run .issue { color: var(--text-dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .run .badge { flex: 0 0 auto; font-size: 12px; color: var(--text-dim); text-align: right; white-space: nowrap; }
+  .list-empty { padding: 60px 24px; text-align: center; color: var(--text-dim); font-size: 14px; }
+  .list-empty .emoji { font-size: 36px; display: block; margin-bottom: 8px; }
+
+  /* ---------- Chat ---------- */
+  .chat-status-bar {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 16px 0; font-size: 12px; color: var(--text-dim);
+  }
+  .chat-status-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .msg-list { padding: 12px 12px 0; display: flex; flex-direction: column; gap: 10px; }
+  .msg { display: flex; max-width: 88%; }
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+  .msg.assistant { align-self: flex-start; }
+  .bubble {
+    padding: 9px 13px; border-radius: 16px; font-size: 15px;
+    white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
+  }
+  .msg.user .bubble { background: var(--bubble-user); color: #fff; border-bottom-right-radius: 5px; }
+  .msg.assistant .bubble { background: var(--bubble-bot); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
+  .msg .avatar { flex: 0 0 auto; width: 26px; height: 26px; font-size: 16px; display: inline-flex; align-items: center; justify-content: center; }
+  .msg.assistant .avatar { margin-right: 7px; }
+  .msg.user .avatar { display: none; }
+  .msg-row { display: flex; align-items: flex-end; gap: 0; }
+  .msg.assistant .msg-row { flex-direction: row; }
+
+  /* Tool call + result chips: compact, monospace, expandable. */
+  .tool {
+    align-self: flex-start; width: 100%; max-width: 92%;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px;
+    font-size: 13px; overflow: hidden;
+  }
+  .tool-head {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+    color: var(--text-dim);
+  }
+  .tool-head .ico { font-size: 14px; }
+  .tool-head .label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool-head .count { font-size: 12px; opacity: 0.8; }
+  .tool-head .chev { font-size: 12px; transition: transform 0.15s; }
+  .tool.open .chev { transform: rotate(90deg); }
+  .tool-body {
+    display: none; padding: 0 12px 10px; border-top: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; color: var(--text-dim); white-space: pre-wrap; overflow-wrap: break-word;
+    margin-top: 6px; padding-top: 10px;
+  }
+  .tool.open .tool-body { display: block; }
+  .tool-result { font-size: 12px; color: var(--text-dim); }
+  .tool-result .bubble { background: transparent; border: 1px dashed var(--border); padding: 8px 11px; font-size: 12px; max-height: 200px; overflow-y: auto; }
+  .tool-result .cropped { display: -webkit-box; -webkit-line-clamp: 6; line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
+  .tool-result .more-link { color: var(--accent); font-size: 12px; margin-top: 4px; display: inline-block; }
+
+  .run-summary {
+    margin: 8px 12px 16px; padding: 12px 14px;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px;
+    font-size: 13px;
+  }
+  .run-summary .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .run-summary .k { color: var(--text-dim); }
+  .run-summary a { color: var(--accent); text-decoration: none; word-break: break-all; }
+
+  /* ---------- Loading + errors ---------- */
+  .center-msg { text-align: center; padding: 60px 24px; color: var(--text-dim); font-size: 14px; }
+  .err-banner { margin: 12px; padding: 12px; background: rgba(248,81,73,0.1); border: 1px solid var(--fail); border-radius: 10px; color: var(--fail); font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- LOGIN -->
+  <section id="login-view">
+    <form class="login-card" id="login-form" autocomplete="on">
+      <div class="logo">🍜</div>
+      <h1>Noodle</h1>
+      <p>Sign in to view agent runs</p>
+      <div class="login-error" id="login-error" role="alert"></div>
+      <input type="password" name="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+      <button type="submit" id="login-btn">Sign in</button>
+    </form>
+  </section>
+
+  <!-- RUNS LIST -->
+  <section id="runs-view" class="hidden">
+    <div class="topbar">
+      <span class="emoji">🍜</span>
+      <span class="title">Runs</span>
+      <button class="icon-btn" id="refresh-runs" title="Refresh" aria-label="Refresh">↻</button>
+      <button class="icon-btn" id="logout-btn" title="Sign out" aria-label="Sign out">⎋</button>
+    </div>
+    <div class="scroll" id="runs-scroll">
+      <div id="runs-list"></div>
+    </div>
+  </section>
+
+  <!-- CHAT -->
+  <section id="chat-view" class="hidden">
+    <div class="topbar">
+      <button class="icon-btn" id="back-btn" title="Back" aria-label="Back">‹</button>
+      <span class="title" id="chat-title">Run</span>
+      <button class="icon-btn" id="refresh-chat" title="Refresh" aria-label="Refresh">↻</button>
+    </div>
+    <div class="scroll" id="chat-scroll">
+      <div id="chat-status" class="chat-status-bar"></div>
+      <div class="msg-list" id="msg-list"></div>
+      <div id="run-summary"></div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+// Single-file SPA: three views (login / runs / chat) swapped by show().
+// All API calls use credentials: "same-origin" so the signed cookie is sent.
+// A 401 anywhere bounces back to the login view. No router, no framework.
+
+const $ = (id) => document.getElementById(id);
+const views = ["login-view", "runs-view", "chat-view"];
+let currentRunId = null;
+
+function show(view) {
+  for (const v of views) $(v).classList.toggle("hidden", v !== view);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { credentials: "same-origin", ...opts });
+  if (res.status === 401) { showLogin(); throw new Error("unauthorized"); }
+  return res;
+}
+function showLogin() {
+  show("login-view");
+  $("login-error").textContent = "";
+  $("login-password").value = "";
+  $("login-password").focus();
+}
+
+// ---------- Login ----------
+$("login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = $("login-btn");
+  const err = $("login-error");
+  err.textContent = "";
+  btn.disabled = true;
+  try {
+    const pw = $("login-password").value;
+    const res = await fetch("/api/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: pw }),
+    });
+    if (res.status === 401) { err.textContent = "Wrong password"; return; }
+    if (!res.ok) throw new Error("login failed");
+    $("login-password").value = "";
+    await openRuns();
+  } catch (ex) {
+    err.textContent = "Could not reach server";
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("logout-btn").addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+  showLogin();
+});
+
+// ---------- Runs list ----------
+function statusText(s) {
+  return ({ succeeded: "ok", failed: "fail", running: "running", no_changes: "no changes" })[s] || s;
+}
+
+async function openRuns() {
+  show("runs-view");
+  $("runs-list").innerHTML = '<div class="center-msg">Loading…</div>';
+  try {
+    const res = await api("/api/runs");
+    const body = await res.json();
+    renderRuns(body.runs || []);
+  } catch {
+    $("runs-list").innerHTML = '<div class="center-msg">Could not load runs.</div>';
+  }
+}
+
+function renderRuns(runs) {
+  const el = $("runs-list");
+  if (runs.length === 0) {
+    el.innerHTML = '<div class="list-empty"><span class="emoji">🍜</span>No runs yet.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for (const r of runs) {
+    const row = document.createElement("div");
+    row.className = "run " + r.status;
+    const repoName = r.repo.split("/").pop() || r.repo;
+    row.innerHTML =
+      '<div class="dot"></div>' +
+      '<div class="meta">' +
+        '<div class="repo"></div>' +
+        '<div class="issue"></div>' +
+      '</div>' +
+      '<div class="badge"></div>';
+    row.querySelector(".repo").textContent = repoName + " #" + r.issue;
+    row.querySelector(".issue").textContent = r.repo;
+    row.querySelector(".badge").textContent = statusText(r.status);
+    row.addEventListener("click", () => openChat(r.job_id));
+    el.appendChild(row);
+  }
+}
+
+$("refresh-runs").addEventListener("click", openRuns);
+
+// ---------- Chat ----------
+async function openChat(jobId) {
+  currentRunId = jobId;
+  show("chat-view");
+  $("msg-list").innerHTML = '<div class="center-msg">Loading…</div>';
+  $("run-summary").innerHTML = "";
+  $("chat-title").textContent = "Run";
+  await loadChat(jobId);
+}
+
+async function loadChat(jobId) {
+  try {
+    const res = await api("/api/runs/" + encodeURIComponent(jobId));
+    const body = await res.json();
+    renderChat(body.run, body.messages || []);
+  } catch {
+    $("msg-list").innerHTML = '<div class="center-msg">Could not load run.</div>';
+  }
+}
+
+function renderChat(run, messages) {
+  $("chat-title").textContent = (run.repo.split("/").pop() || run.repo) + " #" + run.issue;
+
+  const statusEl = $("chat-status");
+  const colors = { succeeded: "var(--ok)", failed: "var(--fail)", running: "var(--running)", no_changes: "var(--none)" };
+  statusEl.innerHTML = '<span class="dot" style="background:' + (colors[run.status] || "var(--none)") + '"></span>' +
+    statusText(run.status) + (run.model ? " · " + escHtml(run.model) : "");
+
+  const list = $("msg-list");
+  list.innerHTML = "";
+
+  if (messages.length === 0) {
+    list.innerHTML = '<div class="center-msg">No conversation recorded.</div>';
+  } else {
+    for (const m of messages) {
+      if (m.role === "toolResult") {
+        list.appendChild(renderToolResult(m));
+      } else {
+        list.appendChild(renderMessage(m));
+      }
+    }
+    // Scroll to bottom so the latest turn is visible.
+    requestAnimationFrame(() => { $("chat-scroll").scrollTop = $("chat-scroll").scrollHeight; });
+  }
+
+  renderSummary(run);
+}
+
+function renderMessage(m) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + m.role;
+
+  if (m.role === "assistant") {
+    // Avatar + bubble inside a row so they align at the bottom.
+    const row = document.createElement("div");
+    row.className = "msg-row";
+    const av = document.createElement("span");
+    av.className = "avatar";
+    av.textContent = "🍜";
+    row.appendChild(av);
+
+    if (m.text && m.text.trim()) {
+      const bub = document.createElement("div");
+      bub.className = "bubble";
+      bub.textContent = m.text;
+      row.appendChild(bub);
+    }
+    wrap.appendChild(row);
+
+    // Tool calls render as expandable chips beneath the text.
+    if (m.toolCalls) {
+      for (const tc of m.toolCalls) wrap.appendChild(renderToolCall(tc));
+    }
+    return wrap;
+  }
+
+  // user
+  const bub = document.createElement("div");
+  bub.className = "bubble";
+  bub.textContent = m.text;
+  wrap.appendChild(bub);
+  return wrap;
+}
+
+function summarizeArgs(name, args) {
+  // One-line preview for the collapsed chip label.
+  if (name === "read" || name === "edit" || name === "write") {
+    const p = args.path || "";
+    return p.split(/[/\\]/).pop() || p || name;
+  }
+  if (name === "bash") return String(args.command || "").slice(0, 60).trim() || "bash";
+  if (name === "grep" || name === "glob") return String(args.pattern || args.path || name);
+  return name;
+}
+
+function renderToolCall(tc) {
+  const tool = document.createElement("div");
+  tool.className = "tool";
+  const head = document.createElement("div");
+  head.className = "tool-head";
+  head.innerHTML =
+    '<span class="ico">🔧</span>' +
+    '<span class="label"></span>' +
+    '<span class="chev">▸</span>';
+  head.querySelector(".label").textContent = summarizeArgs(tc.name, tc.args);
+
+  const body = document.createElement("div");
+  body.className = "tool-body";
+  const pre = document.createElement("div");
+  pre.textContent = JSON.stringify(tc.args, null, 2);
+  body.appendChild(pre);
+
+  head.addEventListener("click", () => tool.classList.toggle("open"));
+  tool.appendChild(head);
+  tool.appendChild(body);
+  return tool;
+}
+
+function renderToolResult(m) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg assistant tool-result";
+  const bub = document.createElement("div");
+  bub.className = "bubble cropped";
+  bub.textContent = "↳ " + m.toolName + ": " + m.text;
+
+  const more = document.createElement("span");
+  more.className = "more-link";
+  more.textContent = "show more";
+  more.addEventListener("click", () => {
+    bub.classList.toggle("cropped");
+    more.textContent = bub.classList.contains("cropped") ? "show more" : "show less";
+  });
+  // Defer the "show more" link: only render if the text is long enough to crop.
+  wrap.appendChild(bub);
+  if (m.text.length > 200) wrap.appendChild(more);
+  return wrap;
+}
+
+function renderSummary(run) {
+  const el = $("run-summary");
+  const rows = [];
+  rows.push(["Repo", run.repo]);
+  if (run.branch) rows.push(["Branch", run.branch]);
+  if (run.profile) rows.push(["Profile", run.profile]);
+  rows.push(["Started", fmtTime(run.started_at)]);
+  if (run.finished_at) rows.push(["Finished", fmtTime(run.finished_at)]);
+  if (run.pr_url) rows.push(["PR", '<a href="' + escAttr(run.pr_url) + '" target="_blank" rel="noopener">' + escHtml(run.pr_url) + "</a>"]);
+
+  let html = "";
+  for (const [k, v] of rows) {
+    html += '<div class="row"><span class="k">' + escHtml(k) + '</span><span style="text-align:right">' + v + "</span></div>";
+  }
+  if (run.error) {
+    html += '<div class="row" style="margin-top:8px;color:var(--fail)"><span class="k">Error</span><span>' + escHtml(run.error) + "</span></div>";
+  }
+  if (run.summary) {
+    html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)"><div class="k" style="margin-bottom:4px">Summary</div><div>' + escHtml(run.summary) + "</div></div>";
+  }
+  el.innerHTML = html ? '<div class="run-summary">' + html + "</div>" : "";
+}
+
+// ---------- Helpers ----------
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function escAttr(s) { return escHtml(s); }
+function fmtTime(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch { return iso; }
+}
+
+// ---------- Nav ----------
+$("back-btn").addEventListener("click", () => { currentRunId = null; openRuns(); });
+$("refresh-chat").addEventListener("click", () => { if (currentRunId) loadChat(currentRunId); });
+
+// ---------- Boot: probe auth, open the right view ----------
+(async function init() {
+  try {
+    const res = await fetch("/api/runs", { credentials: "same-origin" });
+    if (res.ok) { await openRuns(); }
+    else { showLogin(); }
+  } catch {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
