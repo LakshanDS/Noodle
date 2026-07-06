@@ -33,6 +33,13 @@ export interface QueuedJob {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /**
+   * Best-effort profile hint captured at enqueue time (from a `#tag` or the
+   * default profile). Used to gate per-profile concurrency at claim time. May
+   * be corrected by runJob after authoritative profile resolution. Null when
+   * no hint was available (treated as "no per-profile cap").
+   */
+  profile: string | null;
 }
 
 /** What the worker calls to actually run a job. */
@@ -49,6 +56,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   attempts INTEGER NOT NULL DEFAULT 0,
   error TEXT,
   not_before TEXT,
+  profile TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
   finished_at TEXT
@@ -59,9 +67,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedup
 `;
 
 /**
+ * Created AFTER migrations so the `profile` column exists on migrated DBs.
+ * (Can't live in SCHEMA: that runs first, before the column is added to old
+ * tables, and the index creation would fail with "no such column: profile".)
+ */
+const IDX_RUNNING_PROFILE =
+  "CREATE INDEX IF NOT EXISTS idx_jobs_running_profile ON jobs(profile) WHERE status = 'running'";
+
+/**
  * Idempotent migration: add `not_before` to pre-existing `jobs` tables (created
  * before the retry feature). SQLite ≥ 3.35 supports `ALTER TABLE ... ADD COLUMN
- ... IF NOT EXISTS`, but older databases attached via older better-sqlite3 don't,
+ * ... IF NOT EXISTS`, but older databases attached via older better-sqlite3 don't,
  * so we introspect `PRAGMA table_info` instead — runs once, then no-ops.
  */
 function migrateAddNotBefore(db: Db): void {
@@ -69,6 +85,26 @@ function migrateAddNotBefore(db: Db): void {
   if (!cols.some((c) => c.name === "not_before")) {
     db.exec("ALTER TABLE jobs ADD COLUMN not_before TEXT");
   }
+}
+
+/**
+ * Idempotent migration: add `profile` for per-profile concurrency gating. Same
+ * PRAGMA-introspection pattern as `migrateAddNotBefore`.
+ */
+function migrateAddProfile(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "profile")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN profile TEXT");
+  }
+}
+
+/**
+ * Ensure the per-profile running-count index exists. Runs AFTER migrations so
+ * the `profile` column is guaranteed present (created by SCHEMA on fresh DBs,
+ * by migrateAddProfile on old ones).
+ */
+function ensureRunningProfileIndex(db: Db): void {
+  db.exec(IDX_RUNNING_PROFILE);
 }
 
 export class JobQueue {
@@ -80,6 +116,8 @@ export class JobQueue {
     this.db.pragma("busy_timeout = 5000");
     this.db.exec(SCHEMA);
     migrateAddNotBefore(this.db);
+    migrateAddProfile(this.db);
+    ensureRunningProfileIndex(this.db);
   }
 
   /** For tests that want to inject an in-memory DB. */
@@ -88,26 +126,31 @@ export class JobQueue {
     (q as unknown as { db: Db }).db = db;
     db.exec(SCHEMA);
     migrateAddNotBefore(db);
+    migrateAddProfile(db);
+    ensureRunningProfileIndex(db);
     return q;
   }
 
   /**
    * Enqueue a job. No-op (returns existing) if an active job for this
    * (repo, issue) already exists — the unique partial index enforces this.
+   * `profile` is a best-effort hint (from a #tag or default) used to gate
+   * per-profile concurrency at claim time.
    */
   enqueue(opts: {
     repo: string;
     issueNumber: number;
     installationId?: number;
     source?: string;
+    profile?: string | null;
   }): QueuedJob {
-    const { repo, issueNumber, installationId = null, source = "webhook" } = opts;
+    const { repo, issueNumber, installationId = null, source = "webhook", profile = null } = opts;
     // INSERT OR IGNORE relies on the partial unique index over active statuses.
     const ins = this.db.prepare(
-      `INSERT OR IGNORE INTO jobs (repo, issue_number, installation_id, source)
-       VALUES (@repo, @issueNumber, @installationId, @source)`,
+      `INSERT OR IGNORE INTO jobs (repo, issue_number, installation_id, source, profile)
+       VALUES (@repo, @issueNumber, @installationId, @source, @profile)`,
     );
-    ins.run({ repo, issueNumber, installationId, source });
+    ins.run({ repo, issueNumber, installationId, source, profile });
     const row = this.db
       .prepare(
         `SELECT * FROM jobs WHERE repo = ? AND issue_number = ? AND status IN ('queued','running')
@@ -126,6 +169,14 @@ export class JobQueue {
     return row.n;
   }
 
+  /** Number of running jobs whose profile hint matches `profile`. */
+  runningCountForProfile(profile: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM jobs WHERE status = 'running' AND profile = ?")
+      .get(profile) as { n: number };
+    return row.n;
+  }
+
   /** Peek at the next claimable queued job without claiming it. */
   peekQueued(): QueuedJob | null {
     const row = this.db
@@ -141,21 +192,46 @@ export class JobQueue {
 
   /**
    * Atomically claim the next queued job (→ running) and return it, or null if
-   * the queue is empty. Uses a transaction so two workers can't grab the same
-   * job (defense for future concurrency > 1).
+   * the queue is empty (or no queued job fits its profile's capacity). Uses a
+   * transaction so two workers can't grab the same job.
+   *
+   * `capacityFor(profile)`, when supplied, returns the max concurrent jobs for
+   * that profile. A queued job is only claimed if the number of running jobs
+   * with the same profile hint is below its cap — this is what lets profiles on
+   * separate API keys run in parallel while keeping a single key from being
+   * split across N simultaneous runs. Jobs with a null profile hint skip the
+   * per-profile check (the global worker pool size still bounds them).
    */
-  claimNext(): QueuedJob | null {
+  claimNext(capacityFor?: (profile: string) => number): QueuedJob | null {
     return this.db.transaction((): QueuedJob | null => {
-      const job = this.peekQueued();
-      if (!job) return null;
-      this.db
+      const candidates = this.db
         .prepare(
-          `UPDATE jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1
-           WHERE id = ?`,
+          `SELECT * FROM jobs
+           WHERE status = 'queued'
+             AND (not_before IS NULL OR not_before <= datetime('now'))
+           ORDER BY id ASC`,
         )
-        .run(job.id);
-      return this.getById(job.id);
+        .all() as QueuedJob[];
+      for (const job of candidates) {
+        if (job.profile && capacityFor) {
+          const cap = capacityFor(job.profile);
+          if (this.runningCountForProfile(job.profile) >= cap) continue; // at capacity, try the next
+        }
+        this.db
+          .prepare(
+            `UPDATE jobs SET status = 'running', started_at = datetime('now'), attempts = attempts + 1
+             WHERE id = ?`,
+          )
+          .run(job.id);
+        return this.getById(job.id);
+      }
+      return null;
     })();
+  }
+
+  /** Update a job's profile hint (after authoritative resolution in runJob). */
+  setJobProfile(id: number, profile: string): void {
+    this.db.prepare("UPDATE jobs SET profile = ? WHERE id = ?").run(profile, id);
   }
 
   /** Mark a job successfully done. */
@@ -223,6 +299,12 @@ export interface WorkerOptions {
   maxAttempts?: number;
   /** Base backoff seconds; doubles each attempt, capped at 10 min. */
   retryBackoffSec?: number;
+  /**
+   * Max concurrent jobs for a profile. When set, `claimNext` skips a queued job
+   * whose profile is already at capacity. Injected from config so the queue
+   * stays config-agnostic.
+   */
+  capacityFor?: (profile: string) => number;
 }
 
 /**
@@ -269,16 +351,18 @@ export class QueueWorker {
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
     this.maxAttempts = opts.maxAttempts ?? 3;
     this.retryBackoffSec = opts.retryBackoffSec ?? 60;
+    this.capacityFor = opts.capacityFor;
     // Keep the event loop alive while waiting; cleared on stop.
     this.timer = setInterval(() => {}, 1 << 30);
   }
+  private readonly capacityFor?: (profile: string) => number;
 
   /** Start the loop. Returns when `stop()` is called. */
   async run(): Promise<void> {
     this.running = true;
     log.info("queue worker started");
     while (this.running) {
-      const job = this.queue.claimNext();
+      const job = this.queue.claimNext(this.capacityFor);
       if (!job) {
         await sleep(this.pollIntervalMs);
         continue;

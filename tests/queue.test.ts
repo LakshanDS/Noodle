@@ -51,6 +51,85 @@ describe("JobQueue", () => {
     expect(queue.claimNext()).toBeNull();
   });
 
+  // --- per-profile concurrency gating ----------------------------------------
+  it("stores a profile hint on enqueue", () => {
+    const job = queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    expect(job.profile).toBe("claude");
+  });
+
+  it("defaults profile to null when not supplied", () => {
+    const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    expect(job.profile).toBeNull();
+  });
+
+  it("runningCountForProfile counts only matching running jobs", () => {
+    const a = queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    const b = queue.enqueue({ repo: "o/r", issueNumber: 2, profile: "nim" });
+    queue.claimNext(); // claims a (oldest)
+    expect(queue.runningCountForProfile("claude")).toBe(1);
+    expect(queue.runningCountForProfile("nim")).toBe(0);
+    void a; void b;
+  });
+
+  it("claimNext skips a job whose profile is at capacity and takes the next", () => {
+    // Two queued claude jobs + one queued nim job. capacityFor caps claude at 1.
+    queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    queue.enqueue({ repo: "o/r", issueNumber: 2, profile: "nim" });
+    queue.enqueue({ repo: "o/r", issueNumber: 3, profile: "claude" });
+    const cap = (p: string) => (p === "claude" ? 1 : 99);
+
+    // First claim: claude #1 → running (claude now at capacity 1/1).
+    const first = queue.claimNext(cap);
+    expect(first?.issue_number).toBe(1);
+    // Second claim: claude #3 is at capacity, so it skips to nim #2.
+    const second = queue.claimNext(cap);
+    expect(second?.issue_number).toBe(2);
+    // Third claim: claude #3 still at capacity (claude #1 still running) → null.
+    expect(queue.claimNext(cap)).toBeNull();
+    // Once claude #1 finishes, claude #3 becomes claimable.
+    queue.markDone(first!.id);
+    const third = queue.claimNext(cap);
+    expect(third?.issue_number).toBe(3);
+  });
+
+  it("claimNext without capacityFor ignores per-profile limits (back-compat)", () => {
+    queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    queue.enqueue({ repo: "o/r", issueNumber: 2, profile: "claude" });
+    // No capacityFor → both claimable in age order, no gating.
+    expect(queue.claimNext()?.issue_number).toBe(1);
+    expect(queue.claimNext()?.issue_number).toBe(2);
+  });
+
+  it("setJobProfile updates a job's profile hint", () => {
+    const job = queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    queue.setJobProfile(job.id, "nim");
+    expect(queue.getById(job.id).profile).toBe("nim");
+  });
+
+  it("migrates an existing DB adding the profile column", () => {
+    // Simulate an old DB created before the profile column existed.
+    queue.close();
+    const dbPath = join(dir, "test.db");
+    const Database = require("better-sqlite3");
+    const raw = new Database(dbPath);
+    raw.exec(`CREATE TABLE jobs_old (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, issue_number INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued', installation_id INTEGER, source TEXT NOT NULL DEFAULT 'webhook',
+      attempts INTEGER NOT NULL DEFAULT 0, error TEXT, not_before TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')), started_at TEXT, finished_at TEXT)`);
+    raw.exec(`INSERT INTO jobs_old (repo, issue_number) VALUES ('o/r', 1)`);
+    // SQLite table must be named `jobs` for the queue — drop the new one and rename.
+    raw.exec(`DROP TABLE jobs; ALTER TABLE jobs_old RENAME TO jobs;`);
+    raw.close();
+    // Re-open: the constructor's migration should add `profile`.
+    queue = new JobQueue(dbPath);
+    const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    expect(job.profile).toBeNull(); // profile column exists, defaults null
+    // And the running-profile index is usable.
+    queue.claimNext();
+    expect(queue.runningCountForProfile("anything")).toBe(0);
+  });
+
   it("claimNext moves the oldest queued job to running", () => {
     const j1 = queue.enqueue({ repo: "owner/repo", issueNumber: 1 });
     queue.enqueue({ repo: "owner/repo", issueNumber: 2 });
