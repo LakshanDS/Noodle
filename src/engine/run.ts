@@ -581,6 +581,14 @@ export async function runJob(
     } catch (cleanupErr) {
       log_.warn({ err: cleanupErr }, "could not swap cooking→failed label after error");
     }
+    // Post an error comment so the reporter knows the run failed and why.
+    // Best-effort — a failure here must not mask the original error.
+    try {
+      const commentBody = buildErrorComment(profile, (e as Error).message ?? String(e), agentName);
+      await gh.createIssueComment(input.repo, input.issueNumber, commentBody);
+    } catch (commentErr) {
+      log_.warn({ err: commentErr }, "could not post error comment after failure");
+    }
     if (runStore) {
       runStore.updateRun(jobId, { status: "failed", error: (e as Error).message ?? String(e), finished_at: nowIso() });
     }

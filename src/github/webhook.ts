@@ -87,11 +87,18 @@ export function parseWebhookEvent(
     };
     assignee?: { login?: string } | null; // present on `assigned` events
     comment?: { body?: string | null };
+    sender?: { login?: string | null } | null; // user/bot that triggered the event
   };
 
   if (!p.repository?.full_name || !p.issue?.number) return null;
   // Skip events on pull requests — Phase 2 is issue-driven.
   if (p.issue.pull_request) return null;
+
+  // Skip events triggered by the bot itself (e.g. label swaps, comments)
+  // to prevent re-entrant triggers after a run completes.
+  if (selfLogin && p.sender?.login?.toLowerCase() === selfLogin.toLowerCase()) {
+    return null;
+  }
 
   const repo = p.repository.full_name;
   const issueNumber = p.issue.number;
