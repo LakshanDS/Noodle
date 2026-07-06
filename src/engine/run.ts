@@ -270,19 +270,22 @@ export async function runJob(
   const authStorage = deps?.authStorage ?? AuthStorage.create();
   const modelRegistry = ModelRegistry.create(authStorage);
   // Register any custom-endpoint profiles (Ollama/vLLM/proxies) with pi first.
-  registerCustomProviders(config, modelRegistry);
+  // Returns a map from profile name → provider key used in the registry (handles
+  // dedup when multiple profiles share the same provider name).
+  const providerKeyMap = registerCustomProviders(config, modelRegistry);
+  const providerKey = providerKeyMap.get(profile.name) ?? profile.provider;
   let model: Model<Api> | undefined;
   try {
-    model = modelRegistry.find(profile.provider, profile.model);
+    model = modelRegistry.find(providerKey, profile.model);
   } catch (e) {
     throw new Error(
-      `Could not resolve model "${profile.provider}/${profile.model}". ` +
+      `Could not resolve model "${providerKey}/${profile.model}". ` +
         `Check the profile config and that the model id is valid. (${(e as Error).message})`,
     );
   }
   if (!model) {
     throw new Error(
-      `Could not resolve model "${profile.provider}/${profile.model}". ` +
+      `Could not resolve model "${providerKey}/${profile.model}". ` +
         `Check the profile config and that the model id is valid.`,
     );
   }

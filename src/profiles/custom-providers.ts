@@ -10,13 +10,35 @@ import { log } from "../util/log.js";
  * Register each with pi's ModelRegistry so the subsequent find() resolves.
  * Built-in providers (anthropic, openai, openrouter, ...) are skipped — pi
  * already knows them.
+ *
+ * Returns a map from profile name → the provider key used in the registry, so
+ * callers can look up the right model even when two profiles share a provider
+ * name (e.g. both use `provider: nvidia`).
  */
-export function registerCustomProviders(config: NoodleConfig, registry: ModelRegistry): void {
+export function registerCustomProviders(
+  config: NoodleConfig,
+  registry: ModelRegistry,
+): Map<string, string> {
+  const providerKeyMap = new Map<string, string>();
+
+  // Track how many times each provider name has been used. pi's
+  // registerProvider does a full model replacement per provider name, so two
+  // profiles sharing one would clobber each other.
+  const seen = new Map<string, number>();
+
   for (const [name, profile] of Object.entries(config.profiles)) {
     if (!isCustomEndpoint(profile)) continue;
     const apiKey = resolveApiKey(profile);
+
+    // Namespace duplicates: first use keeps the bare name, subsequent ones get
+    // `-<profileName>` so each profile's models live under a unique key.
+    const count = (seen.get(profile.provider) ?? 0) + 1;
+    seen.set(profile.provider, count);
+    const providerKey = count > 1 ? `${profile.provider}-${name}` : profile.provider;
+    providerKeyMap.set(name, providerKey);
+
     try {
-      registry.registerProvider(profile.provider, {
+      registry.registerProvider(providerKey, {
         baseUrl: profile.base_url,
         api: profile.api,
         apiKey,
@@ -52,7 +74,7 @@ export function registerCustomProviders(config: NoodleConfig, registry: ModelReg
       log.info(
         {
           profile: name,
-          provider: profile.provider,
+          provider: providerKey,
           api: profile.api,
           baseUrl: profile.base_url,
           priced,
@@ -65,6 +87,8 @@ export function registerCustomProviders(config: NoodleConfig, registry: ModelReg
       );
     }
   }
+
+  return providerKeyMap;
 }
 
 export function isCustomEndpoint(p: Profile): boolean {
@@ -74,7 +98,7 @@ export function isCustomEndpoint(p: Profile): boolean {
 /**
  * Resolve the API key for a custom endpoint.
  * - If api_key_env is set, read that env var (may be empty for local no-auth endpoints like Ollama).
- * - pi requires *some* apiKey string when models are defined, so default to a placeholder
+ * - pi requires *some* apiKey string when models are defined, so pass a placeholder
  *   for endpoints that ignore auth. For real auth, set the env var.
  */
 function resolveApiKey(p: Profile): string {
