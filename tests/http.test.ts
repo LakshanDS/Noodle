@@ -14,7 +14,10 @@ const issueOpenedPayload = (issueNumber = 7) =>
     action: "opened",
     installation: { id: 42 },
     repository: { full_name: "owner/name" },
-    issue: { number: issueNumber },
+    // Body @-mentions the agent so the opt-in trigger filter in
+    // `parseWebhookEvent` lets this through (the default wake signal is
+    // an @-mention, per `config.triggers`).
+    issue: { number: issueNumber, body: "@noodle please fix" },
   });
 
 const apps = new Set<{ close: () => Promise<unknown> }>();

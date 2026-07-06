@@ -88,6 +88,31 @@ describe("Phase 2 config blocks", () => {
     expect(c.scheduler).toEqual({ enabled: false, interval_minutes: 30, repos: [] });
   });
 
+  it("applies opt-in trigger defaults", () => {
+    const c = NoodleConfigSchema.parse(validBase);
+    expect(c.triggers).toEqual({
+      trigger_on_mention: true,
+      trigger_keywords: [],
+      trigger_on_open: false,
+    });
+  });
+
+  it("accepts an explicit triggers block (legacy always-fire mode)", () => {
+    const c = NoodleConfigSchema.parse({
+      ...validBase,
+      triggers: {
+        trigger_on_mention: false,
+        trigger_keywords: ["noodle-fix"],
+        trigger_on_open: true,
+      },
+    });
+    expect(c.triggers).toEqual({
+      trigger_on_mention: false,
+      trigger_keywords: ["noodle-fix"],
+      trigger_on_open: true,
+    });
+  });
+
   it("parses an explicit server/storage/scheduler block", () => {
     const c = NoodleConfigSchema.parse({
       ...validBase,

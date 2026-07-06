@@ -136,6 +136,37 @@ export const SchedulerConfigSchema = z.object({
 export type SchedulerConfig = z.infer<typeof SchedulerConfigSchema>;
 
 /**
+ * How the agent wakes up on an issue. By default Noodle is opt-in: it ONLY
+ * runs when the issue or a comment carries an explicit wake signal (an
+ * `@<agent>` mention, a listed keyword, or a slash command / assignment).
+ * The Slack-style "always fire on every new issue" mode can be restored by
+ * setting `trigger_on_open: true`.
+ *
+ * Background: without these filters, the agent is enqueued on every new issue
+ * in an installed repo — burning tokens on issues the reporter never intended
+ * for it. opt-in eliminates that.
+ *
+ *   - `trigger_on_mention: true` (default)  — fires when body/comments @-mention
+ *     the agent (e.g. `@Noodle`, `@noodle`, `@noodle-agent`). Case-insensitive,
+ *     word-boundary-aware so `@noodles` does NOT match.
+ *   - `trigger_keywords: [...]` — extra substrings (lower-case, compared
+ *     case-insensitive) that also fire when present in body or comments.
+ *     Handy for repos where the team already uses a tag word like "agent".
+ *   - `trigger_on_open: false` (default) — when `true`, the agent ALSO fires
+ *     on any new/reopened/labeled issue regardless of mention/keyword; this
+ *     restores the pre-opt-in behavior for users who want it.
+ *
+ * Slash commands (`/<agent>` in a comment) and assignment to the agent are
+ * always honored — they're explicit user intent regardless of this config.
+ */
+export const TriggersConfigSchema = z.object({
+  trigger_on_mention: z.boolean().default(true),
+  trigger_keywords: z.array(z.string().min(1)).default([]),
+  trigger_on_open: z.boolean().default(false),
+});
+export type TriggersConfig = z.infer<typeof TriggersConfigSchema>;
+
+/**
  * Per-run controls. The stall watcher aborts a run that has emitted no agent
  * activity (tool calls, turns, messages, tool output, compactions) for N
  * minutes — a strong signal of a hang (dropped socket, deadlock) that a
@@ -197,6 +228,16 @@ export const NoodleConfigSchema = z.object({
     concurrency: 1,
     max_attempts: 3,
     retry_backoff_seconds: 60,
+  }),
+  /**
+   * Wakeup filters for `issues.*` events (webhooks, scheduler scan, the GitHub
+   * Action). See `TriggersConfigSchema` above. Slash commands and assignment
+   * are always honored regardless of this block.
+   */
+  triggers: TriggersConfigSchema.nullish().transform((v) => v ?? {
+    trigger_on_mention: true,
+    trigger_keywords: [],
+    trigger_on_open: false,
   }),
 });
 export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;

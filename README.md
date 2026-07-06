@@ -177,8 +177,10 @@ Action is the simplest way to start.)
              ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
    ```
 
-   That runs Noodle when an issue is opened/reopened/labeled, or when someone
-   comments `/noodle` on an issue. A full annotated copy is in
+   That runs Noodle when someone explicitly invites it on an issue —
+   `@noodle` in the body / a `/noodle` comment. To wake Noodle on an existing
+   issue, type the mention (or slash) and re-open it. A full annotated copy
+   is in
    [`examples/github-action.yml`](./examples/github-action.yml).
 
 Open an issue — Noodle clones, fixes, opens a PR, comments, done.
@@ -327,9 +329,26 @@ npm run dev -- run --repo owner/name --scan
 Lists what the scheduler *would* enqueue right now (no agent runs, no jobs
 queued) — handy for validating routing rules before enabling the scheduler.
 
-## Routing at a glance
+## Routing & wake signals
 
-In the issue body, a comment, labels, or keywords — first match wins:
+Two layers decide whether Noodle runs and which profile handles it:
+
+**1. Waking the agent (opt-in by default).** Noodle only wakes on an `issues.*`
+event or scheduler scan when the issue carries a wake signal — by default an
+`@<agent>` mention in the body or a comment. Slash commands (`/<agent>` in a
+comment) and assigning the issue to the agent are ALWAYS honored regardless
+of this config. To restore the legacy "fire on every issue" behavior, set
+`triggers.trigger_on_open: true` in `noodle.config.yaml`:
+
+```yaml
+triggers:
+  trigger_on_mention: true   # required by default (list form @<agent>)
+  trigger_keywords: []       # substring list (case-insensitive), also wakes
+  trigger_on_open: false      # true → fire on every issue (legacy)
+```
+
+**2. Picking the profile.** After the wake signal, routing evaluates top to
+bottom, first match wins:
 
 | Trigger                              | Example              | → profile |
 |--------------------------------------|----------------------|-----------|
@@ -337,6 +356,10 @@ In the issue body, a comment, labels, or keywords — first match wins:
 | label (case-insensitive)             | `bug`                | cheap     |
 | keyword regex (title + body)         | `refactor\|architecture` | claude |
 | (nothing matches)                    |                      | default   |
+
+To invite Noodle on an issue: open the issue, type `@noodle please look`,
+assign it to the agent, or send a `/noodle` comment. Noodle wakes; routing
+then picks the profile.
 
 ## Project layout
 
@@ -348,9 +371,10 @@ src/
 ├── github/             octokit client + PAT auth + GitHub-App auth + webhook parsing
 ├── engine/             workspace (git) + prompt + the run loop + tools
 ├── server/             fastify webhook server + SQLite job queue + cron scheduler
+├── triggers/           opt-in wake-signal filter (mention / keyword / always-open)
 └── util/               logging, paths
 skills/                 noodle-default, noodle-fix, noodle-review (Noodle's own)
-tests/                  config + routing + output + webhook + auth + queue + scheduler tests
+tests/                  config + routing + output + webhook + auth + queue + scheduler + triggers tests
 ```
 
 ### Skills — composable mindset

@@ -86,6 +86,10 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const app = createWebhookApp(webhookSecret, {
     selfLogin,
     agentName: config.agent_name,
+    // Opt-in wake filter for `issues.*` events — see src/triggers/check.ts.
+    // Slash commands (`/<agent>`) and assignment to the agent are always
+    // honored and don't go through this filter.
+    triggers: config.triggers,
     enqueue: async (intent) => {
       queue.enqueue({
         repo: intent.repo,

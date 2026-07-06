@@ -137,6 +137,26 @@ repos:
 #   repos:
 #     - owner/name
 
+# WAKING THE AGENT (default: opt-in). Noodle only runs when the user
+# explicitly invites it on an issue — by default via an `@<agent>` mention in
+# the issue body or a comment. Configurable so power users can pick a
+# different strategy:
+#
+#   trigger_on_mention: true   # fires when @<agent> appears in body or a comment
+#   trigger_keywords:   []     # extra substrings that also fire (case-insensitive)
+#   trigger_on_open:    false  # when true, fires on every new/reopened issue
+#                              # regardless of mention/keyword (legacy behavior;
+#                              # use this if you want the agent on every issue)
+#
+# Slash commands (`/<agent>` in a comment) and assigning the issue to the
+# agent are ALWAYS wakes — explicit user intent regardless of this config.
+# To invite Noodle on an issue: open the issue, type "@noodle please fix",
+# and submit. The agent sees the mention and wakes.
+# triggers:
+#   trigger_on_mention: true
+#   trigger_keywords: []
+#   trigger_on_open: false
+
 # --- Phase 3: run + queue hardening (all optional) --------------------------
 # Both apply to `noodle serve` AND `noodle run` (the stall watcher guards CLI
 # runs too). Defaults shown — omit a block to use them.

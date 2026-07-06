@@ -36,9 +36,22 @@ permissions:
 
 jobs:
   noodle:
+    # Trigger policy: opt-in wake only. The agent only runs when the user
+    # explicitly asks for it.
+    #   - issue_comment: the comment body starts with `/noodle` (slash command
+    #     is always honored regardless of any other config).
+    #   - issues: the issue body contains @noodle or /noodle — a mention or
+    #     slash command in the body itself (some users type the slash straight
+    #     into the issue instead of commenting). Other events (`labeled`,
+    #     `reopened`) require the same body check.
+    # If you customized `agent_name` in your noodle.config.yaml, swap
+    # "noodle" for the slug of your agent name here (e.g. "@mybot" for
+    # agent_name: MyBot).
     if: |
-      github.event_name == 'issues' ||
-      (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/noodle'))
+      github.event_name == 'issue_comment'
+        ? startsWith(github.event.comment.body, '/noodle')
+        : (contains(github.event.issue.body, '@noodle')
+           || contains(github.event.issue.body, '/noodle'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

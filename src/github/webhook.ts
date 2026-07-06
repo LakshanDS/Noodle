@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { slugify } from "../util/slugify.js";
+import { mentionsAgent, shouldTrigger, type TriggerConfig } from "../triggers/check.js";
 
 /**
  * Pure webhook helpers — HMAC signature verification and event parsing.
@@ -40,24 +41,35 @@ export function verifySignature(body: string, signature: string | undefined, sec
  * is not one Noodle should act on (ping, unrelated actions, PR events, etc.).
  *
  * Recognized events:
- * - `issues` with action opened | reopened | labeled
+ * - `issues` with action opened | reopened | labeled — only when the issue
+ *   body PASSES the configured `triggers` filter (see `config.triggers`).
+ *   This is the new opt-in behavior: by default Noodle only wakes when the
+ *   issue @-mentions the agent or contains a configured keyword. Set
+ *   `triggers.trigger_on_open: true` to restore the pre-opt-in "fire on every
+ *   issue" behavior. Slash commands and assignment-to-agent are exempt — see
+ *   below.
  * - `issues` with action assigned — but only when the issue was assigned to
  *   Noodle itself (`selfLogin` matches the new assignee's login). Assignment
  *   to a human teammate is ignored so Noodle doesn't run on every reshuffle.
- * - `issue_comment` with action created, when the comment body starts with `/noodle`
+ *   This is unconditional (no body filter); being assigned IS the wake.
+ * - `issue_comment` with action created, when the comment body starts with
+ *   `/<agent>` (slash) OR @-mentions the agent. Slash / mention in comments
+ *   are always wake signals regardless of `triggers`.
  *
  * `label`-on-`labeled` is handled by `resolveProfile` later (it reads labels
- * from the issue, not the webhook), so we don't filter by which label was added
- * here — just confirm a label event happened.
+ *   from the issue, not the webhook), so we don't filter by which label was added
+ *   here — just confirm a label event happened AND the issue still passes the
+ *   trigger filter.
  *
  * `selfLogin` is Noodle's own login (e.g. the bot user). Required to scope the
- * `assigned` trigger; when omitted, `assigned` events are ignored.
+ *   `assigned` trigger; when omitted, `assigned` events are ignored.
  */
 export function parseWebhookEvent(
   event: string,
   payload: unknown,
   selfLogin?: string,
   agentName = "Noodle",
+  triggers?: TriggerConfig,
 ): WebhookIntent | null {
   const p = payload as {
     action?: string;
@@ -83,6 +95,28 @@ export function parseWebhookEvent(
 
   if (event === "issues") {
     if (p.action === "opened" || p.action === "reopened" || p.action === "labeled") {
+      // Opt-in trigger filter: ignore `issues.*` events whose body carries no
+      // wake signal. The webhook payload carries the issue body (not the
+      // comment thread — that comes via a separate fetch), so the gate runs
+      // on body alone here; `issue_comment.created` (slash / @mention) is
+      // handled by its own dedicated branch below, which catches cases where
+      // a user wakes Noodle on an existing issue via comment.
+      //
+      // When the caller passes no triggers config (e.g. a caller that
+      // hasn't yet pulled one off `config.triggers`), fall back to the
+      // new default: opt-in (mention-only). The bot doesn't fire on
+      // untagged issues under that fallback. To restore the legacy
+      // "fire-on-everything" behavior at the webhook layer, pass
+      // `{ trigger_on_mention: false, trigger_keywords: [], trigger_on_open: true }`.
+      const cfg: TriggerConfig = triggers ?? {
+        trigger_on_mention: true,
+        trigger_keywords: [],
+        trigger_on_open: false,
+      };
+      const body = (p.issue.body ?? "") as string;
+      if (!shouldTrigger({ agentName, body, comments: [], triggers: cfg })) {
+        return null;
+      }
       return { kind: "issue", repo, issueNumber, installationId };
     }
     // Only trigger on assignment when Noodle itself is the new assignee.
@@ -97,10 +131,19 @@ export function parseWebhookEvent(
 
   if (event === "issue_comment") {
     if (p.action !== "created") return null;
-    // Slash-command rerun: only react to comments starting with /<agent>.
+    // Slash-command rerun OR @mention: only react to comments that
+    // explicitly wake the agent. Slash prefix (`/noodle please fix`) is the
+    // classic command; @-mention (`@noodle can you look?`) is a natural
+    // alternative. Other triggers (`trigger_keywords`, `trigger_on_open`)
+    // are body-level concerns — the scheduler decides them when it scans
+    // the full thread; the webhook just needs to wake for explicit nudges
+    // here.
     const body = (p.comment?.body ?? "").trim();
+    if (!body) return null;
     const cmd = slugify(agentName);
-    if (!new RegExp(`^\\/${cmd}\\b`, "i").test(body)) return null;
+    const isSlash = new RegExp(`^\\/${cmd}\\b`, "i").test(body);
+    const isMention = mentionsAgent(body, agentName);
+    if (!isSlash && !isMention) return null;
     return { kind: "comment", repo, issueNumber, installationId };
   }
 

@@ -13,7 +13,10 @@ const basePayload = {
   action: "opened",
   installation: { id: 42 },
   repository: { full_name: "owner/name" },
-  issue: { number: 7, title: "boom", body: "it broke", labels: [] },
+  // Body deliberately @-mentions the agent so the opt-in trigger filter
+  // (see `parseWebhookEvent`) doesn't drop this payload. Tests that exercise
+  // the trigger filter explicitly use payloads without a mention.
+  issue: { number: 7, title: "boom", body: "it broke -- @noodle can you look?", labels: [] },
 };
 
 describe("verifySignature", () => {
@@ -61,6 +64,54 @@ describe("parseWebhookEvent", () => {
   it("ignores closed/edited/other issue actions", () => {
     expect(parseWebhookEvent("issues", { ...basePayload, action: "closed" })).toBeNull();
     expect(parseWebhookEvent("issues", { ...basePayload, action: "edited" })).toBeNull();
+  });
+
+  it("drops issues.opened when the body carries no @-mention (opt-in default)", () => {
+    // New default: agent only wakes on mention / keyword / slash. A bare
+    // "it broke" should NOT fire. (No mention, no slash, no configured
+    // keywords, no `trigger_on_open`.)
+    const payload = {
+      ...basePayload,
+      issue: { number: 8, body: "plain bug report, no mention" },
+    };
+    expect(parseWebhookEvent("issues", payload)).toBeNull();
+  });
+
+  it("fires when trigger_on_open is configured (legacy always-fire mode)", () => {
+    // Power users who don't want the opt-in filter can flip the escape hatch.
+    const payload = {
+      ...basePayload,
+      issue: { number: 9, body: "plain issue, no mention" },
+    };
+    expect(
+      parseWebhookEvent("issues", payload, undefined, "Noodle", {
+        trigger_on_mention: false,
+        trigger_keywords: [],
+        trigger_on_open: true,
+      })?.kind,
+    ).toBe("issue");
+  });
+
+  it("fires when a configured trigger_keyword is present in the body", () => {
+    const payload = {
+      ...basePayload,
+      issue: { number: 10, body: "agent-fix: please look at this" },
+    };
+    expect(
+      parseWebhookEvent("issues", payload, undefined, "Noodle", {
+        trigger_on_mention: true,
+        trigger_keywords: ["agent-fix"],
+        trigger_on_open: false,
+      })?.kind,
+    ).toBe("issue");
+  });
+
+  it("ignores keyword match when trigger_keywords is empty (default)", () => {
+    const payload = {
+      ...basePayload,
+      issue: { number: 11, body: "agent-fix" },
+    };
+    expect(parseWebhookEvent("issues", payload)).toBeNull();
   });
 
   it("fires on issues.assigned when assigned to Noodle (selfLogin match, case-insensitive)", () => {
@@ -120,6 +171,25 @@ describe("parseWebhookEvent", () => {
       comment: { body: "/noodle go" },
     };
     expect(parseWebhookEvent("issue_comment", payload)).toBeNull();
+  });
+
+  it("fires on issue_comment.created when comment @-mentions the agent", () => {
+    // `@noodle can you look?` is now an explicit wake signal too — the
+    // user might invite the agent in a regular comment instead of using
+    // the slash command.
+    const payload = {
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "@noodle can you look at this?" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload)).toEqual({
+      kind: "comment",
+      repo: "owner/name",
+      issueNumber: 7,
+      installationId: 42,
+    });
   });
 
   it("returns null for ping and unrelated events", () => {

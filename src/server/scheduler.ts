@@ -1,6 +1,7 @@
 import type { Database as Db } from "better-sqlite3";
 import { log } from "../util/log.js";
 import { resolveProfile } from "../profiles/resolve.js";
+import { shouldTrigger } from "../triggers/check.js";
 import type { NoodleConfig } from "../config/schema.js";
 import type { IssueData } from "../github/client.js";
 
@@ -51,29 +52,55 @@ export class SqliteScanState implements ScanStateStore {
 }
 
 /**
- * PURE: from a list of open issues in one repo, route each and return which
- * would be enqueued, with the profile each would run.
+ * PURE: from a list of open issues in one repo, route each and return info
+ * about which would be enqueued, with the profile each would run + whether
+ * the configured trigger filter accepted it.
  *
  * The caller has already filtered to issues updated since `lastSeen` (via the
  * GitHub `since` param), so by the time issues reach here they're all
- * candidates. Routing always resolves (it falls back to default), so every
- * issue is returned — but the attached profile is what makes this useful for
- * the dry-run CLI (`noodle run --scan`). To restrict scans to explicit
- * slash/label/keyword matches only, add a filter predicate here later.
+ * candidates. Each issue's `profile` reflects the routing resolution
+ * (slash / label / keyword / default); `triggered` reflects whether the
+ * configured `triggers` config (default: opt-in on @-mention) accepted the
+ * wake signal in the issue's body.
+ *
+ * Returned issues are NOT pre-filtered to `triggered === true` — both the
+ * scheduler (which enqueues) and the dry-run CLI use this function, and the
+ * dry-run wants to show "this issue was filtered out because no
+ * @-mention/keyword matched" alongside the routing result. Callers should
+ * pick the slice they want.
+ *
+ * Cheap path: scan-time filtering uses issue body only. The webhook layer
+ * separately handles `issue_comment.created` events (slash / @mention) to
+ * catch the case where a user invokes Noodle on an OLD issue by posting a
+ * comment — the scheduler deliberately doesn't fetch comments (one extra
+ * API call per issue) and trusts webhooks for that case.
  */
 export function selectIssuesToEnqueue(
   issues: IssueData[],
   config: NoodleConfig,
   repo: string,
-): { issue: IssueData; profile: string }[] {
+): { issue: IssueData; profile: string; triggered: boolean }[] {
   return issues.map((issue) => {
     const resolved = resolveProfile(
       config,
       { title: issue.title, body: issue.body, labels: issue.labels, comments: [] },
       repo,
     );
-    return { issue, profile: resolved.name };
+    const triggered = shouldTrigger({
+      agentName: config.agent_name,
+      body: issue.body ?? "",
+      comments: [],
+      triggers: config.triggers,
+    });
+    return { issue, profile: resolved.name, triggered };
   });
+}
+
+/** Filter a `selectIssuesToEnqueue` result to issues that pass the trigger filter. */
+export function filterTriggered(
+  selected: { issue: IssueData; profile: string; triggered: boolean }[],
+): { issue: IssueData; profile: string }[] {
+  return selected.filter((s) => s.triggered).map(({ issue, profile }) => ({ issue, profile }));
 }
 
 export interface SchedulerDeps {
@@ -96,8 +123,12 @@ export async function runScanOnce(config: NoodleConfig, deps: SchedulerDeps): Pr
     try {
       const issues = await deps.listOpenIssues(repo, lastSeen ?? undefined);
       const selected = selectIssuesToEnqueue(issues, config, repo);
-      log_.info({ count: selected.length, lastSeen }, "scanned repo");
-      for (const { issue } of selected) {
+      // Honor the opt-in trigger filter — scheduler enqueues only what the
+      // wake-signal gate accepts. Issues without an @-mention or configured
+      // `trigger_keyword` are dropped (and would otherwise waste tokens).
+      const toEnqueue = filterTriggered(selected);
+      log_.info({ total: selected.length, enqueued: toEnqueue.length }, "scanned repo");
+      for (const { issue } of toEnqueue) {
         await deps.enqueue(repo, issue.number);
       }
       // Advance the watermark to "now" so the next pass only sees new changes.
