@@ -505,6 +505,12 @@ pi's token accounting) are all shipped. Still on the list from
   already there as the source of truth; only the surface to render it is left.
 - `pull_request` webhook events (currently issues-only).
 
+## Test Agents
+
+Added in response to [#8](https://github.com/LakshanDS/Noodle/issues/8) — a
+sanity-check that the agent loop wakes on a mention, edits the repo, and opens
+a PR. ✅ wired.
+
 ## License
 
 MIT.
