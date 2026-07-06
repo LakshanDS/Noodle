@@ -1,5 +1,7 @@
 # Noodle
 
+<!-- test: agent smoke test — verified the issue → PR loop end to end. safe to remove. -->
+
 A self-hostable, open-source GitHub agent. Add it to a repo, open an issue, and
 Noodle drives the [**pi**](https://github.com/earendil-works/pi) agent toolkit
 to read the code, fix the bug, and open a pull request.
