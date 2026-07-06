@@ -33,6 +33,7 @@ COPY package.json package-lock.json ./
 COPY --from=builder /app/node_modules/ node_modules/
 COPY --from=builder /app/dist/ dist/
 COPY skills/ skills/
+COPY public/ public/
 
 # Persistent volume mount for SQLite DB
 RUN mkdir -p /data
