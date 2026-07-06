@@ -667,21 +667,31 @@ export function lastAssistantStopReason(
 }
 
 /**
- * Attach a subscriber that mirrors pi agent events into the run log, so the
- * full conversation flow is visible in `docker logs`:
- *   - agent lifecycle (start/end, retries, compaction)
- *   - assistant messages (full text — the agent's reply)
- *   - tool calls (start with args, end with the returned output)
- *   - turn boundaries
+ * Mirror pi agent events into the run log — kept deliberately minimal so
+ * `docker logs` stays readable. One short line per thing that matters:
  *
- * The persisted session file (./sessions/<jobId>/) remains the authoritative
- * record; this is the readable mirror.
+ *   ▶ agent started
+ *   💬 <full assistant reply>
+ *   ▸ grep                       (tool call — name only)
+ *   $ npm test                   (bash — the actual command)
+ *   ✓ grep                       (tool finished ok)
+ *   ✗ bash: <first line of err>  (tool errored)
+ *   ↻ retry 1/3: 429 …
+ *   ■ agent finished
+ *
+ * Tool outputs, args, turn boundaries, and streaming updates are dropped here —
+ * they live in the persisted session file (./sessions/<jobId>/) if ever needed.
+ * pi also echoes each tool result back as a follow-up assistant message; we
+ * suppress that echo so a result isn't logged twice.
  */
 function subscribeForLogging(
   session: { subscribe?: (fn: (e: unknown) => void) => unknown },
   log_: typeof log,
 ) {
   if (typeof session.subscribe !== "function") return;
+  // Text of the most recent tool result, so a follow-up assistant message that
+  // just echoes it can be detected and skipped.
+  let lastToolOutput = "";
   session.subscribe((event: unknown) => {
     const e = event as Record<string, unknown>;
     switch (e.type) {
@@ -689,82 +699,54 @@ function subscribeForLogging(
         log_.info("▶ agent started");
         break;
 
-      case "agent_end": {
-        const willRetry = e.willRetry === true;
-        log_.info({ willRetry }, "■ agent finished");
+      case "agent_end":
+        log_.info(e.willRetry === true ? "■ agent finished (will retry)" : "■ agent finished");
         break;
-      }
-
-      case "turn_start":
-        log_.info("── turn start ──────────────────");
-        break;
-
-      case "turn_end": {
-        const toolResults = (e.toolResults as unknown[]) ?? [];
-        log_.info({ toolResultCount: toolResults.length }, `── turn end (${toolResults.length} tool result${toolResults.length === 1 ? "" : "s"}) ──`);
-        break;
-      }
 
       case "message_end": {
-        // Assistant's final message for this turn — log its full text.
-        const text = extractMessageText(e.message);
-        if (text) log_.info(`💬 assistant:\n${text}`);
+        const msg = e.message as { role?: string } | undefined;
+        // pi emits message_end for tool/user messages too — only the assistant's
+        // own reply is useful as a log line.
+        if (msg?.role && msg.role !== "assistant") break;
+        const text = extractMessageText(msg).trim();
+        if (!text || text === lastToolOutput) break;
+        lastToolOutput = "";
+        log_.info(`💬 ${text}`);
         break;
       }
 
-      case "tool_execution_start": {
-        // Args go in the message text only (avoids trailing key=value duplicate).
-        const argsStr = truncate(JSON.stringify(e.args), 300);
-        log_.info({ tool: e.toolName }, `▸ tool: ${e.toolName}(${argsStr})`);
+      case "tool_execution_start":
+        lastToolOutput = "";
+        log_.info(toolStartLabel(e.toolName, e.args));
         break;
-      }
 
       case "tool_execution_end": {
         const isError = e.isError === true;
-        const output = truncate(extractToolResultText(e.result), 2000);
-        // Output goes in the message text; `isError` stays as a field for grep.
-        const msg = `◂ ${isError ? "tool error" : "tool result"}: ${e.toolName}\n${output}`;
+        const out = extractToolResultText(e.result).trim();
+        lastToolOutput = out.slice(0, 300);
         if (isError) {
-          log_.warn({ tool: e.toolName, isError }, msg);
+          log_.warn(`✗ ${e.toolName}: ${truncate(firstLine(out), 200)}`);
         } else {
-          log_.info({ tool: e.toolName }, msg);
-        }
-        break;
-      }
-
-      case "compaction_start":
-        log_.info({ reason: e.reason }, "♻ compacting context");
-        break;
-
-      case "compaction_end": {
-        const errMsg = e.errorMessage as string | undefined;
-        if (errMsg) {
-          log_.warn({ reason: e.reason, errorMessage: errMsg }, "♻ compaction failed");
-        } else {
-          log_.info({ reason: e.reason, aborted: e.aborted }, "♻ compaction complete");
+          log_.info(`✓ ${e.toolName}`);
         }
         break;
       }
 
       case "auto_retry_start":
-        // errorMessage goes in the message; attempt/delay stay as fields.
-        log_.warn(
-          { attempt: e.attempt, maxAttempts: e.maxAttempts, delayMs: e.delayMs },
-          `↻ retrying (attempt ${e.attempt}/${e.maxAttempts}) after: ${e.errorMessage}`,
-        );
+        log_.warn(`↻ retry ${e.attempt}/${e.maxAttempts}: ${e.errorMessage}`);
         break;
 
-      case "auto_retry_end":
-        log_.info(
-          { success: e.success, attempt: e.attempt },
-          e.success === true ? "↻ retry succeeded" : "↻ retry failed",
-        );
+      case "compaction_start":
+        log_.info("♻ compacting context");
+        break;
+
+      case "compaction_end":
+        if (e.errorMessage) log_.warn("♻ compaction failed");
         break;
 
       default:
-        // Other events (message_start, message_update, tool_execution_update,
-        // queue_update, session_info_changed, thinking_level_changed) are too
-        // noisy to mirror — they're in the session file if needed.
+        // Drop the rest (turn_*, message_start/update, tool_execution_update,
+        // queue_update, auto_retry_end, …) — noise for log readability.
     }
   });
 }
@@ -803,6 +785,29 @@ function extractToolResultText(result: unknown): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + `… (+${s.length - max} more chars)` : s;
+}
+
+/** First non-empty line of `s`, trimmed — used to summarize a tool error. */
+function firstLine(s: string): string {
+  for (const line of s.split("\n")) {
+    const t = line.trim();
+    if (t) return t;
+  }
+  return "";
+}
+
+/**
+ * Label for a `tool_execution_start` event: `▸ <tool>`, except for `bash` we
+ * show the actual command (`$ npm test`) since that's the one tool whose args
+ * matter for log readability. All other tools log name-only at the start and
+ * their pass/fail status at the end.
+ */
+function toolStartLabel(toolName: unknown, args: unknown): string {
+  if (toolName === "bash") {
+    const cmd = (args as { command?: unknown } | null)?.command;
+    if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
+  }
+  return `▸ ${toolName}`;
 }
 
 /**
