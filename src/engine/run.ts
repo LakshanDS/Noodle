@@ -952,6 +952,13 @@ function formatTokens(n: number): string {
   return String(Math.round(n));
 }
 
+// Integer percent of `part` relative to `whole`. Returns "0%" when whole is 0
+// rather than NaN — should never hit at runtime but cheap to be defensive.
+function pctOf(part: number, whole: number): string {
+  if (!whole) return "0%";
+  return `${Math.round((part / whole) * 100)}%`;
+}
+
 /** Format a USD cost, trimming to cents for small amounts. */
 function formatCost(usd: number): string {
   if (usd < 0.01) return `$${usd.toFixed(4)}`;
@@ -1012,9 +1019,11 @@ export function buildFooter(
         `${formatTokens(t.output)} out`,
       ];
       // Cache tokens only surface for providers that support prompt caching
-      // (Anthropic, an Anthropic-protocol proxy). Omitted when 0.
-      if (t.cacheRead > 0) parts.push(`${formatTokens(t.cacheRead)} cache read`);
-      if (t.cacheWrite > 0) parts.push(`${formatTokens(t.cacheWrite)} cache write`);
+      // (Anthropic, an Anthropic-protocol proxy). Rendered as a percentage of
+      // input tokens — the ratio that actually tells you how much was reused
+      // vs reread.
+      if (t.cacheRead > 0) parts.push(`${pctOf(t.cacheRead, t.input)} cache read`);
+      if (t.cacheWrite > 0) parts.push(`${pctOf(t.cacheWrite, t.input)} cache write`);
       parts.push(`${formatTokens(t.total)} total`);
       lines.push(`Tokens: ${parts.join(" · ")}`);
 
