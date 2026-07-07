@@ -73,8 +73,9 @@ describe("buildFooter", () => {
       tokens: { input: 45210, output: 3180, cacheRead: 12800, cacheWrite: 5000, total: 66190 },
     };
     const f = buildFooter(profile, "Noodle", cacheStats);
-    expect(f).toContain("12.8K cache read");
-    expect(f).toContain("5K cache write");
+    // Cache tokens render as a percentage of input tokens (12800/45210 ≈ 28%).
+    expect(f).toContain("28% cache read");
+    expect(f).toContain("11% cache write");
     expect(f).toContain("66.19K total");
   });
 
