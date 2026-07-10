@@ -119,6 +119,28 @@ export class GitHubClient {
     return data.html_url;
   }
 
+  /**
+   * Open a new issue in the repo. Used by cron runs, whose output IS an issue
+   * (e.g. a bug-finding sweep opens one issue per finding). Optional labels are
+   * applied atomically at creation. Returns the new issue number + URL.
+   */
+  async createIssue(
+    repo: string,
+    title: string,
+    body: string,
+    labels?: string[],
+  ): Promise<{ number: number; html_url: string }> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.issues.create({
+      owner,
+      repo: name,
+      title,
+      body,
+      labels: labels ?? [],
+    });
+    return { number: data.number, html_url: data.html_url };
+  }
+
   /** Get the repo's default branch name (e.g. "main", "master", "develop"). */
   async defaultBranch(repo: string): Promise<string> {
     const [owner, name] = parseRepo(repo);

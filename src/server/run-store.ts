@@ -18,7 +18,11 @@ export type RunStatus = "running" | "succeeded" | "failed" | "no_changes";
 export interface RunRow {
   job_id: string;
   repo: string;
-  issue: number;
+  /**
+   * The source issue number for normal runs; NULL for cron runs (which create
+   * issues rather than fixing one). Migrated to nullable for the cron feature.
+   */
+  issue: number | null;
   branch: string;
   profile: string | null;
   model: string | null;
@@ -30,22 +34,29 @@ export interface RunRow {
   session_path: string | null;
   started_at: string;
   finished_at: string | null;
+  /** The cron_jobs row that produced this run, or NULL for issue-driven runs. */
+  cron_job_id: number | null;
+  /** URL of an issue a cron run opened (its output). NULL for normal runs. */
+  output_issue_url: string | null;
 }
 
 /** Subset needed to create a row (the rest defaults/NULLs at insert time). */
 export interface NewRun {
   job_id: string;
   repo: string;
-  issue: number;
+  /** Source issue for normal runs. Omit/leave null for cron runs. */
+  issue?: number | null;
   branch: string;
   session_path?: string | null;
+  /** Set for cron runs so the dashboard can group runs by their cron. */
+  cron_job_id?: number | null;
 }
 
 /** Partial update applied by `updateRun` — only set fields are written. */
 export type RunUpdate = Partial<
   Pick<
     RunRow,
-    | "profile" | "model" | "status" | "pr_url" | "comment_url" | "summary" | "error" | "session_path" | "finished_at"
+    | "profile" | "model" | "status" | "pr_url" | "comment_url" | "summary" | "error" | "session_path" | "finished_at" | "output_issue_url"
   >
 >;
 
@@ -53,7 +64,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
   job_id TEXT PRIMARY KEY,
   repo TEXT NOT NULL,
-  issue INTEGER NOT NULL,
+  issue INTEGER,
   branch TEXT NOT NULL,
   profile TEXT,
   model TEXT,
@@ -64,11 +75,81 @@ CREATE TABLE IF NOT EXISTS runs (
   error TEXT,
   session_path TEXT,
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
-  finished_at TEXT
+  finished_at TEXT,
+  cron_job_id INTEGER,
+  output_issue_url TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
 `;
+
+/**
+ * The cron_job_id index references a column that doesn't exist on pre-existing
+ * `runs` tables, so it can only be created AFTER the migration adds the column.
+ * On fresh DBs the column is in the CREATE above; on old DBs the migration adds
+ * it first. Same pattern as the queue's `ensureDedupeIndex`.
+ */
+const IDX_CRON_JOB_ID =
+  "CREATE INDEX IF NOT EXISTS idx_runs_cron_job_id ON runs(cron_job_id)";
+
+/**
+ * Idempotent migrations for the cron feature. On pre-existing DBs the `runs`
+ * table predates these columns; add them so cron runs (which carry no source
+ * issue) can store NULL. Same PRAGMA-introspection pattern as the queue migrations.
+ *
+ * Also relaxes the historical NOT NULL on `issue`: the column was
+ * `INTEGER NOT NULL`, but cron runs have no source issue and need to store NULL.
+ * SQLite cannot drop a NOT NULL constraint in place (no `ALTER ... DROP NOT NULL`
+ * without a full table rebuild), so we rebuild the table to the nullable shape.
+ * On a fresh DB the CREATE above already allows NULL, so the rebuild is skipped.
+ */
+function migrateAddCronColumns(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(runs)").all() as { name: string; notnull: number }[];
+  const hasCronJobId = cols.some((c) => c.name === "cron_job_id");
+  const hasOutputIssueUrl = cols.some((c) => c.name === "output_issue_url");
+  const issueCol = cols.find((c) => c.name === "issue");
+
+  // Fast path: table already has all columns + nullable issue. Nothing to do.
+  if (hasCronJobId && hasOutputIssueUrl && (!issueCol || issueCol.notnull === 0)) {
+    db.exec(IDX_CRON_JOB_ID);
+    return;
+  }
+
+  // Add the new columns if missing (works on existing tables via ALTER).
+  if (!hasCronJobId) db.exec("ALTER TABLE runs ADD COLUMN cron_job_id INTEGER");
+  if (!hasOutputIssueUrl) db.exec("ALTER TABLE runs ADD COLUMN output_issue_url TEXT");
+
+  // Relax NOT NULL on `issue` via a table rebuild when it's still constrained.
+  if (issueCol && issueCol.notnull === 1) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs_new (
+        job_id TEXT PRIMARY KEY,
+        repo TEXT NOT NULL,
+        issue INTEGER,
+        branch TEXT NOT NULL,
+        profile TEXT,
+        model TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        pr_url TEXT,
+        comment_url TEXT,
+        summary TEXT,
+        error TEXT,
+        session_path TEXT,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT,
+        cron_job_id INTEGER,
+        output_issue_url TEXT
+      );
+      INSERT INTO runs_new (job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url)
+      SELECT job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url FROM runs;
+      DROP TABLE runs;
+      ALTER TABLE runs_new RENAME TO runs;
+      CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+      CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
+    `);
+  }
+  db.exec(IDX_CRON_JOB_ID);
+}
 
 export class RunStore {
   private readonly db: Db;
@@ -76,6 +157,7 @@ export class RunStore {
   constructor(db: Db) {
     this.db = db;
     this.db.exec(SCHEMA);
+    migrateAddCronColumns(this.db);
   }
 
   /** For tests that want to inject an in-memory DB. */
@@ -94,8 +176,8 @@ export class RunStore {
   createRun(run: NewRun): RunRow {
     this.db
       .prepare(
-        `INSERT INTO runs (job_id, repo, issue, branch, session_path, status)
-         VALUES (@job_id, @repo, @issue, @branch, @session_path, 'running')
+        `INSERT INTO runs (job_id, repo, issue, branch, session_path, status, cron_job_id)
+         VALUES (@job_id, @repo, @issue, @branch, @session_path, 'running', @cron_job_id)
          ON CONFLICT(job_id) DO UPDATE SET
            repo = excluded.repo,
            issue = excluded.issue,
@@ -108,10 +190,12 @@ export class RunStore {
            summary = NULL,
            error = NULL,
            session_path = NULL,
+           cron_job_id = excluded.cron_job_id,
+           output_issue_url = NULL,
            started_at = datetime('now'),
            finished_at = NULL`,
       )
-      .run({ session_path: null, ...run });
+      .run({ session_path: null, cron_job_id: null, ...run });
     return this.getRun(run.job_id);
   }
 
@@ -141,6 +225,13 @@ export class RunStore {
     return this.db
       .prepare("SELECT * FROM runs ORDER BY started_at DESC LIMIT ?")
       .all(limit) as RunRow[];
+  }
+
+  /** Runs belonging to one cron job, newest-first (for the cron detail view). */
+  listRunsForCron(cronJobId: number, limit = 20): RunRow[] {
+    return this.db
+      .prepare("SELECT * FROM runs WHERE cron_job_id = ? ORDER BY started_at DESC LIMIT ?")
+      .all(cronJobId, limit) as RunRow[];
   }
 
   /** Count runs by status (for dashboard stats). */

@@ -4,7 +4,10 @@ import { dirname, join } from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { RunStore } from "./run-store.js";
 import type { JobQueue } from "./queue.js";
+import { CronStore } from "./cron-store.js";
+import type { NewCron, CronUpdate } from "./cron-store.js";
 import type { AuthProvider } from "../github/auth-provider.js";
+import type { NoodleConfig } from "../config/schema.js";
 import { labelsFor } from "../engine/run.js";
 import { readSession, type ParsedMessage } from "./session-reader.js";
 import {
@@ -40,10 +43,14 @@ export interface UiDeps {
   queue: JobQueue;
   authProvider: AuthProvider;
   agentName: string;
+  /** Cron job store — for the /api/crons CRUD + manual-run routes. */
+  cronStore: CronStore;
+  /** Resolved config — for the profile-name dropdown + default profile. */
+  config: NoodleConfig;
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, secret, queue, authProvider, agentName } = deps;
+  const { runStore, secret, queue, authProvider, agentName, cronStore, config } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   const auth = async (req: FastifyRequest, reply: FastifyReply) => requireAuth(req, reply, secret);
@@ -120,16 +127,171 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     // Update the run store.
     runStore.updateRun(id, { status: "failed", error: "cancelled by operator", finished_at: new Date().toISOString() });
     // Best-effort: remove the "cooking" label so future runs aren't blocked.
+    // Cron runs have no source issue (run.issue is null) and never apply the
+    // label, so skip the API call for them.
     try {
-      const lbls = labelsFor(agentName);
-      const instId = queue.getById(numericId).installation_id ?? undefined;
-      const { gh } = await authProvider.forRepo(run.repo, instId);
-      await gh.removeIssueLabel(run.repo, run.issue, lbls.cooking.name);
+      if (run.issue != null) {
+        const lbls = labelsFor(agentName);
+        const instId = queue.getById(numericId).installation_id ?? undefined;
+        const { gh } = await authProvider.forRepo(run.repo, instId);
+        await gh.removeIssueLabel(run.repo, run.issue, lbls.cooking.name);
+      }
     } catch (e) {
       log.warn({ err: e, jobId: id }, "could not remove cooking label after cancel");
     }
     return { ok: true };
   });
+
+  // --- Cron job management (all auth-guarded). ---
+  // Crons are DB-defined recurring agent runs that open issues (see cron-store.ts).
+  // These routes are the backend for the "Crons" section of the web UI.
+
+  /** Profile names available for the create/edit dropdown. */
+  app.get("/api/profiles", { preHandler: auth }, async () => {
+    return { profiles: Object.keys(config.profiles), default: config.default_profile };
+  });
+
+  app.get("/api/crons", { preHandler: auth }, async () => {
+    return { crons: cronStore.listCrons() };
+  });
+
+  app.post("/api/crons", { preHandler: auth }, async (req, reply) => {
+    const body = readJsonBody(req.body);
+    const parsed = parseCronInput(body);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    try {
+      const cron = cronStore.createCron(parsed);
+      return { cron };
+    } catch (e) {
+      return reply.code(400).send({ error: `Invalid cron expression: ${(e as Error).message}` });
+    }
+  });
+
+  app.get("/api/crons/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    try {
+      const cron = cronStore.getCron(id);
+      const runs = runStore.listRunsForCron(id, 20);
+      return { cron, runs };
+    } catch {
+      return reply.code(404).send({ error: "cron not found" });
+    }
+  });
+
+  app.patch("/api/crons/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    const body = readJsonBody(req.body);
+    const parsed = parseCronUpdate(body);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    try {
+      // Validate a changed cron expression before persisting.
+      if (parsed.cron_expression !== undefined) {
+        CronStore.nextRunFromExpr(parsed.cron_expression);
+      }
+      const cron = cronStore.updateCron(id, parsed);
+      return { cron };
+    } catch (e) {
+      const msg = (e as Error).message ?? String(e);
+      if (/not found/.test(msg)) return reply.code(404).send({ error: msg });
+      return reply.code(400).send({ error: `Invalid cron expression: ${msg}` });
+    }
+  });
+
+  app.delete("/api/crons/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    try {
+      cronStore.getCron(id);
+    } catch {
+      return reply.code(404).send({ error: "cron not found" });
+    }
+    cronStore.deleteCron(id);
+    return { ok: true };
+  });
+
+  /** Trigger a cron job immediately (enqueue now, bypassing its schedule). */
+  app.post("/api/crons/:id/run", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    let cron;
+    try {
+      cron = cronStore.getCron(id);
+    } catch {
+      return reply.code(404).send({ error: "cron not found" });
+    }
+    // Resolve installation id (App mode); PAT mode ignores it.
+    let instId: number | null = null;
+    try {
+      const { gh } = await authProvider.forRepo(cron.repo);
+      instId = (await gh.repoInstallationId(cron.repo)) ?? null;
+    } catch {
+      // PAT mode or repo not reachable yet — enqueue without installation id.
+    }
+    queue.enqueueCron({
+      repo: cron.repo,
+      cronJobId: cron.id,
+      installationId: instId ?? undefined,
+      profile: cron.profile ?? config.default_profile,
+      source: "manual",
+    });
+    return { ok: true };
+  });
+}
+
+/**
+ * Parse a request body that may arrive as a raw JSON string (the webhook app's
+ * custom parser) or a parsed object. Mirrors readPassword's coercion. Returns
+ * the object, or null when unparseable.
+ */
+function readJsonBody(body: unknown): Record<string, unknown> | null {
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {
+      return null;
+    }
+  }
+  return body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+}
+
+/** Validate a cron create payload. Returns the typed input or { error }. */
+function parseCronInput(body: Record<string, unknown> | null): NewCron | { error: string } {
+  if (!body) return { error: "missing body" };
+  const name = strField(body, "name");
+  const repo = strField(body, "repo");
+  const prompt = strField(body, "prompt");
+  const branch_name = strField(body, "branch_name") || strField(body, "branch");
+  const cron_expression = strField(body, "cron_expression") || strField(body, "schedule");
+  if (!name || !repo || !prompt || !branch_name || !cron_expression) {
+    return { error: "name, repo, prompt, branch_name, and cron_expression are required" };
+  }
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+    return { error: `repo "${repo}" is not a valid "owner/name"` };
+  }
+  const profile = body.profile === null || body.profile === undefined ? null : strField(body, "profile");
+  return { name, repo, prompt, branch_name, cron_expression, profile, enabled: 1 };
+}
+
+/** Validate a cron update payload (all fields optional). Returns the typed update or { error }. */
+function parseCronUpdate(body: Record<string, unknown> | null): CronUpdate | { error: string } {
+  if (!body) return { error: "missing body" };
+  const out: CronUpdate = {};
+  for (const key of ["name", "repo", "prompt", "branch_name", "cron_expression", "profile"] as const) {
+    const v = strField(body, key === "branch_name" ? "branch_name" : key);
+    if (v !== undefined) (out as Record<string, unknown>)[key] = v;
+  }
+  if (body.enabled !== undefined) {
+    out.enabled = body.enabled ? 1 : 0;
+  }
+  return out;
+}
+
+/** Coerce a body field to a trimmed string, or undefined when absent/empty. */
+function strField(body: Record<string, unknown>, key: string): string | undefined {
+  const v = body[key];
+  return typeof v === "string" ? v.trim() || undefined : undefined;
 }
 
 /**

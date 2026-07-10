@@ -2,8 +2,11 @@ import { createWebhookApp } from "./http.js";
 import { JobQueue, QueueWorker, type RunJobFn } from "./queue.js";
 import { RunStore } from "./run-store.js";
 import { Scheduler, SqliteScanState, runScanOnce, type SchedulerDeps } from "./scheduler.js";
+import { CronStore } from "./cron-store.js";
+import { CronScheduler, buildCronSchedulerDeps } from "./cron-scheduler.js";
 import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/auth-provider.js";
 import { runJob } from "../engine/run.js";
+import { runCronJob } from "../engine/cron-run.js";
 import { loadConfig } from "../config/load.js";
 import { log } from "../util/log.js";
 import { slugify } from "../util/slugify.js";
@@ -31,15 +34,44 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const queue = new JobQueue(config.storage.sqlite_path);
   const scanState = new SqliteScanState(queue.getDb());
   const runStore = new RunStore(queue.getDb());
+  const cronStore = new CronStore(queue.getDb());
 
   // The worker's runJobFn: resolve auth for the job's repo, build a GitHubClient,
-  // and call the existing engine.runJob with the token + run store plumbed through.
-  // Providers re-call forRepo() at each git+HTTP op so a long-running job (2h+)
-  // re-mints its token after the GitHub-App installation token's 1h TTL expires.
-  // The auth provider caches, so the repeated calls are hash lookups.
+  // and dispatch to either runJob (issue→PR) or runCronJob (scheduled → issues)
+  // based on whether the job carries a cron_job_id. Both share the runStore +
+  // auth provider. Providers re-call forRepo() at each git+HTTP op so a
+  // long-running job (2h+) re-mints its token after the GitHub-App installation
+  // token's 1h TTL expires. The auth provider caches, so the repeated calls are
+  // hash lookups.
   const runJobFn: RunJobFn = async (job) => {
     const instId = job.installation_id ?? undefined;
     const initial = await authProvider.forRepo(job.repo, instId);
+
+    // Cron-originated job: look up its definition and dispatch to runCronJob.
+    // A cron job row may have been deleted between enqueue and execution —
+    // surface that as a clean failure rather than a crash.
+    if (job.cron_job_id && job.cron_job_id > 0) {
+      let cron;
+      try {
+        cron = cronStore.getCron(job.cron_job_id);
+      } catch {
+        log.warn({ jobId: job.id, cronJobId: job.cron_job_id }, "cron job no longer exists; skipping");
+        return;
+      }
+      await runCronJob(config, initial.gh, {
+        repo: job.repo,
+        prompt: cron.prompt,
+        branchName: cron.branch_name,
+        profile: cron.profile,
+        jobId: `job-${job.id}`,
+        token: initial.token,
+      }, {
+        runStore,
+        tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
+      });
+      return;
+    }
+
     await runJob(config, initial.gh, {
       repo: job.repo,
       issueNumber: job.issue_number,
@@ -121,7 +153,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const uiPassword = process.env.NOODLE_UI_PASSWORD;
   if (uiPassword) {
     const { registerUiRoutes } = await import("./ui-routes.js");
-    registerUiRoutes(app, { runStore, secret: uiPassword, queue, authProvider, agentName: config.agent_name });
+    registerUiRoutes(app, { runStore, secret: uiPassword, queue, authProvider, agentName: config.agent_name, cronStore, config });
     log.info("web UI enabled (password-protected)");
   } else {
     log.warn("NOODLE_UI_PASSWORD not set — web UI disabled (/health + /webhook only)");
@@ -152,13 +184,19 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     scheduler = new Scheduler(config, schedulerDeps);
   }
 
-  // --- Boot order: workers first (drain backlog), then http, then scheduler. ---
+  // Cron scheduler: always runs (cron jobs are DB-defined, not config-gated).
+  // Fires an immediate tick on boot so due crons run without waiting for the
+  // first interval, then every 60s.
+  const cronScheduler = new CronScheduler(buildCronSchedulerDeps(cronStore, queue, authProvider, config));
+
+  // --- Boot order: workers first (drain backlog), then http, then schedulers. ---
   const workerPromises = Promise.all(workers.map((w) => w.run()));
 
   await app.listen({ host, port });
   log.info({ host, port }, "webhook server listening");
 
   scheduler?.start();
+  cronScheduler.start();
 
   // --- Graceful shutdown ---
   let shuttingDown = false;
@@ -167,6 +205,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     shuttingDown = true;
     log.info({ signal }, "shutting down");
     scheduler?.stop();
+    cronScheduler.stop();
     for (const w of workers) w.stop();
     await app.close().catch((e) => log.error({ err: e }, "http close error"));
     await workerPromises.catch(() => {}); // all workers exit their loops

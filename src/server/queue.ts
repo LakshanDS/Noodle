@@ -40,6 +40,14 @@ export interface QueuedJob {
    * no hint was available (treated as "no per-profile cap").
    */
   profile: string | null;
+  /**
+   * The cron_jobs row that enqueued this job, or 0 for a normal issue-driven
+   * job. Cron jobs carry no `issue_number` (they CREATE issues), so the dedupe
+   * key was widened to `(repo, issue_number, cron_job_id)` to tell them apart
+   * — different crons on the same repo can run concurrently, while a repeat
+   * fire of the SAME cron (before its previous run finishes) is still deduped.
+   */
+  cron_job_id: number;
 }
 
 /** What the worker calls to actually run a job. */
@@ -57,14 +65,25 @@ CREATE TABLE IF NOT EXISTS jobs (
   error TEXT,
   not_before TEXT,
   profile TEXT,
+  cron_job_id INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
   finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedup
-  ON jobs(repo, issue_number) WHERE status IN ('queued', 'running');
 `;
+
+/**
+ * The dedupe index references `cron_job_id`, so it can ONLY be created after the
+ * `migrateAddCronJobId` migration has run on pre-existing DBs (the column
+ * wouldn't exist yet at SCHEMA time). On fresh DBs the column is in the CREATE
+ * above, so this is a clean CREATE. On old DBs the migration adds the column
+ * first, then this builds the index. Lives outside SCHEMA for the same reason
+ * `IDX_RUNNING_PROFILE` does — see ensureRunningProfileIndex.
+ */
+const IDX_ACTIVE_DEDUP =
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedup" +
+  " ON jobs(repo, issue_number, cron_job_id) WHERE status IN ('queued', 'running')";
 
 /**
  * Created AFTER migrations so the `profile` column exists on migrated DBs.
@@ -99,6 +118,42 @@ function migrateAddProfile(db: Db): void {
 }
 
 /**
+ * Idempotent migration: add `cron_job_id` so cron-originated jobs can be
+ * distinguished from issue-driven ones. Same PRAGMA-introspection pattern.
+ */
+function migrateAddCronJobId(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "cron_job_id")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN cron_job_id INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/**
+ * Ensure the dedupe index exists with the `cron_job_id` column in its key.
+ *
+ * The original index (pre-cron) was on `(repo, issue_number)`. Cron jobs have
+ * no issue_number (they create one), so the key was widened to
+ * `(repo, issue_number, cron_job_id)` — each cron dedupes against itself while
+ * normal jobs keep deduping on `(repo, issue, 0)`.
+ *
+ * Runs AFTER the `cron_job_id` migration so the column is guaranteed present.
+ * Idempotent: introspects the existing index's SQL; only drops + recreates when
+ * it's still the old 2-column shape. On fresh DBs (no index yet) and on
+ * already-migrated DBs, it's a plain CREATE IF NOT EXISTS.
+ */
+function ensureDedupeIndex(db: Db): void {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_active_dedup'")
+    .get() as { sql: string } | undefined;
+  const sql = row?.sql ?? "";
+  if (sql && !sql.includes("cron_job_id")) {
+    // Old 2-column index — drop it so the new 3-column one can replace it.
+    db.exec("DROP INDEX IF EXISTS idx_jobs_active_dedup");
+  }
+  db.exec(IDX_ACTIVE_DEDUP);
+}
+
+/**
  * Ensure the per-profile running-count index exists. Runs AFTER migrations so
  * the `profile` column is guaranteed present (created by SCHEMA on fresh DBs,
  * by migrateAddProfile on old ones).
@@ -117,6 +172,8 @@ export class JobQueue {
     this.db.exec(SCHEMA);
     migrateAddNotBefore(this.db);
     migrateAddProfile(this.db);
+    migrateAddCronJobId(this.db);
+    ensureDedupeIndex(this.db);
     ensureRunningProfileIndex(this.db);
   }
 
@@ -127,6 +184,8 @@ export class JobQueue {
     db.exec(SCHEMA);
     migrateAddNotBefore(db);
     migrateAddProfile(db);
+    migrateAddCronJobId(db);
+    ensureDedupeIndex(db);
     ensureRunningProfileIndex(db);
     return q;
   }
@@ -158,6 +217,38 @@ export class JobQueue {
       )
       .get(repo, issueNumber) as QueuedJob | undefined;
     if (!row) throw new Error("enqueue: insert returned no row");
+    return row;
+  }
+
+  /**
+   * Enqueue a cron-originated job. Cron runs have no issue_number (the agent
+   * CREATES issues during the run), so `issue_number = 0` and dedupe is keyed on
+   * `(repo, 0, cron_job_id)` instead — each cron job dedupes against itself, so
+   * a repeat fire before the prior run finishes is a no-op, while different
+   * crons on the same repo run concurrently. `profile` is the cron's configured
+   * profile (or default) for per-profile concurrency gating.
+   */
+  enqueueCron(opts: {
+    repo: string;
+    cronJobId: number;
+    installationId?: number;
+    profile?: string | null;
+    source?: string;
+  }): QueuedJob {
+    const { repo, cronJobId, installationId = null, profile = null, source = "cron" } = opts;
+    const ins = this.db.prepare(
+      `INSERT OR IGNORE INTO jobs (repo, issue_number, cron_job_id, installation_id, source, profile)
+       VALUES (@repo, 0, @cronJobId, @installationId, @source, @profile)`,
+    );
+    ins.run({ repo, cronJobId, installationId, source, profile });
+    const row = this.db
+      .prepare(
+        `SELECT * FROM jobs
+         WHERE repo = ? AND cron_job_id = ? AND status IN ('queued','running')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(repo, cronJobId) as QueuedJob | undefined;
+    if (!row) throw new Error("enqueueCron: insert returned no row");
     return row;
   }
 

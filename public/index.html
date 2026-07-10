@@ -194,6 +194,59 @@
   /* ---------- Loading + errors ---------- */
   .center-msg { text-align: center; padding: 60px 24px; color: var(--text-dim); font-size: 14px; }
   .err-banner { margin: 12px; padding: 12px; background: rgba(248,81,73,0.1); border: 1px solid var(--fail); border-radius: 10px; color: var(--fail); font-size: 13px; }
+
+  /* ---------- Bottom tab nav (Runs | Crons) ---------- */
+  .tab-nav {
+    flex: 0 0 auto; display: flex; gap: 0;
+    background: var(--bg-elev); border-top: 1px solid var(--border);
+    padding-bottom: var(--safe-bottom);
+  }
+  .tab-nav button {
+    flex: 1 1 0; min-height: 48px; background: transparent; border: none;
+    color: var(--text-dim); font-size: 13px; font-weight: 600;
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    padding: 8px 4px;
+  }
+  .tab-nav button.active { color: var(--accent); }
+  .tab-nav button .tab-ico { font-size: 18px; }
+
+  /* ---------- Cron list rows ---------- */
+  .cron-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 16px; border-bottom: 1px solid var(--border); min-height: 44px;
+  }
+  .cron-row:active { background: var(--bg-elev); }
+  .cron-row .dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%; margin-top: 2px; }
+  .cron-row.enabled .dot { background: var(--ok); }
+  .cron-row.disabled .dot { background: var(--none); }
+  .cron-row .meta { flex: 1 1 auto; min-width: 0; }
+  .cron-row .name { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cron-row .schedule { color: var(--text-dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* ---------- Cron detail / form ---------- */
+  .form-card { padding: 16px; }
+  .form-card .field { margin-bottom: 14px; }
+  .form-card label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 5px; font-weight: 600; }
+  .form-card input, .form-card textarea, .form-card select {
+    width: 100%; padding: 11px 13px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    font-size: 16px; font-family: inherit;
+  }
+  .form-card input:focus, .form-card textarea:focus, .form-card select:focus { outline: none; border-color: var(--accent); }
+  .form-card textarea { min-height: 90px; resize: vertical; font-family: inherit; }
+  .form-card .hint { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+  .form-card .hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--bg-elev2); padding: 1px 5px; border-radius: 4px; }
+  .form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  .btn {
+    flex: 1 1 auto; padding: 12px; border-radius: 10px; font-weight: 600; font-size: 15px;
+    border: 1px solid var(--border); background: var(--bg-elev2); color: var(--text); min-height: 44px;
+  }
+  .btn:active { opacity: 0.85; }
+  .btn:disabled { opacity: 0.5; }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.danger { border-color: var(--fail); color: var(--fail); }
+  .btn.danger:active { background: rgba(248,81,73,0.12); }
+  .section-label { padding: 14px 16px 6px; font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
 </style>
 </head>
 <body>
@@ -222,6 +275,39 @@
     <div class="scroll" id="runs-scroll">
       <div id="runs-list"></div>
     </div>
+    <nav class="tab-nav">
+      <button id="tab-runs" class="active"><span class="tab-ico">▶</span>Runs</button>
+      <button id="tab-crons"><span class="tab-ico">⏰</span>Crons</button>
+    </nav>
+  </section>
+
+  <!-- CRONS LIST -->
+  <section id="crons-view" class="hidden">
+    <div class="topbar">
+      <span class="emoji">⏰</span>
+      <span class="title">Crons</span>
+      <button class="icon-btn" id="new-cron-btn" title="New cron" aria-label="New cron">+</button>
+      <button class="icon-btn" id="refresh-crons" title="Refresh" aria-label="Refresh">↻</button>
+    </div>
+    <div class="scroll" id="crons-scroll">
+      <div id="crons-list"></div>
+    </div>
+    <nav class="tab-nav">
+      <button id="tab-runs-2"><span class="tab-ico">▶</span>Runs</button>
+      <button id="tab-crons-2" class="active"><span class="tab-ico">⏰</span>Crons</button>
+    </nav>
+  </section>
+
+  <!-- CRON DETAIL / EDIT -->
+  <section id="cron-detail-view" class="hidden">
+    <div class="topbar">
+      <button class="icon-btn" id="cron-back-btn" title="Back" aria-label="Back">‹</button>
+      <span class="title" id="cron-detail-title">Cron</span>
+      <button class="icon-btn" id="refresh-cron-detail" title="Refresh" aria-label="Refresh">↻</button>
+    </div>
+    <div class="scroll" id="cron-detail-scroll">
+      <div id="cron-form-area"></div>
+    </div>
   </section>
 
   <!-- CHAT -->
@@ -248,8 +334,11 @@
 // A 401 anywhere bounces back to the login view. No router, no framework.
 
 const $ = (id) => document.getElementById(id);
-const views = ["login-view", "runs-view", "chat-view"];
+const views = ["login-view", "runs-view", "crons-view", "cron-detail-view", "chat-view"];
 let currentRunId = null;
+let currentCronId = null;
+let profiles = [];        // fetched profile names for the dropdown
+let defaultProfile = "";
 
 function show(view) {
   for (const v of views) $(v).classList.toggle("hidden", v !== view);
@@ -351,6 +440,240 @@ function renderRuns(runs) {
 
 $("refresh-runs").addEventListener("click", openRuns);
 
+// ---------- Crons ----------
+async function ensureProfiles() {
+  if (profiles.length) return;
+  try {
+    const res = await api("/api/profiles");
+    const body = await res.json();
+    profiles = body.profiles || [];
+    defaultProfile = body.default || "";
+  } catch { /* leave empty — dropdown shows default only */ }
+}
+
+async function openCrons() {
+  show("crons-view");
+  $("crons-list").innerHTML = '<div class="center-msg">Loading…</div>';
+  try {
+    const res = await api("/api/crons");
+    const body = await res.json();
+    renderCrons(body.crons || []);
+  } catch {
+    $("crons-list").innerHTML = '<div class="center-msg">Could not load crons.</div>';
+  }
+}
+
+function cronScheduleText(expr) {
+  // Lightweight humanizer for the common cases; falls back to the raw expr.
+  const m = expr.trim().split(/\s+/);
+  if (m.length === 5) {
+    const [min, hr, dom, mon, dow] = m;
+    if (min === "0" && hr !== "*" && dom === "*" && mon === "*" && dow === "*") {
+      const h = parseInt(hr, 10);
+      const ampm = h < 12 ? "AM" : "PM";
+      const h12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+      return `Daily at ${String(h12).padStart(2,"0")}:00 ${ampm}`;
+    }
+    if (min === "0" && hr === "0" && dom === "*" && mon === "*" && dow === "0-6") return "Daily at 12:00 AM";
+    if (min === "0" && hr === "0" && dom === "*" && mon === "*" && dow === "1-5") return "Weekdays at 12:00 AM";
+    if (min === "0" && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "Every hour";
+    if (/^\*\//.test(min)) return `Every ${min.slice(2)} minutes`;
+    if (/^\*\//.test(hr)) return `Every ${hr.slice(2)} hours`;
+  }
+  return expr;
+}
+
+function renderCrons(crons) {
+  const el = $("crons-list");
+  if (crons.length === 0) {
+    el.innerHTML = '<div class="list-empty"><span class="emoji">⏰</span>No crons yet. Tap + to add one.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for (const c of crons) {
+    const row = document.createElement("div");
+    row.className = "cron-row " + (c.enabled ? "enabled" : "disabled");
+    row.innerHTML =
+      '<div class="dot"></div>' +
+      '<div class="meta">' +
+        '<div class="name"></div>' +
+        '<div class="schedule"></div>' +
+      '</div>';
+    row.querySelector(".name").textContent = c.name;
+    row.querySelector(".schedule").textContent =
+      cronScheduleText(c.cron_expression) + " · " + c.repo;
+    row.addEventListener("click", () => openCronDetail(c.id));
+    el.appendChild(row);
+  }
+}
+
+$("refresh-crons").addEventListener("click", openCrons);
+$("new-cron-btn").addEventListener("click", () => openCronDetail(null));
+$("tab-crons").addEventListener("click", openCrons);
+$("tab-crons-2").addEventListener("click", openCrons);
+$("tab-runs").addEventListener("click", openRuns);
+$("tab-runs-2").addEventListener("click", openRuns);
+$("cron-back-btn").addEventListener("click", () => { currentCronId = null; openCrons(); });
+$("refresh-cron-detail").addEventListener("click", () => { if (currentCronId) openCronDetail(currentCronId); });
+
+async function openCronDetail(id) {
+  currentCronId = id;
+  show("cron-detail-view");
+  $("cron-form-area").innerHTML = '<div class="center-msg">Loading…</div>';
+  $("cron-detail-title").textContent = id ? "Edit Cron" : "New Cron";
+  await ensureProfiles();
+
+  let cron = null;
+  let runs = [];
+  if (id) {
+    try {
+      const res = await api("/api/crons/" + encodeURIComponent(id));
+      const body = await res.json();
+      cron = body.cron;
+      runs = body.runs || [];
+    } catch {
+      $("cron-form-area").innerHTML = '<div class="center-msg">Could not load cron.</div>';
+      return;
+    }
+  }
+  renderCronForm(cron, runs);
+}
+
+function renderCronForm(cron, runs) {
+  const isNew = !cron;
+  const c = cron || { name: "", repo: "", prompt: "", branch_name: "", cron_expression: "0 0 * * *", profile: null, enabled: 1 };
+  const el = $("cron-form-area");
+  el.innerHTML = "";
+
+  const card = document.createElement("div");
+  card.className = "form-card";
+  card.innerHTML =
+    '<div class="field"><label for="cf-name">Name</label>' +
+      '<input id="cf-name" type="text" value="' + escAttr(c.name) + '" placeholder="e.g. Bug sweep"></div>' +
+    '<div class="field"><label for="cf-repo">Repository</label>' +
+      '<input id="cf-repo" type="text" value="' + escAttr(c.repo) + '" placeholder="owner/name"></div>' +
+    '<div class="field"><label for="cf-branch">Branch</label>' +
+      '<input id="cf-branch" type="text" value="' + escAttr(c.branch_name) + '" placeholder="e.g. wa-agent">' +
+      '<div class="hint">The agent commits here each run. Reused across runs.</div></div>' +
+    '<div class="field"><label for="cf-expr">Schedule (cron)</label>' +
+      '<input id="cf-expr" type="text" value="' + escAttr(c.cron_expression) + '" placeholder="0 0 * * *">' +
+      '<div class="hint" id="cf-expr-hint"></div></div>' +
+    '<div class="field"><label for="cf-profile">Profile</label>' +
+      '<select id="cf-profile"><option value="">Default</option></select>' +
+      '<div class="hint">Which model the cron runs on.</div></div>' +
+    '<div class="field"><label for="cf-prompt">Prompt / Instructions</label>' +
+      '<textarea id="cf-prompt" placeholder="e.g. Find bugs in the codebase and open an issue for each one.">' + escHtml(c.prompt) + '</textarea></div>' +
+    '<div id="cf-error" class="err-banner hidden"></div>' +
+    '<div class="form-actions">' +
+      '<button class="btn primary" id="cf-save">' + (isNew ? "Create" : "Save") + '</button>' +
+      (isNew ? "" : '<button class="btn" id="cf-run">Run Now</button>') +
+      (isNew ? "" : '<button class="btn" id="cf-toggle">' + (c.enabled ? "Disable" : "Enable") + '</button>') +
+      (isNew ? "" : '<button class="btn danger" id="cf-delete">Delete</button>') +
+    '</div>';
+  el.appendChild(card);
+
+  // Populate the profile dropdown.
+  const sel = $("cf-profile");
+  for (const p of profiles) {
+    const opt = document.createElement("option");
+    opt.value = p; opt.textContent = p + (p === defaultProfile ? " (default)" : "");
+    sel.appendChild(opt);
+  }
+  if (c.profile) sel.value = c.profile;
+
+  // Live schedule preview.
+  const exprInput = $("cf-expr");
+  const hintEl = $("cf-expr-hint");
+  const updateHint = () => { hintEl.innerHTML = "Runs: <code>" + escHtml(cronScheduleText(exprInput.value)) + "</code>"; };
+  exprInput.addEventListener("input", updateHint);
+  updateHint();
+
+  // Save (create or update).
+  $("cf-save").addEventListener("click", async () => {
+    const payload = {
+      name: $("cf-name").value.trim(),
+      repo: $("cf-repo").value.trim(),
+      branch_name: $("cf-branch").value.trim(),
+      cron_expression: $("cf-expr").value.trim(),
+      profile: $("cf-profile").value || null,
+      prompt: $("cf-prompt").value,
+    };
+    const errEl = $("cf-error");
+    errEl.classList.add("hidden");
+    try {
+      const res = await api("/api/crons" + (isNew ? "" : "/" + encodeURIComponent(cron.id)), {
+        method: isNew ? "POST" : "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json();
+      if (!res.ok) { errEl.textContent = body.error || "Save failed"; errEl.classList.remove("hidden"); return; }
+      // After create/edit, open the saved cron's detail.
+      await openCronDetail(body.cron.id);
+    } catch {
+      errEl.textContent = "Could not reach server"; errEl.classList.remove("hidden");
+    }
+  });
+
+  if (!isNew) {
+    $("cf-run").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = "Queuing…";
+      try {
+        const res = await api("/api/crons/" + encodeURIComponent(cron.id) + "/run", { method: "POST" });
+        if (!res.ok) { const b = await res.json().catch(() => ({})); btn.textContent = b.error || "Failed"; btn.disabled = false; return; }
+        btn.textContent = "Queued ✓";
+        setTimeout(() => { btn.textContent = "Run Now"; btn.disabled = false; }, 2000);
+      } catch { btn.textContent = "Error"; btn.disabled = false; }
+    });
+
+    $("cf-toggle").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      const enable = btn.textContent.trim() === "Enable";
+      try {
+        const res = await api("/api/crons/" + encodeURIComponent(cron.id), {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: enable ? 1 : 0 }),
+        });
+        if (res.ok) { btn.textContent = enable ? "Disable" : "Enable"; }
+      } catch { /* ignore */ }
+    });
+
+    $("cf-delete").addEventListener("click", async () => {
+      if (!confirm("Delete this cron? Run history is kept.")) return;
+      try {
+        await api("/api/crons/" + encodeURIComponent(cron.id), { method: "DELETE" });
+        await openCrons();
+      } catch { /* ignore */ }
+    });
+
+    // Recent runs for this cron (reuses the .run row pattern).
+    if (runs.length > 0) {
+      const label = document.createElement("div");
+      label.className = "section-label";
+      label.textContent = "Recent runs";
+      el.appendChild(label);
+      const list = document.createElement("div");
+      for (const r of runs) {
+        const row = document.createElement("div");
+        row.className = "run " + r.status;
+        const repoName = r.repo.split("/").pop() || r.repo;
+        row.innerHTML =
+          '<div class="dot"></div>' +
+          '<div class="meta"><div class="repo"></div><div class="issue"></div></div>' +
+          '<div class="badge"></div>';
+        row.querySelector(".repo").textContent = repoName;
+        row.querySelector(".issue").textContent = fmtTime(r.started_at);
+        row.querySelector(".badge").textContent = statusText(r.status);
+        row.addEventListener("click", () => openChat(r.job_id));
+        list.appendChild(row);
+      }
+      el.appendChild(list);
+    }
+  }
+}
+
 async function cancelRun(jobId, btn) {
   btn.disabled = true;
   btn.textContent = "Cancelling…";
@@ -391,7 +714,8 @@ async function loadChat(jobId) {
 }
 
 function renderChat(run, messages) {
-  $("chat-title").textContent = (run.repo.split("/").pop() || run.repo) + " #" + run.issue;
+  const issuePart = run.issue != null ? " #" + run.issue : (run.cron_job_id ? " (cron)" : "");
+  $("chat-title").textContent = (run.repo.split("/").pop() || run.repo) + issuePart;
 
   // Show cancel button only for running jobs.
   const cancelBtn = $("chat-cancel-btn");
@@ -572,7 +896,12 @@ function fmtTime(iso) {
 }
 
 // ---------- Nav ----------
-$("back-btn").addEventListener("click", () => { currentRunId = null; openRuns(); });
+// Back from chat returns to the view that opened it (runs list or cron detail).
+$("back-btn").addEventListener("click", () => {
+  currentRunId = null;
+  if (currentCronId) { openCronDetail(currentCronId); }
+  else { openRuns(); }
+});
 $("refresh-chat").addEventListener("click", () => { if (currentRunId) loadChat(currentRunId); });
 
 // ---------- Boot: probe auth, open the right view ----------
