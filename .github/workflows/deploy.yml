@@ -40,10 +40,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Lowercase the image name (GHCR rejects mixed-case paths).
+      # Lowercase the image name + append -agent suffix (GHCR rejects mixed-case
+      # paths). The -agent suffix matches the compose file's image field and the
+      # container_name, so they all line up: ghcr.io/<owner>/noodle-agent.
       - name: Lowercase image name
         id: image
-        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')-agent" >> $GITHUB_OUTPUT
 
       - name: Extract metadata
         id: meta
