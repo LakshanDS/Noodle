@@ -7,6 +7,7 @@ import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildCronPrompt } from "./prompt.js";
+import { generateIssueTitle, templateTitle } from "./title.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
@@ -31,6 +32,12 @@ import {
 
 /** AuthStorage instance type (its constructor is private; use the factory's return type). */
 type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
+
+/**
+ * Color applied to the agent-name label on cron output issues — teal (#008672,
+ * without the leading '#'). Makes cron output visually distinct in a triage list.
+ */
+const CRON_LABEL_COLOR = "008672";
 
 /**
  * Input for a scheduled (cron) run. Unlike the issue-driven RunInput, there is
@@ -274,7 +281,20 @@ export async function runCronJob(
       const issueBody = errored
         ? buildCronErrorBody(config.agent_name, stopReason.errorMessage ?? "agent run ended on error")
         : buildCronIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
-      const issueTitle = cronIssueTitle(input.prompt);
+      // Generate a clean title from the agent's findings via a separate model
+      // call (falls back to a template on any failure). Only on success — an
+      // errored run uses the task as the title since there are no findings.
+      const issueTitle = errored
+        ? templateTitle(input.prompt)
+        : await generateIssueTitle(agentAnswer ?? "", input.prompt, config, profile);
+      // Ensure the agent-name label exists with the brand teal color so cron
+      // output issues are visually identifiable in a triage list. Idempotent.
+      await gh.ensureLabel(
+        input.repo,
+        config.agent_name,
+        CRON_LABEL_COLOR,
+        `${config.agent_name} cron output`,
+      );
       const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [config.agent_name]);
       log_.info({ issue: issue.number, url: issue.html_url, errored }, "opened cron output issue");
 
@@ -435,30 +455,35 @@ function firstLine(s: string): string {
   return "";
 }
 
+/**
+ * Label for a `tool_execution_start` event. Each tool gets a short glyph +
+ * the one arg that matters for log readability (a file path, a pattern, the
+ * shell command). Args come from pi's tool schemas — the file-path key is
+ * `path` (not `filePath`) for read/write/edit, the search key is `pattern`
+ * for find/grep, and `ls` takes an optional `path`.
+ */
 function toolStartLabel(toolName: unknown, args: unknown): string {
   const a = (args as Record<string, unknown> | null) ?? {};
+  const pathOf = () => (typeof a.path === "string" ? a.path : "?");
+  const patternOf = () => (typeof a.pattern === "string" ? a.pattern : "?");
   switch (toolName) {
-    case "read": {
-      const fp = a.filePath;
-      return `read > ${typeof fp === "string" ? fp : "?"}`;
-    }
-    case "write": {
-      const fp = a.filePath;
-      return `write > ${typeof fp === "string" ? fp : "?"}`;
-    }
+    case "read":
+      return `📖 read > ${pathOf()}`;
+    case "write":
+      return `✏️ write > ${pathOf()}`;
+    case "edit":
+      return `✏️ edit > ${pathOf()}`;
     case "bash": {
       const cmd = a.command;
       if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
       return "$ ?";
     }
-    case "glob": {
-      const pat = a.pattern;
-      return `glob > ${typeof pat === "string" ? pat : "?"}`;
-    }
-    case "grep": {
-      const pat = a.pattern;
-      return `grep > ${typeof pat === "string" ? pat : "?"}`;
-    }
+    case "find":
+      return `🔎 find > ${patternOf()}`;
+    case "grep":
+      return `🔎 grep > ${patternOf()}`;
+    case "ls":
+      return `📂 ls > ${pathOf()}`;
     default:
       return `▸ ${toolName}`;
   }
@@ -474,18 +499,6 @@ function sessionsDirFor(jobId: string): string {
 
 function nowIso(): string {
   return new Date().toISOString();
-}
-
-/**
- * Derive a concise issue title from the cron task. The task is freeform, so we
- * take its first non-empty line (capped to ~80 chars) and prefix it with the
- * agent name so the issue is identifiable as cron output in a triage list. When
- * the task is blank, fall back to a generic "scheduled sweep" title.
- */
-function cronIssueTitle(task: string): string {
-  const firstLine = task.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
-  const head = firstLine ? truncate(firstLine, 80) : "scheduled sweep";
-  return head;
 }
 
 /**
