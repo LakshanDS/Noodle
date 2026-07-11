@@ -74,6 +74,15 @@ profiles:
   # minute (e.g. NVIDIA NIM's free tier = 40). Noodle installs a pre-request
   # throttle so the agent loop never exceeds it. 0 = unlimited. Default: 30.
   #
+  # Retry config (optional) controls how pi recovers from 429s / transient
+  # errors after a request fails:
+  #   retry_max_attempts   — agent-level retries (whole turn re-run). Default: 5.
+  #   retry_base_delay_ms  — backoff base (doubles each attempt). Default: 3000.
+  #   provider_max_retries — HTTP-level retries (respect Retry-After). Default: 3.
+  # Set retry_base_delay_ms to at least 2× the api_rpm interval so a retried
+  # turn doesn't land before the rate-limit window resets. For 40 rpm that's
+  # ~1.5s interval → 3000ms base delay is a good match.
+  #
   # max_concurrent (optional) caps how many jobs of THIS profile run at once.
   # Useful when profiles use separate API keys: set queue.concurrency to the
   # total pool size (e.g. 2), then max_concurrent per profile (e.g. 1 each) so
@@ -86,6 +95,9 @@ profiles:
     model: minimaxai/minimax-m3
     api_key_env: NVIDIA_API_KEY
     api_rpm: 40
+    retry_max_attempts: 5
+    retry_base_delay_ms: 3000
+    provider_max_retries: 3
     context_window: 131072
     max_tokens: 8192
     # max_concurrent: 1

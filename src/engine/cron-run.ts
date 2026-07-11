@@ -11,6 +11,7 @@ import { createOpenIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
+import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
 import {
   AuthStorage,
@@ -158,9 +159,12 @@ export async function runCronJob(
     log_.debug({ sysFacts }, "probed system info for cron prompt");
     const prompt = buildCronPrompt(input.prompt, input.repo, config.agent_name, buildSysInfoGuidance(sysFacts));
     const throttle = throttleForRpm(profile.api_rpm);
+    // pi retry settings tuned from the profile config so 429 retries don't cascade.
+    const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
     const loader = new DefaultResourceLoader({
       cwd: ws.path,
       agentDir: join(ws.path, ".noodle-agent"),
+      settingsManager,
       ...(throttle
         ? { extensionFactories: [throttleExtensionFactory(throttle, `${profile.provider}/${profile.model}`)] }
         : {}),
@@ -178,6 +182,7 @@ export async function runCronJob(
       authStorage,
       modelRegistry,
       sessionManager,
+      settingsManager,
       resourceLoader: loader,
       thinkingLevel: profile.thinking_level,
       tools: profile.tools,

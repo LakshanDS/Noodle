@@ -2,7 +2,7 @@ name: Noodle
 description: Self-hosted GitHub agent — turns issues into pull requests, powered by the pi agent toolkit. Add the Action to your repo, open an issue, and Noodle clones, fixes, and opens a PR.
 author: LakshanDS
 branding:
-  icon: pull-request
+  icon: git-pull-request
   color: yellow
 
 inputs:

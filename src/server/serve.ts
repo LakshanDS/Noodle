@@ -1,13 +1,19 @@
 import { createWebhookApp } from "./http.js";
 import { JobQueue, QueueWorker, type RunJobFn } from "./queue.js";
+import Database from "better-sqlite3";
+import type { Database as Db } from "better-sqlite3";
+import { randomBytes } from "node:crypto";
 import { RunStore } from "./run-store.js";
 import { Scheduler, SqliteScanState, runScanOnce, type SchedulerDeps } from "./scheduler.js";
 import { CronStore } from "./cron-store.js";
 import { CronScheduler, buildCronSchedulerDeps } from "./cron-scheduler.js";
+import { SettingStore } from "./settings-store.js";
+import { hydrateEnvFromDb } from "./hydrate-env.js";
 import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/auth-provider.js";
 import { runJob } from "../engine/run.js";
 import { runCronJob } from "../engine/cron-run.js";
 import { loadConfig } from "../config/load.js";
+import { readSetupProfile, synthesizeConfig, hasUsableProfiles } from "../config/setup-fallback.js";
 import { log } from "../util/log.js";
 import { slugify } from "../util/slugify.js";
 import type { NoodleConfig } from "../config/schema.js";
@@ -26,15 +32,29 @@ export interface ServeOptions {
 }
 
 export async function serve(configPath: string | undefined, opts: ServeOptions = {}): Promise<void> {
-  const config = loadConfig(configPath);
+  // Resolve config. The normal path: loadConfig() reads the YAML. But for a
+  // first-run instance set up via the wizard, the YAML may be missing or empty
+  // — in that case we open the DB (default path) and synthesize a minimal
+  // config from the wizard's setup_initial_profile seed (see setup-fallback.ts).
+  const config = resolveConfig(configPath);
   const host = opts.host ?? config.server.host;
   const port = opts.port ?? config.server.port;
 
-  const authProvider = resolveAuthProvider();
+  // Open the SQLite DB first so we can hydrate process.env from the settings
+  // table BEFORE resolving GitHub auth + reading the UI password — those read
+  // env once at boot, so DB-stored secrets (set via the web UI / setup wizard)
+  // must be in process.env by this point. Real env vars still win (see
+  // hydrate-env.ts), so this never clobbers a per-deploy override.
   const queue = new JobQueue(config.storage.sqlite_path);
+  const hydrated = hydrateEnvFromDb(queue.getDb());
+  if (hydrated.length) {
+    log.info({ keys: hydrated }, "hydrated env from settings DB");
+  }
+  const authProvider = resolveAuthProvider();
   const scanState = new SqliteScanState(queue.getDb());
   const runStore = new RunStore(queue.getDb());
   const cronStore = new CronStore(queue.getDb());
+  const settingsStore = new SettingStore(queue.getDb());
 
   // The worker's runJobFn: resolve auth for the job's repo, build a GitHubClient,
   // and dispatch to either runJob (issue→PR) or runCronJob (scheduled → issues)
@@ -147,16 +167,25 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     },
   });
 
-  // Web UI (Phase 3): fail-closed — only registered when NOODLE_UI_PASSWORD is
-  // set, so an unconfigured deployment exposes nothing beyond /health + /webhook.
-  // The password doubles as the signed-cookie secret (see ui-auth.ts).
-  const uiPassword = process.env.NOODLE_UI_PASSWORD;
+  // Web UI: registered whenever there's a way to reach it. The dashboard
+  // password can come from the env (NOODLE_UI_PASSWORD) or the settings DB
+  // (set via the wizard / settings page). On a truly blank instance neither is
+  // set — but we still register the routes so the first-run setup wizard at
+  // /api/setup/* is reachable. In that state, the cookie secret is a random
+  // throwaway (no one can log in until the wizard sets a password), and the
+  // setup routes are the only useful unauthenticated surface.
+  const uiPassword = process.env.NOODLE_UI_PASSWORD ?? settingsStore.get("NOODLE_UI_PASSWORD") ?? "";
+  const { registerUiRoutes } = await import("./ui-routes.js");
+  // When a real password exists, it's the cookie secret. When none exists
+  // (blank instance), use a random per-boot secret — login is impossible until
+  // the wizard runs, but the wizard itself is unauthenticated and admitted
+  // while isConfigured() is false.
+  const cookieSecret = uiPassword || cryptoRandomSecret();
+  registerUiRoutes(app, { runStore, secret: cookieSecret, queue, authProvider, agentName: config.agent_name, cronStore, settingsStore, config });
   if (uiPassword) {
-    const { registerUiRoutes } = await import("./ui-routes.js");
-    registerUiRoutes(app, { runStore, secret: uiPassword, queue, authProvider, agentName: config.agent_name, cronStore, config });
     log.info("web UI enabled (password-protected)");
   } else {
-    log.warn("NOODLE_UI_PASSWORD not set — web UI disabled (/health + /webhook only)");
+    log.warn("NOODLE_UI_PASSWORD not set — web UI in setup mode (wizard reachable at /#/setup, login disabled until configured)");
   }
 
   // Scheduler (optional). Shares the queue + scan state.
@@ -218,6 +247,76 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
 
   // Keep this function alive until shutdown exits the process.
   await workerPromises;
+}
+
+/**
+ * A random cookie-signing secret for a blank instance (no UI password set yet).
+ * Used only so the cookie auth machinery has *a* secret to sign with; no one
+ * can log in with it because verifyPassword compares against the real password
+ * (empty in this state), so every login attempt fails until the wizard sets
+ * NOODLE_UI_PASSWORD. The wizard routes themselves are unauthenticated.
+ */
+function cryptoRandomSecret(): string {
+  return randomBytes(32).toString("hex");
+}
+
+/**
+ * Resolve the boot config, with a first-run fallback for wizard-set-up
+ * instances.
+ *
+ * Normal: loadConfig() reads the YAML. If that succeeds and the config has at
+ * least one usable profile, use it as-is.
+ *
+ * Fallback (first run via the setup wizard): if loadConfig throws (no YAML) OR
+ * the YAML has zero profiles, open the DB at the default path and look for a
+ * `setup_initial_profile` seed. If found, synthesize a minimal config from it.
+ * If neither YAML nor a seed exists, rethrow the original loadConfig error —
+ * the operator must either create noodle.config.yaml or run the wizard.
+ *
+ * The DB is opened at the default storage path (./noodle.db or $NOODLE_DB_PATH)
+ * for the fallback probe; the real queue opens afterward at the resolved
+ * config's storage.sqlite_path (same file). This is a read-only probe that
+ * closes its handle so the JobQueue reopens cleanly.
+ */
+function resolveConfig(configPath: string | undefined): NoodleConfig {
+  // Try the normal YAML path first.
+  try {
+    const config = loadConfig(configPath);
+    if (hasUsableProfiles(config)) return config;
+    // YAML loaded but has no usable profiles → fall through to the seed check.
+    return trySeedFallback(config) ?? config;
+  } catch (e) {
+    // YAML missing/unloadable. Try the wizard seed before giving up.
+    const fromSeed = trySeedFallback();
+    if (fromSeed) return fromSeed;
+    throw e;
+  }
+}
+
+/**
+ * Open the default DB and synthesize a config from the wizard seed, or null if
+ * no seed is stored. `existing` (when the YAML loaded but had no profiles) is
+ * returned unchanged if no seed exists, so the caller keeps the YAML config.
+ */
+function trySeedFallback(existing?: NoodleConfig): NoodleConfig | null {
+  const dbPath = process.env.NOODLE_DB_PATH ?? "./noodle.db";
+  let db: Db;
+  try {
+    // Throwaway read-only handle on the default DB path; the JobQueue opens its
+    // own long-lived handle afterward on the same file.
+    db = new Database(dbPath, { readonly: true });
+  } catch {
+    return existing ?? null;
+  }
+  try {
+    const seed = readSetupProfile(db);
+    if (!seed) return existing ?? null;
+    return synthesizeConfig(seed);
+  } catch {
+    return existing ?? null;
+  } finally {
+    db.close();
+  }
 }
 
 /**

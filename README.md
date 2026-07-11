@@ -435,6 +435,60 @@ Open an issue in an installed repo — Noodle clones, fixes, opens a PR, comment
 done. `GET /health` returns `{ "status": "ok" }` for uptime checks. SIGINT /
 SIGTERM drain the worker, close the server, and close the DB cleanly.
 
+### Web UI (dashboard)
+
+`noodle serve` ships a password-protected dashboard at `/` — a Vue 3 SPA that
+lets you browse runs (with the full agent conversation), manage scheduled crons,
+and edit instance settings, all from the browser.
+
+**Enable it** by setting `NOODLE_UI_PASSWORD` (env or the settings DB):
+
+```dotenv
+NOODLE_UI_PASSWORD=your-dashboard-password
+```
+
+The UI is served as a single self-contained `public/index.html` (built from
+`client/` via Vite, all JS+CSS inlined — no separate static-file server). It's
+gated behind a signed-cookie login; the password doubles as the cookie secret.
+
+**First-run setup wizard.** On a blank instance (no password set), the dashboard
+boots into a 4-step wizard at `/#/setup` that collects GitHub credentials, an
+LLM provider + key + model, and the dashboard password — enough to go from zero
+to a working agent without hand-editing YAML or `.env`. Secrets are stored in
+the SQLite DB (see below) and hydrated into `process.env` at boot.
+
+**DB-backed settings.** The wizard and the Settings page write secrets (GitHub
+creds, LLM API keys, webhook secret, UI password) to the `settings` table in the
+same SQLite DB Noodle already uses. At boot, `hydrateEnvFromDb()` copies every
+row into `process.env` before auth is resolved — so DB-stored secrets behave
+identically to env vars for every consumer, with **zero code changes** to the
+providers. Precedence: **real env wins** (a `.env`/`-e` value is never clobbered
+by a stale DB row). Changes to boot-read secrets (GitHub auth, webhook secret,
+UI password) take effect after a restart; LLM keys apply to new runs
+immediately.
+
+**Developing the UI.** The client lives in `client/` (separate `package.json`,
+Vue 3 + Vite + vue-router, hash-based routing). Dev workflow:
+
+```bash
+# Terminal 1 — the Node server (proxies /api to it)
+npm run dev -- serve
+
+# Terminal 2 — the Vite dev server with HMR (proxies /api → :3000)
+npm run dev:client
+```
+
+The production build (`npm run build`) compiles the server (`tsc`) **and** the
+client (`vite build` → `public/index.html`). The Dockerfile has a `client-builder`
+stage so the runtime image carries the built UI but no client toolchain.
+
+The YAML config (`noodle.config.yaml`) stays the source of truth for
+**behavioral** config — profiles, routing, triggers, queue, scheduler. The
+DB-backed settings are for **instance** config (secrets + the dashboard
+password) that an operator sets once and edits through the browser. The wizard's
+model choice seeds a single `default` profile as a fallback when the YAML has
+none; graduate to YAML for multiple profiles and routing rules.
+
 ### Dry-run scan
 
 ```bash
@@ -462,14 +516,15 @@ follow-up comment reroutes that issue.
 ```
 src/
 ├── cli.ts              noodle CLI (run / config validate / doctor / serve)
-├── config/             zod schema + loader for noodle.config.yaml
+├── config/             zod schema + loader for noodle.config.yaml + first-run setup fallback
 ├── profiles/           issue → profile routing + custom-endpoint registration
 ├── github/             octokit client + PAT/App auth provider + webhook parsing
 ├── engine/             workspace (git) + prompt + the run loop + stall watcher + throttle + tools
-├── server/             fastify webhook server + SQLite job queue + run store + cron scheduler + serve wiring
+├── server/             fastify webhook server + SQLite job queue + run/cron/settings stores + cron scheduler + web UI routes + serve wiring
 └── util/               logging, paths, slugify, sysinfo (host probe)
+client/                 Vue 3 + Vite dashboard SPA (builds to a single public/index.html)
 skills/                 noodle-default, noodle-fix, noodle-review (Noodle's own)
-tests/                  config + routing + custom-providers + output + stall + throttle + sysinfo + stop-reason + summary-fallback + dispose-guard + webhook + auth + queue + run-store + scheduler + workspace + client + log + skills tests
+tests/                  config + routing + custom-providers + output + stall + throttle + sysinfo + stop-reason + summary-fallback + dispose-guard + webhook + auth + queue + run-store + settings-store + setup-fallback + ui-routes + ui-routes-settings + ui-routes-setup + scheduler + workspace + client + log + skills tests
 ```
 
 ### Skills — composable mindset
@@ -486,9 +541,10 @@ load `noodle-default` + the relevant task skill before starting.
 ## Develop
 
 ```bash
-npm test               # vitest
-npm run typecheck      # tsc --noEmit
-npm run build          # compile to dist/
+npm test               # vitest (server)
+npm run typecheck      # tsc --noEmit (server)
+npm run build          # compile server (tsc) + build client (vite → public/index.html)
+npm run dev:client     # vite dev server with HMR (proxies /api → :3000)
 ```
 
 ## Roadmap
@@ -501,8 +557,6 @@ pi's token accounting) are all shipped. Still on the list from
 
 - **Docker-per-job isolation** — route pi's `BashOperations`/`ReadOperations`
   into an ephemeral container, so unpinned repos can't escape into the host.
-- **Optional web UI** — job list, logs, profile editor. The `runs` table is
-  already there as the source of truth; only the surface to render it is left.
 - `pull_request` webhook events (currently issues-only).
 
 ## License

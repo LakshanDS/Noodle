@@ -5,6 +5,8 @@ import { join } from "node:path";
 import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
+import { CronStore } from "../src/server/cron-store.js";
+import { SettingStore } from "../src/server/settings-store.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
 import { createWebhookApp } from "../src/server/http.js";
 import { signToken } from "../src/server/ui-auth.js";
@@ -21,6 +23,8 @@ const PASSWORD = "test-password";
 
 let dir: string;
 let store: RunStore;
+let cronStore: CronStore;
+let settingsStore: SettingStore;
 let db: Database.Database;
 let sessionPath: string;
 
@@ -28,6 +32,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "noodle-ui-"));
   db = new Database(join(dir, "runs.db"));
   store = RunStore.fromDb(db);
+  cronStore = CronStore.fromDb(db);
+  settingsStore = SettingStore.fromDb(db);
   sessionPath = join(dir, "session.jsonl");
 });
 
@@ -36,10 +42,25 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** A fresh app with UI routes registered (password is the signing secret too). */
+/**
+ * A fresh app with UI routes registered (password is the signing secret too).
+ * Only the stores used by the route(s) under test need real values; the rest
+ * (authProvider, agentName, config) are stubbed because those routes aren't hit
+ * in these tests — matching how the production wiring passes real deps.
+ */
 function makeApp() {
   const app = Fastify({ logger: false });
-  registerUiRoutes(app, { runStore: store, secret: PASSWORD });
+  registerUiRoutes(app, {
+    runStore: store,
+    secret: PASSWORD,
+    cronStore,
+    settingsStore,
+    // Stubs for deps not exercised by these tests:
+    queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
+    authProvider: {} as never,
+    agentName: "TestBot",
+    config: { profiles: {}, default_profile: "x" } as never,
+  });
   return app;
 }
 
@@ -51,7 +72,16 @@ function makeApp() {
  */
 function makeWebhookAppWithUi() {
   const app = createWebhookApp("wh-secret", { enqueue: async () => {} });
-  registerUiRoutes(app, { runStore: store, secret: PASSWORD });
+  registerUiRoutes(app, {
+    runStore: store,
+    secret: PASSWORD,
+    cronStore,
+    settingsStore,
+    queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
+    authProvider: {} as never,
+    agentName: "TestBot",
+    config: { profiles: {}, default_profile: "x" } as never,
+  });
   return app;
 }
 

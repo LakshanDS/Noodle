@@ -1,0 +1,47 @@
+/*
+ * Shared form-control styling for input, textarea, select inside .field.
+ * Components apply this via the global `.ctrl` class so every form surface
+ * (Settings, Cron form, Setup wizard) stays consistent without re-declaring it.
+ */
+.ctrl {
+  width: 100%;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  font-size: var(--text-sm);
+  padding: 9px 12px;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+.ctrl::placeholder {
+  color: var(--text-3);
+}
+.ctrl:hover {
+  border-color: var(--border-strong);
+}
+.ctrl:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface-0);
+  box-shadow: 0 0 0 3px var(--accent-weaker);
+}
+.ctrl[type="password"] {
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+}
+textarea.ctrl {
+  min-height: 96px;
+  resize: vertical;
+  line-height: var(--leading-normal);
+  font-family: var(--font-sans);
+}
+select.ctrl {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236b6d78' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 32px;
+}

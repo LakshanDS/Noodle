@@ -12,11 +12,14 @@
   },
   "files": [
     "dist",
+    "public",
     "skills"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:client",
+    "build:client": "npm --prefix client run build",
     "dev": "tsx src/cli.ts",
+    "dev:client": "npm --prefix client run dev",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

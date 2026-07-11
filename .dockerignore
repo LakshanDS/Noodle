@@ -10,3 +10,8 @@ tests
 vitest.config.ts
 PLAN.md
 README.md
+# client deps are reinstalled in the client-builder stage; don't leak host copies.
+client/node_modules
+client/dist
+# public/ is a build artifact — the client-builder stage generates it fresh.
+public

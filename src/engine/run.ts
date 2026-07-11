@@ -12,6 +12,7 @@ import { createCommentOnIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
+import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
 import { slugify } from "../util/slugify.js";
 import { extractProfileTag } from "../triggers/check.js";
@@ -327,9 +328,12 @@ export async function runJob(
     const prompt = buildPrompt(issue, comments, input.repo, agentName, buildSysInfoGuidance(sysFacts));
     // Optional per-profile rate-limit throttle (e.g. NVIDIA NIM's 40 rpm).
     const throttle = throttleForRpm(profile.api_rpm);
+    // pi retry settings tuned from the profile config so 429 retries don't cascade.
+    const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
     const loader = new DefaultResourceLoader({
       cwd: ws.path,
       agentDir: join(ws.path, ".noodle-agent"),
+      settingsManager,
       ...(throttle
         ? { extensionFactories: [throttleExtensionFactory(throttle, `${profile.provider}/${profile.model}`)] }
         : {}),
@@ -353,6 +357,7 @@ export async function runJob(
       authStorage,
       modelRegistry,
       sessionManager,
+      settingsManager,
       resourceLoader: loader,
       // Forward the profile's thinking level. pi-ai clamps it to what the model
       // supports (gated on model.reasoning === true), so passing "medium" to a

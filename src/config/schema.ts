@@ -85,10 +85,36 @@ export const ProfileSchema = z.object({
   system_prompt_file: z.string().optional(),
   /**
    * Max LLM requests per minute for this profile. Noodle installs a pre-request
-   * throttle so the agent loop never exceeds the provider's rate limit.
-   * `0` = unlimited. Default: 30.
+   * throttle (via pi's `before_provider_request` extension hook) that sleeps to
+   * enforce a minimum interval between requests — so the agent loop never
+   * exceeds the provider's rate limit. `0` = unlimited (no throttle). Default: 30.
+   *
+   * pi has no native request-delay setting; this throttle is the only way to
+   * space out requests. The interval is `60000 / api_rpm` ms (e.g. 38 rpm →
+   * ~1.58s between requests).
    */
   api_rpm: z.number().int().min(0).default(30),
+  /**
+   * Max agent-level retries after a failed LLM turn (e.g. a 429 that exhausts
+   * provider-level retry). pi removes the failed message and re-runs the turn
+   * after an exponential backoff (`retry_base_delay_ms * 2^(attempt-1)`).
+   * Default: 5. Set to 0 to disable agent-level retry entirely.
+   */
+  retry_max_attempts: z.number().int().min(0).default(5),
+  /**
+   * Base delay (ms) for agent-level retry backoff. Doubles each attempt. Should
+   * be at least 2× the `api_rpm` interval so a retried turn doesn't land before
+   * the provider's rate-limit window resets. Default: 3000.
+   */
+  retry_base_delay_ms: z.number().int().min(0).default(3000),
+  /**
+   * Max HTTP-level retries by the provider client (the OpenAI SDK's built-in
+   * retry). These fire BEFORE the agent-level retry and respect the provider's
+   * `Retry-After` header when present. Absorbs transient 429s at the HTTP layer
+   * so they never reach the agent retry loop. Default: 3. Set to 0 to bubble
+   * all 429s directly to the agent retry.
+   */
+  provider_max_retries: z.number().int().min(0).default(3),
   /**
    * Max jobs of this profile that may run at the same time. Optional — when
    * unset, the profile is limited only by the global `queue.concurrency`.
