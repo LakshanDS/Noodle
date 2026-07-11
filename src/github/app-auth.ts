@@ -75,6 +75,8 @@ export class GithubAppAuth {
   private readonly appId: string;
   private readonly privateKey: string;
   private readonly cache = new Map<number, InstallationToken>();
+  /** repo ("owner/name") → installation id, cached after first lookup. */
+  private readonly repoInstallations = new Map<string, number>();
   /** Override for tests. Production uses global fetch. */
   private readonly fetchImpl: typeof fetch;
 
@@ -108,9 +110,42 @@ export class GithubAppAuth {
     return fresh.token;
   }
 
+  /**
+   * Resolve the installation id for a repo ("owner/name") via the App's JWT.
+   * This is the bootstrap path for sources with no webhook payload — cron jobs
+   * and the manual "Run Now" button know the repo but not its installation id.
+   * Uses App-level auth (the JWT), not an installation token (chicken-and-egg:
+   * you need the id to mint the token). Results are cached per-repo.
+   *
+   * Returns null when the App isn't installed on the repo (404).
+   */
+  async getInstallationIdForRepo(repo: string): Promise<number | null> {
+    const cached = this.repoInstallations.get(repo);
+    if (cached !== undefined) return cached;
+    const jwt = buildAppJwt(this.appId, this.privateKey);
+    const res = await this.fetchImpl(`${GITHUB_API}/repos/${repo}/installation`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${jwt}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `Failed to resolve installation for ${repo} (${res.status}): ${body.slice(0, 200)}`,
+      );
+    }
+    const data = (await res.json()) as { id: number };
+    this.repoInstallations.set(repo, data.id);
+    return data.id;
+  }
+
   /** Clear the cache (used on shutdown / forced re-auth). */
   clearCache(): void {
     this.cache.clear();
+    this.repoInstallations.clear();
   }
 
   private async exchangeToken(installationId: number): Promise<InstallationToken> {

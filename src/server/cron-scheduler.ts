@@ -96,32 +96,26 @@ export class CronScheduler {
 
 /**
  * Build the real CronSchedulerDeps from the shared stores + auth provider.
- * The enqueue closure resolves the repo's installation id (App mode) so the
- * worker can mint a token for the clone — same pattern as the issue scheduler
- * in serve.ts.
+ * Installation-id resolution happens lazily at job-run time inside the auth
+ * provider (forRepo auto-resolves when no id is passed), so enqueueCron doesn't
+ * need to do any API calls — it just drops the job in the queue.
  */
 export function buildCronSchedulerDeps(
   cronStore: CronStore,
   queue: JobQueue,
-  authProvider: AuthProvider,
+  _authProvider: AuthProvider,
   config: NoodleConfig,
 ): CronSchedulerDeps {
   return {
     listDueCrons: (now) => cronStore.listDueCrons(now),
     enqueueCron: async (repo, cronJobId, _installationId, profile) => {
-      // Resolve the installation id for the repo (App mode); PAT mode ignores it.
-      const instId = await (async () => {
-        try {
-          const { gh } = await authProvider.forRepo(repo);
-          return await gh.repoInstallationId(repo);
-        } catch {
-          return undefined;
-        }
-      })();
+      // No installation-id resolution here — the worker's forRepo() call
+      // resolves it from the repo name via the App JWT (see auth-provider.ts).
+      // This keeps enqueue fast (no API round-trips) and lets the dedupe index
+      // fire before any network call.
       queue.enqueueCron({
         repo,
         cronJobId,
-        installationId: instId ?? undefined,
         profile: profile ?? config.default_profile,
       });
     },

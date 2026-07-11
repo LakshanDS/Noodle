@@ -221,18 +221,11 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     } catch {
       return reply.code(404).send({ error: "cron not found" });
     }
-    // Resolve installation id (App mode); PAT mode ignores it.
-    let instId: number | null = null;
-    try {
-      const { gh } = await authProvider.forRepo(cron.repo);
-      instId = (await gh.repoInstallationId(cron.repo)) ?? null;
-    } catch {
-      // PAT mode or repo not reachable yet — enqueue without installation id.
-    }
+    // No installation-id resolution here — the worker resolves it from the repo
+    // name when the job runs (forRepo auto-resolves in App mode).
     queue.enqueueCron({
       repo: cron.repo,
       cronJobId: cron.id,
-      installationId: instId ?? undefined,
       profile: cron.profile ?? config.default_profile,
       source: "manual",
     });

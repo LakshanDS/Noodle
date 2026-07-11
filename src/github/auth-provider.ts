@@ -27,13 +27,26 @@ export class PatAuthProvider implements AuthProvider {
 export class GithubAppAuthProvider implements AuthProvider {
   constructor(private readonly appAuth: GithubAppAuth) {}
 
-  async forRepo(_repo: string, installationId?: number): Promise<{ gh: GitHubClient; token: string }> {
-    if (!installationId) {
+  /**
+   * Resolve credentials for a repo. When `installationId` is provided (webhook
+   * payload), use it directly. When it's not (cron jobs, manual "Run Now"),
+   * resolve it from the repo name via the App's JWT — the repo→installation
+   * lookup is cached after the first call.
+   *
+   * Throws when the App isn't installed on the repo (the lookup returns null).
+   */
+  async forRepo(repo: string, installationId?: number): Promise<{ gh: GitHubClient; token: string }> {
+    let instId = installationId;
+    if (!instId) {
+      instId = await this.appAuth.getInstallationIdForRepo(repo) ?? undefined;
+    }
+    if (!instId) {
       throw new Error(
-        "GithubAppAuthProvider needs an installationId. Pass one from the webhook payload or via repoInstallationId().",
+        `GitHub App is not installed on ${repo}, or the installation could not be resolved. ` +
+          "Install the App on the repo, or pass an installationId explicitly.",
       );
     }
-    const token = await this.appAuth.getInstallationToken(installationId);
+    const token = await this.appAuth.getInstallationToken(instId);
     return { gh: new GitHubClient(new Octokit({ auth: token })), token };
   }
 }
