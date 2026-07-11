@@ -32,6 +32,7 @@ interface NavItem {
 const NAV: NavItem[] = [
   { name: "runs", label: "Runs", icon: "runs", target: { name: "runs" }, activeOn: ["runs", "run-detail"] },
   { name: "crons", label: "Crons", icon: "cron", target: { name: "crons" }, activeOn: ["crons", "cron-detail", "cron-new"] },
+  { name: "profiles", label: "Profiles", icon: "key", target: { name: "profiles" }, activeOn: ["profiles", "profile-detail", "profile-new"] },
   { name: "settings", label: "Settings", icon: "settings", target: { name: "settings" }, activeOn: ["settings"] },
 ];
 
@@ -47,6 +48,9 @@ const pageTitle = computed(() => {
     crons: "Crons",
     "cron-detail": "Edit cron",
     "cron-new": "New cron",
+    profiles: "Profiles",
+    "profile-detail": "Edit profile",
+    "profile-new": "New profile",
     settings: "Settings",
   };
   return map[String(route.name ?? "")] ?? "Dashboard";

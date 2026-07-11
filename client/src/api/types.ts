@@ -88,8 +88,11 @@ export interface CronMutationResponse {
   cron: CronRow;
 }
 export interface ProfilesResponse {
+  /** Flat name list (cron dropdown contract). */
   profiles: string[];
   default: string;
+  /** Full-detail list for the profiles tab. */
+  items: ProfileListItem[];
 }
 export interface ApiError {
   error: string;
@@ -158,4 +161,67 @@ export interface SetupPayload {
 export interface SetupResponse {
   ok: boolean;
   needsRestart: boolean;
+}
+
+/* ----- Profiles (DB-managed agent profiles) ----- */
+
+/** The 7 built-in tool names the agent can use. */
+export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export type Api = | "openai-completions" | "openai-responses" | "azure-openai-responses"
+  | "anthropic-messages" | "google-generative-ai" | "google-vertex"
+  | "mistral-conversations" | "bedrock-converse-stream";
+
+/**
+ * The full per-profile field set — mirrors ProfileSchema in
+ * src/config/schema.ts. Every field the engine applies to a run lives here.
+ */
+export interface ProfileData {
+  provider: string;
+  model: string;
+  base_url?: string;
+  api?: Api;
+  api_key_env?: string;
+  context_window?: number;
+  max_tokens?: number;
+  input_token_price: number;
+  output_token_price: number;
+  cache_read_price: number;
+  cache_write_price: number;
+  reasoning: boolean;
+  thinking_level: ThinkingLevel;
+  tools: string[];
+  system_prompt_file?: string;
+  api_rpm: number;
+  retry_max_attempts: number;
+  retry_base_delay_ms: number;
+  max_concurrent?: number;
+}
+
+/** Where a profile comes from — DB rows are editable/deletable; YAML are read-only. */
+export type ProfileSource = "db" | "yaml";
+
+/** One entry in the profiles list. */
+export interface ProfileListItem {
+  name: string;
+  profile: ProfileData;
+  source: ProfileSource;
+}
+
+/** Response shape from GET /api/profiles/:name. */
+export interface ProfileDetailResponse {
+  profile: ProfileListItem;
+}
+
+/** Response from POST/PATCH. */
+export interface ProfileMutationResponse {
+  profile: ProfileListItem;
+}
+
+/** Payload for create (POST). */
+export interface ProfileInput {
+  name: string;
+  profile: ProfileData;
 }

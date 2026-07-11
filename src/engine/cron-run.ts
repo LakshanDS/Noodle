@@ -49,6 +49,9 @@ const CRON_LABEL_COLOR = "008672";
  */
 const SESSION_RESTART_ATTEMPTS = 3;
 const SESSION_RESTART_DELAY_MS = 120_000; // 2 minutes
+/** Hard cap on total restarts across all reset cycles, so progress-based resets
+ *  can't loop forever on a provider that keeps failing after partial work. */
+const SESSION_RESTART_HARD_CAP = 9;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -237,7 +240,11 @@ export async function runCronJob(
     let booted = await bootSession(currentManager);
     let promptError: unknown = null;
 
-    for (let attempt = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++) {
+    for (let attempt = 0, totalRestarts = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++, totalRestarts++) {
+      if (totalRestarts > SESSION_RESTART_HARD_CAP) {
+        log_.warn({ totalRestarts }, "hit hard cap on total restarts — giving up");
+        break;
+      }
       const { session, sessionManager, watcher, unsubStall } = booted;
       const turnsBefore = session.getSessionStats?.()?.assistantMessages ?? 0;
       try {

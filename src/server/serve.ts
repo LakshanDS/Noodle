@@ -8,6 +8,7 @@ import { Scheduler, SqliteScanState, runScanOnce, type SchedulerDeps } from "./s
 import { CronStore } from "./cron-store.js";
 import { CronScheduler, buildCronSchedulerDeps } from "./cron-scheduler.js";
 import { SettingStore } from "./settings-store.js";
+import { ProfileStore } from "./profile-store.js";
 import { hydrateEnvFromDb } from "./hydrate-env.js";
 import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/auth-provider.js";
 import { runJob } from "../engine/run.js";
@@ -56,6 +57,17 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const runStore = new RunStore(queue.getDb());
   const cronStore = new CronStore(queue.getDb());
   const settingsStore = new SettingStore(queue.getDb());
+  const profileStore = new ProfileStore(queue.getDb());
+
+  // Merge DB-managed profiles into the in-memory config so they're runnable
+  // immediately. DB profiles override same-named YAML profiles on a name clash
+  // (the DB is the live, editable source). This happens BEFORE the worker pool,
+  // webhook handler, and relay read `config.profiles`, so all of them see the
+  // merged set. The UI routes mutate `config.profiles` in lockstep on every
+  // create/update/rename/delete so edits take effect without a restart.
+  for (const { name, profile } of profileStore.list()) {
+    config.profiles[name] = profile;
+  }
 
   // The worker's runJobFn: resolve auth for the job's repo, build a GitHubClient,
   // and dispatch to either runJob (issue→PR) or runCronJob (scheduled → issues)
@@ -182,7 +194,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // the wizard runs, but the wizard itself is unauthenticated and admitted
   // while isConfigured() is false.
   const cookieSecret = uiPassword || cryptoRandomSecret();
-  registerUiRoutes(app, { runStore, secret: cookieSecret, queue, authProvider, agentName: config.agent_name, cronStore, settingsStore, config });
+  registerUiRoutes(app, { runStore, secret: cookieSecret, queue, authProvider, agentName: config.agent_name, cronStore, settingsStore, profileStore, config });
   if (uiPassword) {
     log.info("web UI enabled (password-protected)");
   } else {

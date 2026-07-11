@@ -7,10 +7,11 @@ import type { JobQueue } from "./queue.js";
 import { CronStore } from "./cron-store.js";
 import type { NewCron, CronUpdate } from "./cron-store.js";
 import { SettingStore, SETTING_CATALOG } from "./settings-store.js";
+import { ProfileStore, validateProfileInput, type StoredProfile } from "./profile-store.js";
 import { SETUP_PROFILE_KEY, type SetupProfile } from "../config/setup-fallback.js";
 import { isAppMode } from "../github/auth-provider.js";
 import type { AuthProvider } from "../github/auth-provider.js";
-import type { NoodleConfig } from "../config/schema.js";
+import type { NoodleConfig, Profile } from "../config/schema.js";
 import { labelsFor } from "../engine/run.js";
 import { readSession, type ParsedMessage } from "./session-reader.js";
 import {
@@ -50,12 +51,14 @@ export interface UiDeps {
   cronStore: CronStore;
   /** Settings store — for the /api/settings read/write routes (secrets etc.). */
   settingsStore: SettingStore;
+  /** Profile store — for the /api/profiles CRUD routes (DB-managed profiles). */
+  profileStore: ProfileStore;
   /** Resolved config — for the profile-name dropdown + default profile. */
   config: NoodleConfig;
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, secret, queue, authProvider, agentName, cronStore, settingsStore, config } = deps;
+  const { runStore, secret, queue, authProvider, agentName, cronStore, settingsStore, profileStore, config } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   const auth = async (req: FastifyRequest, reply: FastifyReply) => requireAuth(req, reply, secret);
@@ -218,9 +221,111 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
   // Crons are DB-defined recurring agent runs that open issues (see cron-store.ts).
   // These routes are the backend for the "Crons" section of the web UI.
 
-  /** Profile names available for the create/edit dropdown. */
+  // --- Profile management (DB-backed agent profiles). All auth-guarded. ---
+  // These routes are the backend for the "Profiles" tab. DB-managed profiles are
+  // merged into `config.profiles` at boot (serve.ts) and kept in sync here on
+  // every mutation, so a freshly created/edited profile is instantly runnable
+  // by the engine, appears in the cron dropdown, and counts toward the worker
+  // pool's per-profile concurrency — no restart needed.
+
+  /**
+   * List every available profile: DB-stored ones (with full data, editable) plus
+   * any YAML-only ones (name + data, but not deletable via the DB). The cron
+   * dropdown and profiles list both consume this.
+   */
   app.get("/api/profiles", { preHandler: auth }, async () => {
-    return { profiles: Object.keys(config.profiles), default: config.default_profile };
+    const stored = profileStore.list();
+    const dbNames = new Set(stored.map((p) => p.name));
+    const fromYaml = Object.entries(config.profiles)
+      .filter(([name]) => !dbNames.has(name))
+      .map(([name, profile]) => ({ name, profile, source: "yaml" as const }));
+    const fromDb = stored.map(({ name, profile }) => ({ name, profile, source: "db" as const }));
+    return {
+      // Flat name list (kept for the cron dropdown's existing contract).
+      profiles: Object.keys(config.profiles),
+      default: config.default_profile,
+      // Full-detail list for the profiles tab.
+      items: [...fromDb, ...fromYaml],
+    };
+  });
+
+  app.post("/api/profiles", { preHandler: auth }, async (req, reply) => {
+    const body = readJsonBody(req.body);
+    if (!body) return reply.code(400).send({ error: "missing body" });
+    const parsed = parseProfilePayload(body, /*creating*/ true);
+    if (!parsed.ok) return reply.code(400).send({ error: parsed.error });
+    const name = parsed.name!;
+    if (profileStore.has(name) || name in config.profiles) {
+      return reply.code(409).send({ error: `profile "${name}" already exists` });
+    }
+    const stored = profileStore.create(name, parsed.profile);
+    // Live-sync into the in-memory config so the profile is runnable now.
+    config.profiles[name] = parsed.profile;
+    return { profile: toProfileDetail(stored, "db") };
+  });
+
+  app.get("/api/profiles/:name", { preHandler: auth }, async (req, reply) => {
+    const name = (req.params as { name: string }).name;
+    const dbRow = profileStore.has(name) ? profileStore.get(name) : undefined;
+    if (dbRow) return { profile: toProfileDetail(dbRow, "db") };
+    const yamlProfile = config.profiles[name];
+    if (yamlProfile) {
+      return { profile: { name, profile: yamlProfile, source: "yaml" as const } };
+    }
+    return reply.code(404).send({ error: `profile "${name}" not found` });
+  });
+
+  app.patch("/api/profiles/:name", { preHandler: auth }, async (req, reply) => {
+    const name = (req.params as { name: string }).name;
+    const body = readJsonBody(req.body);
+    if (!body) return reply.code(400).send({ error: "missing body" });
+    const parsed = parseProfilePayload(body, /*creating*/ false);
+    if (!parsed.ok) return reply.code(400).send({ error: parsed.error });
+    const newName = parsed.name ?? name;
+
+    // YAML-only profiles can't be edited in place (they'd reappear from the YAML
+    // on next boot). Instead, promote the edit to a new DB row so the DB override
+    // takes effect.
+    if (!profileStore.has(name) && !(name in config.profiles)) {
+      return reply.code(404).send({ error: `profile "${name}" not found` });
+    }
+    if (newName !== name && (profileStore.has(newName) || newName in config.profiles)) {
+      return reply.code(409).send({ error: `profile "${newName}" already exists` });
+    }
+
+    let stored: StoredProfile;
+    if (profileStore.has(name)) {
+      if (newName !== name) {
+        profileStore.rename(name, newName);
+        // Drop the old-name binding from the live config; the new one is set below.
+        delete config.profiles[name];
+      }
+      stored = profileStore.update(newName, parsed.profile);
+    } else {
+      // Promote a YAML profile to DB-managed.
+      stored = profileStore.create(newName, parsed.profile);
+    }
+    config.profiles[stored.name] = parsed.profile;
+    return { profile: toProfileDetail(stored, "db") };
+  });
+
+  app.delete("/api/profiles/:name", { preHandler: auth }, async (req, reply) => {
+    const name = (req.params as { name: string }).name;
+    const existed = profileStore.has(name);
+    profileStore.delete(name);
+    // Only DB profiles come back from the YAML on next boot, so removing a
+    // pure-DB profile from the live config is safe + durable. We DON'T touch
+    // YAML-only profiles here (they'd just reappear).
+    if (existed) {
+      delete config.profiles[name];
+      return { ok: true };
+    }
+    if (name in config.profiles) {
+      return reply.code(400).send({
+        error: `"${name}" is defined in the YAML config; remove it there to delete it.`,
+      });
+    }
+    return reply.code(404).send({ error: `profile "${name}" not found` });
   });
 
   app.get("/api/crons", { preHandler: auth }, async () => {
@@ -409,6 +514,37 @@ function parseCronUpdate(body: Record<string, unknown> | null): CronUpdate | { e
 function strField(body: Record<string, unknown>, key: string): string | undefined {
   const v = body[key];
   return typeof v === "string" ? v.trim() || undefined : undefined;
+}
+
+/**
+ * Shape a stored profile into the API detail envelope. `source` distinguishes
+ * DB-managed (editable, deletable) profiles from YAML-only ones.
+ */
+function toProfileDetail(
+  stored: StoredProfile,
+  source: "db" | "yaml",
+): ProfileDetailOut {
+  return { name: stored.name, profile: stored.profile, source };
+}
+
+type ProfileDetailOut = { name: string; profile: Profile; source: "db" | "yaml" };
+
+/**
+ * Extract + validate the `name` (required on create) and `profile` (validated
+ * against ProfileSchema) fields from a create/update payload. On PATCH, an
+ * omitted `name` means "keep the existing name" (name is undefined).
+ *
+ * Returns a discriminated union: `{ ok: true, … }` or `{ ok: false, error }`.
+ */
+function parseProfilePayload(
+  body: Record<string, unknown>,
+  creating: boolean,
+): { ok: true; name: string | undefined; profile: Profile } | { ok: false; error: string } {
+  const rawName = strField(body, "name");
+  if (creating && !rawName) return { ok: false, error: "name is required" };
+  const profile = validateProfileInput(body.profile ?? {});
+  if ("error" in profile) return { ok: false, error: profile.error };
+  return { ok: true, name: rawName, profile };
 }
 
 /**

@@ -14,6 +14,9 @@ const routes: RouteRecordRaw[] = [
   { path: "/crons", name: "crons", component: () => import("./views/CronsView.vue") },
   { path: "/crons/new", name: "cron-new", component: () => import("./views/CronDetailView.vue"), props: { isNew: true } },
   { path: "/crons/:id", name: "cron-detail", component: () => import("./views/CronDetailView.vue"), props: true },
+  { path: "/profiles", name: "profiles", component: () => import("./views/ProfilesView.vue") },
+  { path: "/profiles/new", name: "profile-new", component: () => import("./views/ProfileDetailView.vue"), props: { isNew: true } },
+  { path: "/profiles/:name", name: "profile-detail", component: () => import("./views/ProfileDetailView.vue"), props: true },
   // Settings + setup land in later phases; stubbed so routes resolve.
   { path: "/settings", name: "settings", component: () => import("./views/SettingsView.vue") },
   { path: "/setup", name: "setup", component: () => import("./views/SetupView.vue") },
