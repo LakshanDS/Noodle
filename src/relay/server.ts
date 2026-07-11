@@ -92,7 +92,12 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
 
     // 4. Forward to the real API.
     try {
+      const forwardUrl = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+      log.info({ model, baseUrl, url: forwardUrl, bodyKeys: Object.keys(body), stream: body.stream, messages: Array.isArray(body.messages) ? body.messages.length : 0 }, "relay: forwarding request");
       const result = await forwardRequest(baseUrl, apiKey, body);
+      if (result.status >= 400) {
+        log.warn({ model, status: result.status, body: result.body }, "relay: upstream error");
+      }
       return reply.code(result.status).send(result.body);
     } catch (e) {
       log.error({ err: (e as Error).message, model }, "relay: forward failed");
