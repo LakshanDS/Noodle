@@ -6,6 +6,7 @@ import { createOctokit } from "./github/auth.js";
 import { GitHubClient } from "./github/client.js";
 import { runJob } from "./engine/run.js";
 import { serve, scanOnce } from "./server/serve.js";
+import { startRelay } from "./relay/server.js";
 import { log } from "./util/log.js";
 
 const program = new Command();
@@ -86,6 +87,18 @@ program
   .option("-p, --port <number>", "bind port (overrides config server.port)", (v) => parseInt(v, 10))
   .action(async (opts: { config?: string; host?: string; port?: number }) => {
     await serve(opts.config, { host: opts.host, port: opts.port });
+  });
+
+// --- noodle relay (API relay for rate limiting) ------------------------------
+program
+  .command("relay")
+  .description("Run the API relay server for centralized rate limiting.")
+  .option("-c, --config <path>", "path to config file")
+  .option("-H, --host <host>", "bind host (default: 0.0.0.0)")
+  .option("-p, --port <number>", "bind port (default: 4445)", (v) => parseInt(v, 10))
+  .action(async (opts: { config?: string; host?: string; port?: number }) => {
+    const config = loadConfig(opts.config);
+    await startRelay(config, { host: opts.host, port: opts.port });
   });
 
 // --- noodle doctor ----------------------------------------------------------

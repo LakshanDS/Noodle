@@ -173,6 +173,20 @@ export const SchedulerConfigSchema = z.object({
 export type SchedulerConfig = z.infer<typeof SchedulerConfigSchema>;
 
 /**
+ * API relay server settings. When enabled, the relay provides a centralized
+ * rate-limiting layer that multiple agents (Noodle, OpenCode CLI, etc.) can
+ * share. Agents point their base_url to the relay instead of the real API.
+ */
+export const RelayConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** Port the relay listens on. */
+  port: z.number().int().positive().max(65535).default(4445),
+  /** Host the relay binds to. */
+  host: z.string().default("0.0.0.0"),
+});
+export type RelayConfig = z.infer<typeof RelayConfigSchema>;
+
+/**
  * Per-run controls. The stall watcher aborts a run that has emitted no agent
  * activity (tool calls, turns, messages, tool output, compactions) for N
  * minutes — a strong signal of a hang (dropped socket, deadlock) that a
@@ -273,6 +287,12 @@ export const NoodleConfigSchema = z.object({
     trigger_keywords: [],
     trigger_on_open: false,
   }),
+  /**
+   * API relay server. When enabled, provides centralized rate limiting for
+   * multiple agents sharing the same API keys. Agents point their base_url
+   * to the relay (e.g. http://localhost:4445/v1) instead of the real API.
+   */
+  relay: RelayConfigSchema.nullish().transform((v) => v ?? { enabled: false, port: 4445, host: "0.0.0.0" }),
 });
 export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;
 

@@ -204,3 +204,19 @@ repos:
 #   # Restore "fire on every new/reopened/labeled issue" (legacy behavior).
 #   # Default: false. Set true to opt out of the mention/keyword filter entirely.
 #   trigger_on_open: false
+
+# --- API Relay (optional) ----------------------------------------------------
+# Centralized rate-limiting relay. When enabled, all API calls from this process
+# automatically route through the relay — no config changes needed. The relay
+# enforces per-profile RPM limits, then forwards to each profile's base_url.
+#
+# When disabled (default), requests go directly to each profile's base_url.
+#
+# External agents (OpenCode CLI, etc.) can also use the relay by pointing their
+# base_url to http://localhost:4445/v1 — the relay extracts the model from the
+# request and applies the matching profile's rate limit.
+#
+# relay:
+#   enabled: false
+#   port: 4445
+#   host: 0.0.0.0

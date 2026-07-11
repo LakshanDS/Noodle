@@ -14,6 +14,7 @@ import { runJob } from "../engine/run.js";
 import { runCronJob } from "../engine/cron-run.js";
 import { loadConfig } from "../config/load.js";
 import { readSetupProfile, synthesizeConfig, hasUsableProfiles } from "../config/setup-fallback.js";
+import { createRelayServer } from "../relay/server.js";
 import { log } from "../util/log.js";
 import { slugify } from "../util/slugify.js";
 import type { NoodleConfig } from "../config/schema.js";
@@ -218,6 +219,37 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // first interval, then every 60s.
   const cronScheduler = new CronScheduler(buildCronSchedulerDeps(cronStore, queue, authProvider, config));
 
+  // API relay (optional). Provides centralized rate limiting for multiple agents
+  // sharing the same API keys. When enabled, all API calls from this process
+  // route through the relay transparently — no config changes needed.
+  let relayApp: ReturnType<typeof createRelayServer> | null = null;
+  if (config.relay?.enabled) {
+    const relayPort = config.relay.port ?? 4445;
+    const relayHost = config.relay.host ?? "0.0.0.0";
+
+    // Save original base URLs before modifying profiles for relay routing.
+    const originalUrls = new Map<string, string>();
+    for (const [, profile] of Object.entries(config.profiles)) {
+      if (profile.base_url) {
+        originalUrls.set(profile.model, profile.base_url);
+      }
+    }
+
+    // Create relay with access to original URLs for forwarding.
+    relayApp = createRelayServer(config, { originalUrls });
+    await relayApp.listen({ port: relayPort, host: relayHost });
+    log.info({ port: relayPort, host: relayHost }, "API relay listening");
+
+    // Rewrite each profile's base_url to route through the relay.
+    const relayBase = `http://localhost:${relayPort}/v1`;
+    for (const profile of Object.values(config.profiles)) {
+      if (profile.base_url) {
+        profile.base_url = relayBase;
+      }
+    }
+    log.info({ relayBase }, "rewrote profile base_urls to route through relay");
+  }
+
   // --- Boot order: workers first (drain backlog), then http, then schedulers. ---
   const workerPromises = Promise.all(workers.map((w) => w.run()));
 
@@ -236,6 +268,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     scheduler?.stop();
     cronScheduler.stop();
     for (const w of workers) w.stop();
+    await relayApp?.close().catch((e) => log.error({ err: e }, "relay close error"));
     await app.close().catch((e) => log.error({ err: e }, "http close error"));
     await workerPromises.catch(() => {}); // all workers exit their loops
     queue.close();
