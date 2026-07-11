@@ -85,7 +85,6 @@ export async function runCronJob(
     jobId,
     repo: input.repo,
     branch: branchName,
-    cron: true,
     pid: process.pid,
   });
   log.info("═══════════════════════════════════════════════════════════════");
@@ -347,10 +346,10 @@ function subscribeForLogging(
     const e = event as Record<string, unknown>;
     switch (e.type) {
       case "agent_start":
-        log_.info("▶ cron agent started");
+        log_.info("▶ agent started");
         break;
       case "agent_end":
-        log_.info(e.willRetry === true ? "■ cron agent finished (will retry)" : "■ cron agent finished");
+        log_.info(e.willRetry === true ? "■ agent finished (will retry)" : "■ agent finished");
         break;
       case "message_end": {
         const msg = e.message as { role?: string } | undefined;
@@ -372,7 +371,7 @@ function subscribeForLogging(
         if (isError) {
           log_.warn(`✗ ${e.toolName}: ${truncate(firstLine(out), 200)}`);
         } else {
-          log_.info(`✓ ${e.toolName}`);
+          log_.info("✓ done");
         }
         break;
       }
@@ -420,11 +419,32 @@ function firstLine(s: string): string {
 }
 
 function toolStartLabel(toolName: unknown, args: unknown): string {
-  if (toolName === "bash") {
-    const cmd = (args as { command?: unknown } | null)?.command;
-    if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
+  const a = (args as Record<string, unknown> | null) ?? {};
+  switch (toolName) {
+    case "read": {
+      const fp = a.filePath;
+      return `read > ${typeof fp === "string" ? fp : "?"}`;
+    }
+    case "write": {
+      const fp = a.filePath;
+      return `write > ${typeof fp === "string" ? fp : "?"}`;
+    }
+    case "bash": {
+      const cmd = a.command;
+      if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
+      return "$ ?";
+    }
+    case "glob": {
+      const pat = a.pattern;
+      return `glob > ${typeof pat === "string" ? pat : "?"}`;
+    }
+    case "grep": {
+      const pat = a.pattern;
+      return `grep > ${typeof pat === "string" ? pat : "?"}`;
+    }
+    default:
+      return `▸ ${toolName}`;
   }
-  return `▸ ${toolName}`;
 }
 
 /** Stable sessions dir for a cron run (mirrors run.ts's helper). */
