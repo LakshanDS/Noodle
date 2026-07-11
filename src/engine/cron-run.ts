@@ -7,7 +7,6 @@ import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildCronPrompt } from "./prompt.js";
-import { createOpenIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
@@ -35,8 +34,8 @@ type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
 
 /**
  * Input for a scheduled (cron) run. Unlike the issue-driven RunInput, there is
- * no source issue — the agent works a freeform prompt and its output is one or
- * more NEW issues opened via the `open_issue` tool.
+ * no source issue — the agent works a freeform prompt and its final message is
+ * turned into a NEW issue by Noodle after the run.
  */
 export interface CronRunInput {
   /** "owner/name" */
@@ -55,14 +54,17 @@ export interface CronRunInput {
 
 /**
  * Run one scheduled job end-to-end: resolve profile → clone → branch → run pi
- * with the `open_issue` tool → commit + push the branch → record the run.
+ * → commit + push the branch → open an issue with the agent's final message →
+ * record the run.
  *
  * Sibling to `runJob` (engine/run.ts), sharing the same building blocks
  * (Workspace, profile resolution, model registry, session management, stall
  * watcher, footer builder) but with a different lifecycle: no source issue, no
- * PR, no status labels. The agent's deliverable is the issues it opens; the
- * commit/branch is kept for traceability (so an operator can see what the agent
- * inspected/changed) but no PR is opened against it.
+ * PR, no status labels. The agent's deliverable is its final text message;
+ * Noodle opens a single issue in the repo with that message as the body (plus a
+ * rich footer, same shape as an issue→PR run). The commit/branch is kept for
+ * traceability (so an operator can see what the agent inspected/changed) but no
+ * PR is opened against it.
  *
  * The branch is reused across runs when it exists on the remote — a daily cron
  * stacks onto yesterday's branch, giving a running timeline of the sweep.
@@ -170,8 +172,10 @@ export async function runCronJob(
     });
     await loader.reload();
 
-    // 6. Create pi session + run. The agent's only output tool is `open_issue`
-    // — no `comment_on_issue`, since there's no source issue to comment on.
+    // 6. Create pi session + run. No custom output tool — the agent ends by
+    // writing its findings as a normal final text message, and Noodle opens a
+    // single issue with that message as the body after the run (mirrors how
+    // runJob turns the agent's answer into the issue comment + PR body).
     const sessionDir = sessionsDirFor(jobId);
     const sessionManager = SessionManager.create(ws.path, sessionDir);
     const create = deps?.createAgentSessionFn ?? createAgentSession;
@@ -185,7 +189,6 @@ export async function runCronJob(
       resourceLoader: loader,
       thinkingLevel: profile.thinking_level,
       tools: profile.tools,
-      customTools: [createOpenIssueTool(gh, input.repo, [config.agent_name])],
     });
 
     subscribeForLogging(session, log_);
@@ -253,7 +256,7 @@ export async function runCronJob(
         agentAnswer = extractLastAssistantText(session);
       }
 
-      // Commit + push the branch (traceability). No PR — issues are the output.
+      // Commit + push the branch (traceability). No PR — the issue below is the output.
       await ws.removeInternals();
       const committed = await ws.commitAll(
         `cron run (${input.branchName})\n\nScheduled run by ${config.agent_name} (profile: ${profile.name}).`,
@@ -263,6 +266,18 @@ export async function runCronJob(
         log_.info({ branch: branchName, reused }, "pushed cron branch");
       }
 
+      // Open the cron output issue: the agent's final message as the body, with
+      // a rich footer (same shape as an issue→PR run's comment). On an errored
+      // run the body is an honest error notice instead — the agent's last text
+      // is just an opening utterance, not a real answer. The title is derived
+      // from the task so the issue is identifiable in a triage list.
+      const issueBody = errored
+        ? buildCronErrorBody(config.agent_name, stopReason.errorMessage ?? "agent run ended on error")
+        : buildCronIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
+      const issueTitle = cronIssueTitle(input.prompt);
+      const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [config.agent_name]);
+      log_.info({ issue: issue.number, url: issue.html_url, errored }, "opened cron output issue");
+
       if (runStore) {
         runStore.updateRun(jobId, {
           profile: profile.name,
@@ -270,6 +285,7 @@ export async function runCronJob(
           status: errored ? "failed" : "succeeded",
           error: errored ? (stopReason.errorMessage ?? "agent run ended on error") : null,
           summary: agentAnswer ?? null,
+          output_issue_url: issue.html_url,
           finished_at: nowIso(),
         });
       }
@@ -280,6 +296,7 @@ export async function runCronJob(
         agentAnswer,
         commentUrl: "",
         sessionPath,
+        outputIssueUrl: issue.html_url,
       };
     } finally {
       teardownDisposeGuard();
@@ -334,7 +351,7 @@ async function tryReuseBranch(
  * subscriber (one line per notable event; full detail lives in the session file).
  * Duplicated from run.ts because that subscriber is a private function there;
  * keeping a cron-specific copy avoids coupling the two run paths and lets cron
- * logging evolve independently (e.g. surfacing open_issue calls specially).
+ * logging evolve independently.
  */
 function subscribeForLogging(
   session: { subscribe?: (fn: (e: unknown) => void) => unknown },
@@ -457,6 +474,44 @@ function sessionsDirFor(jobId: string): string {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Derive a concise issue title from the cron task. The task is freeform, so we
+ * take its first non-empty line (capped to ~80 chars) and prefix it with the
+ * agent name so the issue is identifiable as cron output in a triage list. When
+ * the task is blank, fall back to a generic "scheduled sweep" title.
+ */
+function cronIssueTitle(task: string): string {
+  const firstLine = task.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
+  const head = firstLine ? truncate(firstLine, 80) : "scheduled sweep";
+  return head;
+}
+
+/**
+ * Build the cron output issue body from the agent's final message + the shared
+ * footer. A blank/missing agent message still produces a useful issue body so
+ * the run is never silent (the team sees the agent ran but had nothing to say).
+ */
+function buildCronIssueBody(agentMessage: string | undefined, footer: string): string {
+  const body = agentMessage?.trim() ||
+    "_The agent ran but produced no findings. It may have found nothing concrete to report._";
+  return `${body}\n\n---\n${footer}`;
+}
+
+/**
+ * Build the cron output issue body for an errored run. Honest notice that the
+ * run failed, with the error text quoted so the cause is visible, plus the
+ * footer. Mirrors `buildErrorComment` from run.ts but for the cron (no-issue) path.
+ */
+function buildCronErrorBody(agentName: string, errorMessage: string): string {
+  const err = errorMessage.trim() || "unknown error";
+  const body =
+    `⚠️ **Scheduled run by ${agentName} errored out before finishing.**\n\n` +
+    `> \`${err}\`\n\n` +
+    `No findings were produced. The run may be retried once the underlying issue ` +
+    `(API quota, rate limit, provider outage, etc.) is resolved.`;
+  return body;
 }
 
 // Re-export buildFooter for callers (UI / summary rendering) that want the

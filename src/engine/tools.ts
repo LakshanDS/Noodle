@@ -6,11 +6,11 @@ import { log } from "../util/log.js";
 /**
  * Noodle custom tools injected into pi via `createAgentSession({ customTools })`.
  *
- * `comment_on_issue` is the output path for issue→PR runs (the agent posts its
- * final answer, Noodle turns it into the issue comment + PR body). `open_issue`
- * is the output path for cron runs — the agent's deliverable IS a new issue, so
- * it opens as many as its findings warrant. Each tool is a factory capturing its
- * dependencies (gh client, repo, optional issue number) via closure.
+ * `comment_on_issue` is the mid-run output path for issue→PR runs (the agent
+ * asks the reporter a question or shares progress). The agent's END-of-run
+ * answer is never a tool call: it writes a normal final text message, and
+ * Noodle turns it into the issue comment + PR body (issue→PR runs) or into a
+ * newly-opened issue (cron runs).
  */
 
 /**
@@ -57,54 +57,3 @@ export function createCommentOnIssueTool(
   });
 }
 
-/**
- * `open_issue(title, body, labels?)` — open a NEW issue in the repo. This is a
- * cron run's output mechanism: the agent is given a freeform prompt (e.g.
- * "find bugs") and reports each finding as its own issue, so the team gets
- * actionable, triageable tickets rather than a comment buried in a thread.
- *
- * `cronLabels` are ALWAYS applied (e.g. a tag identifying the cron source);
- * the agent may add more via the `labels` parameter.
- */
-export function createOpenIssueTool(
-  gh: GitHubClient,
-  repo: string,
-  cronLabels: string[] = [],
-) {
-  return defineTool({
-    name: "open_issue",
-    label: "Open Issue",
-    description:
-      "Open a new GitHub issue with a title and body. Use to report a finding " +
-      "(a bug, a smell, a missing test) as its own triageable issue. Call once " +
-      "per finding — don't lump unrelated problems into one issue. Each call " +
-      "opens a separate issue. The title should be a concise summary; the body " +
-      "should describe the problem and how to reproduce / locate it.",
-    parameters: Type.Object({
-      title: Type.String({
-        description: "A concise issue title (1 line).",
-      }),
-      body: Type.String({
-        description: "The issue body, in Markdown. Describe the finding clearly.",
-      }),
-      labels: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Optional extra labels to apply. Added on top of any fixed labels.",
-        }),
-      ),
-    }),
-    execute: async (_id, params) => {
-      try {
-        const allLabels = [...cronLabels, ...(params.labels ?? [])];
-        const issue = await gh.createIssue(repo, params.title, params.body, allLabels);
-        log.info({ repo, issue: issue.number }, "agent opened issue");
-        return {
-          content: [{ type: "text" as const, text: `Opened issue #${issue.number}: ${issue.html_url}` }],
-          details: { issue_number: issue.number, url: issue.html_url },
-        };
-      } catch (e) {
-        throw new Error(`Failed to open issue: ${(e as Error).message}`);
-      }
-    },
-  });
-}

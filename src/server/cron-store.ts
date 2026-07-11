@@ -4,8 +4,8 @@ import { log } from "../util/log.js";
 
 /**
  * DB-backed store for scheduled cron jobs. Each row defines a recurring agent
- * run: a freeform prompt executed on a named branch, whose output is one or more
- * new GitHub issues (opened by the agent via the `open_issue` tool).
+ * run: a freeform prompt executed on a named branch, whose output is a single
+ * new issue (opened by Noodle with the agent's final message as the body).
  *
  * Managed entirely through the web UI (create / edit / enable / delete / run
  * now) — there is no `cron` block in the YAML config. This keeps schedules

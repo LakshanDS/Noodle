@@ -84,6 +84,11 @@ export interface RunResult {
   commentUrl: string;
   /** Path to pi's persisted session file (resume/inspect). Omitted if no store. */
   sessionPath?: string;
+  /**
+   * URL of the issue a cron run opened (its output). Omitted for issue→PR runs,
+   * which produce a PR + comment instead.
+   */
+  outputIssueUrl?: string;
 }
 
 /**

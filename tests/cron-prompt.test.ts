@@ -8,16 +8,15 @@ describe("buildCronPrompt", () => {
     expect(prompt).toContain("Find bugs and open issues.");
   });
 
-  it("instructs the agent to use the open_issue tool", () => {
+  it("instructs the agent to write findings as a final message", () => {
     const prompt = buildCronPrompt("sweep", "o/r");
-    expect(prompt.toLowerCase()).toContain("open_issue");
+    expect(prompt.toLowerCase()).toContain("final message");
   });
 
   it("instructs the agent NOT to open a pull request", () => {
     const prompt = buildCronPrompt("sweep", "o/r");
-    // The deliverable is issues, not a PR.
-    expect(prompt.toLowerCase()).toContain("pull request");
-    expect(prompt.toLowerCase()).toContain("does not open");
+    // The deliverable is an issue Noodle opens, not a PR.
+    expect(prompt.toLowerCase()).toContain("no pull request");
   });
 
   it("loads only noodle-default, not noodle-fix", () => {

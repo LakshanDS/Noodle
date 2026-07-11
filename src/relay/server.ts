@@ -96,7 +96,7 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
     // 4. Forward to the real API.
     try {
       const forwardUrl = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
-      log.info({ model, baseUrl, url: forwardUrl, stream: isStreaming, bodyKeys: Object.keys(body), messages: Array.isArray(body.messages) ? body.messages.length : 0 }, "relay: forwarding request");
+      log.debug({ model, baseUrl, url: forwardUrl, stream: isStreaming, bodyKeys: Object.keys(body), messages: Array.isArray(body.messages) ? body.messages.length : 0 }, "relay: forwarding request");
 
       if (isStreaming) {
         // Streaming: pipe the SSE response directly to the client.

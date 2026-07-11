@@ -64,8 +64,10 @@ export function buildPrompt(
 /**
  * Build the user prompt for a scheduled (cron) run. Unlike `buildPrompt`, there
  * is no source issue — the agent is given a freeform task (e.g. "find bugs and
- * open issues") and works the repo. Its deliverable is one or more NEW issues
- * opened via the `open_issue` tool, not a PR or a comment on an existing thread.
+ * open issues") and works the repo. Its deliverable is a final text message:
+ * its findings, written up clearly. Noodle opens a single issue in the repo
+ * with that message as the body (plus a footer), mirroring how an issue→PR run
+ * turns the agent's final message into the issue comment + PR body.
  *
  * Only `noodle-default` is loaded: cron runs are investigative/sweeps, not the
  * fix workflow (which assumes a single issue to resolve). `noodle-fix` would
@@ -92,15 +94,15 @@ export function buildCronPrompt(
     "  minimal diff, stdlib first, no over-engineering). It governs how you reason",
     "  about the code you inspect.",
     "",
-    "This is a **cron run** — there is no issue to fix. Your output is one or more",
-    "**new issues**, opened via the `open_issue` tool. Each distinct finding gets its",
-    "own issue with a clear title and a body that explains what's wrong and where to",
-    "find it. Open as many issues as your findings warrant; don't lump unrelated",
-    "problems together, and don't open an issue if you have nothing concrete to report.",
+    "This is a **cron run** — there is no issue to fix. Investigate the task, then",
+    "write up your findings as your **final message** (normal text, in Markdown).",
+    "Be concrete: for each finding, say what's wrong and where to find it (file +",
+    "line). Don't pad with architecture walkthroughs or restate the task. If you",
+    "have nothing concrete to report, say so plainly.",
     "",
-    `${agentName} commits any exploratory changes to the cron's branch (for`,
-    "traceability) but does NOT open a pull request — the issues you open ARE the",
-    "deliverable.",
+    `${agentName} opens a single GitHub issue with your final message as the body,`,
+    "and commits any exploratory changes to the cron's branch (for traceability).",
+    "No pull request is opened — your final message IS the deliverable.",
     "",
     "## Task",
     "",
