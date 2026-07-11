@@ -119,8 +119,14 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
       }
       return reply.code(result.status).send(result.body);
     } catch (e) {
-      log.error({ err: (e as Error).message, model }, "relay: forward failed");
-      return reply.code(502).send({ error: `Upstream error: ${(e as Error).message}` });
+      const msg = (e as Error).message;
+      // Pass through 429 so the agent's OpenAI SDK retry logic
+      // (which goes through the rate limiter) kicks in.
+      if (msg.startsWith("Upstream 429")) {
+        return reply.code(429).send({ error: msg });
+      }
+      log.error({ err: msg, model }, "relay: forward failed");
+      return reply.code(502).send({ error: `Upstream error: ${msg}` });
     }
   });
 

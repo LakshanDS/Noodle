@@ -51,19 +51,15 @@ export async function forwardRequest(
         };
       }
 
-      // 429 — Rate limited. Retry with backoff.
-      if (response.status === 429 && attempt < maxRetries) {
-        const retryAfter = response.headers.get("retry-after");
-        const backoffMs = retryAfter
-          ? parseRetryAfter(retryAfter) * 1000
-          : 1000 * Math.pow(2, attempt); // exponential: 1s, 2s, 4s
-
-        log.warn(
-          { status: 429, attempt: attempt + 1, maxRetries, backoffMs },
-          "relay rate limited, retrying",
-        );
-        await sleep(backoffMs);
-        continue;
+      // 429 — Rate limited. Pass through immediately (don't retry behind
+      // the rate limiter's back — every retry must re-acquire a slot).
+      if (response.status === 429) {
+        const errorBody = await response.text().catch(() => "");
+        return {
+          status: 429,
+          headers: {},
+          body: { error: errorBody || "Too Many Requests" },
+        };
       }
 
       // Other errors — return as-is (don't retry 4xx except 429).
@@ -134,20 +130,12 @@ export async function forwardRequestStream(
       };
     }
 
-    // 429 — Rate limited. Retry with backoff.
-    if (response.status === 429 && attempt < maxRetries) {
+    // 429 — Rate limited. Pass through immediately (every retry must
+    // re-acquire a rate limiter slot through the relay).
+    if (response.status === 429) {
       await response.body?.cancel().catch(() => {});
-      const retryAfter = response.headers.get("retry-after");
-      const backoffMs = retryAfter
-        ? parseRetryAfter(retryAfter) * 1000
-        : 1000 * Math.pow(2, attempt + 1); // 2s, 4s, 8s
-
-      log.warn(
-        { status: 429, attempt: attempt + 1, maxRetries, backoffMs },
-        "relay stream rate limited, retrying",
-      );
-      await sleep(backoffMs);
-      continue;
+      const errorBody = await response.text().catch(() => "");
+      throw new Error(`Upstream 429: ${errorBody || "Too Many Requests"}`);
     }
 
     // Other errors — throw immediately.
@@ -156,11 +144,6 @@ export async function forwardRequestStream(
   }
 
   throw new Error("relay stream: max retries exceeded");
-}
-
-function parseRetryAfter(value: string): number {
-  const seconds = parseInt(value, 10);
-  return isNaN(seconds) ? 5 : seconds;
 }
 
 function sleep(ms: number): Promise<void> {
