@@ -57,6 +57,17 @@ describe("RateLimiter", () => {
     // No sleep expected for different model
   });
 
+  it("serializes concurrent callers to the same model", async () => {
+    // Fire two concurrent requests — the old code had a race condition where
+    // both would set independent timers and fire near-simultaneously.
+    const [r1, r2] = await Promise.all([
+      limiter.acquireSlot(profiles, "minimaxai/minimax-m3"),
+      limiter.acquireSlot(profiles, "minimaxai/minimax-m3"),
+    ]);
+    expect(r1).toBe("NVIDIA_API_KEY_01");
+    expect(r2).toBe("NVIDIA_API_KEY_01");
+  });
+
   it("returns correct stats", async () => {
     await limiter.acquireSlot(profiles, "minimaxai/minimax-m3");
     const stats = limiter.getStats();

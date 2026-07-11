@@ -71,32 +71,44 @@ export class RateLimiter {
 
   /**
    * Serialize access to the bucket using a promise-based queue.
-   * The first caller enters immediately; subsequent callers queue up.
-   * Each caller sleeps for the remaining interval before proceeding.
+   * The first caller dispatches; subsequent callers queue up.
+   * Only one setTimeout is active at a time, preventing race
+   * conditions when multiple callers arrive concurrently.
    */
   private async waitForSlot(bucket: Bucket): Promise<void> {
     return new Promise<void>((resolve) => {
-      const tryAcquire = () => {
-        const t = this.now();
-        const elapsed = t - bucket.lastAt;
-        const waitMs = bucket.minIntervalMs - elapsed;
-
-        if (waitMs <= 0) {
-          // Slot available — claim it immediately.
-          bucket.lastAt = this.now();
-          resolve();
-          return;
-        }
-
-        // Slot not available — schedule a retry after the wait.
-        setTimeout(() => {
-          bucket.lastAt = this.now();
-          resolve();
-        }, waitMs);
-      };
-
-      tryAcquire();
+      bucket.queue.push(resolve);
+      if (bucket.queue.length > 1) {
+        // Already have a waiter scheduled — the preceding
+        // waiter's timeout will dequeue us when it fires.
+        return;
+      }
+      this.dispatchNext(bucket);
     });
+  }
+
+  private dispatchNext(bucket: Bucket): void {
+    const resolve = bucket.queue[0];
+    if (!resolve) return;
+
+    const t = this.now();
+    const elapsed = t - bucket.lastAt;
+    const waitMs = bucket.minIntervalMs - elapsed;
+
+    if (waitMs <= 0) {
+      bucket.lastAt = this.now();
+      bucket.queue.shift();
+      resolve();
+      this.dispatchNext(bucket);
+      return;
+    }
+
+    setTimeout(() => {
+      bucket.lastAt = this.now();
+      bucket.queue.shift();
+      resolve();
+      this.dispatchNext(bucket);
+    }, waitMs);
   }
 
   /**

@@ -96,43 +96,66 @@ export async function forwardRequest(
  * Forward a streaming chat completions request. Returns the raw fetch Response
  * so the caller can pipe the SSE stream directly to the client.
  *
- * Does NOT retry on 429 for streaming — the client handles reconnection.
+ * Retries on 429 with exponential backoff (up to maxRetries attempts).
  */
 export async function forwardRequestStream(
   baseUrl: string,
   apiKey: string,
   body: unknown,
+  maxRetries = 3,
 ): Promise<{ status: number; headers: Record<string, string>; stream: ReadableStream }> {
   const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
 
-  if (response.status >= 400) {
+    // Success — return the stream.
+    if (response.status < 400) {
+      const responseHeaders: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+
+      if (!response.body) {
+        throw new Error("Upstream returned no body for streaming response");
+      }
+
+      return {
+        status: response.status,
+        headers: responseHeaders,
+        stream: response.body,
+      };
+    }
+
+    // 429 — Rate limited. Retry with backoff.
+    if (response.status === 429 && attempt < maxRetries) {
+      await response.body?.cancel().catch(() => {});
+      const retryAfter = response.headers.get("retry-after");
+      const backoffMs = retryAfter
+        ? parseRetryAfter(retryAfter) * 1000
+        : 1000 * Math.pow(2, attempt + 1); // 2s, 4s, 8s
+
+      log.warn(
+        { status: 429, attempt: attempt + 1, maxRetries, backoffMs },
+        "relay stream rate limited, retrying",
+      );
+      await sleep(backoffMs);
+      continue;
+    }
+
+    // Other errors — throw immediately.
     const errorBody = await response.text().catch(() => "");
     throw new Error(`Upstream ${response.status}: ${errorBody || response.statusText}`);
   }
 
-  const responseHeaders: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    responseHeaders[key] = value;
-  });
-
-  if (!response.body) {
-    throw new Error("Upstream returned no body for streaming response");
-  }
-
-  return {
-    status: response.status,
-    headers: responseHeaders,
-    stream: response.body,
-  };
+  throw new Error("relay stream: max retries exceeded");
 }
 
 function parseRetryAfter(value: string): number {
