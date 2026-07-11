@@ -108,14 +108,6 @@ export const ProfileSchema = z.object({
    */
   retry_base_delay_ms: z.number().int().min(0).default(3000),
   /**
-   * Max HTTP-level retries by the provider client (the OpenAI SDK's built-in
-   * retry). These fire BEFORE the agent-level retry and respect the provider's
-   * `Retry-After` header when present. Absorbs transient 429s at the HTTP layer
-   * so they never reach the agent retry loop. Default: 3. Set to 0 to bubble
-   * all 429s directly to the agent retry.
-   */
-  provider_max_retries: z.number().int().min(0).default(3),
-  /**
    * Max jobs of this profile that may run at the same time. Optional — when
    * unset, the profile is limited only by the global `queue.concurrency`.
    *
