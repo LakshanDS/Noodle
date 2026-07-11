@@ -783,7 +783,7 @@ function subscribeForLogging(
         const text = extractMessageText(msg).trim();
         if (!text || text === lastToolOutput) break;
         lastToolOutput = "";
-        log_.info(`💬 ${text}`);
+        log_.info(`⦿ ${text}`);
         break;
       }
 
@@ -869,17 +869,36 @@ function firstLine(s: string): string {
 }
 
 /**
- * Label for a `tool_execution_start` event: `▸ <tool>`, except for `bash` we
- * show the actual command (`$ npm test`) since that's the one tool whose args
- * matter for log readability. All other tools log name-only at the start and
- * their pass/fail status at the end.
+ * Label for a `tool_execution_start` event. Each tool gets a short symbol +
+ * the one arg that matters for log readability (a file path, a pattern, the
+ * shell command). Matches the cron-run.ts labels so both run paths read the
+ * same in the console.
  */
 function toolStartLabel(toolName: unknown, args: unknown): string {
-  if (toolName === "bash") {
-    const cmd = (args as { command?: unknown } | null)?.command;
-    if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
+  const a = (args as Record<string, unknown> | null) ?? {};
+  const pathOf = () => (typeof a.path === "string" ? a.path : "?");
+  const patternOf = () => (typeof a.pattern === "string" ? a.pattern : "?");
+  switch (toolName) {
+    case "read":
+      return `☰ read > ${pathOf()}`;
+    case "write":
+      return `✎ write > ${pathOf()}`;
+    case "edit":
+      return `✑ edit > ${pathOf()}`;
+    case "bash": {
+      const cmd = a.command;
+      if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
+      return "$ ?";
+    }
+    case "find":
+      return `⌖ find > ${patternOf()}`;
+    case "grep":
+      return `⌕ grep > ${patternOf()}`;
+    case "ls":
+      return `≡ ls > ${pathOf()}`;
+    default:
+      return `▸ ${toolName}`;
   }
-  return `▸ ${toolName}`;
 }
 
 /**

@@ -394,7 +394,7 @@ function subscribeForLogging(
         const text = extractMessageText(msg).trim();
         if (!text || text === lastToolOutput) break;
         lastToolOutput = "";
-        log_.info(`💬 ${text}`);
+        log_.info(`⦿ ${text}`);
         break;
       }
       case "tool_execution_start":
@@ -468,22 +468,22 @@ function toolStartLabel(toolName: unknown, args: unknown): string {
   const patternOf = () => (typeof a.pattern === "string" ? a.pattern : "?");
   switch (toolName) {
     case "read":
-      return `📖 read > ${pathOf()}`;
+      return `☰ read > ${pathOf()}`;
     case "write":
-      return `✏️ write > ${pathOf()}`;
+      return `✎ write > ${pathOf()}`;
     case "edit":
-      return `✏️ edit > ${pathOf()}`;
+      return `✑ edit > ${pathOf()}`;
     case "bash": {
       const cmd = a.command;
       if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
       return "$ ?";
     }
     case "find":
-      return `🔎 find > ${patternOf()}`;
+      return `⌖ find > ${patternOf()}`;
     case "grep":
-      return `🔎 grep > ${patternOf()}`;
+      return `⌕ grep > ${patternOf()}`;
     case "ls":
-      return `📂 ls > ${pathOf()}`;
+      return `≡ ls > ${pathOf()}`;
     default:
       return `▸ ${toolName}`;
   }
