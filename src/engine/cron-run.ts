@@ -239,6 +239,7 @@ export async function runCronJob(
 
     for (let attempt = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++) {
       const { session, sessionManager, watcher, unsubStall } = booted;
+      const turnsBefore = session.getSessionStats?.()?.assistantMessages ?? 0;
       try {
         await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
       } catch (e) {
@@ -273,18 +274,28 @@ export async function runCronJob(
       // Failure — dispose, optionally restart.
       watcher.dispose();
       unsubStall?.();
+
+      // If the agent completed new turns before failing, it made real progress.
+      // Reset the restart counter so a run that's actively working always gets
+      // 3 fresh restarts — instead of burning its budget on one bad stretch.
+      const turnsAfter = session.getSessionStats?.()?.assistantMessages ?? 0;
+      if (turnsAfter > turnsBefore) {
+        log_.info({ turnsBefore, turnsAfter }, "agent made progress before failure — resetting restart budget");
+        attempt = -1; // loop increments to 0 → 3 fresh attempts
+      }
+
       if (attempt >= SESSION_RESTART_ATTEMPTS) break;
 
       const sessionPath = sessionManager.getSessionFile();
       try { await session.dispose?.(); } catch { /* best-effort */ }
       log_.warn(
-        { err: (promptError as Error).message ?? String(promptError), restartAttempt: attempt + 1, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
+        { err: (promptError as Error).message ?? String(promptError), restartAttempt: attempt + 2, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
         "session.prompt() failed — will restart with same session after backoff",
       );
       await sleep(SESSION_RESTART_DELAY_MS);
       currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
       booted = await bootSession(currentManager);
-      log_.info({ restartAttempt: attempt + 1 }, "restarted session from saved context");
+      log_.info({ restartAttempt: attempt + 2 }, "restarted session from saved context");
     }
 
     if (promptError) {
@@ -544,7 +555,7 @@ function toolStartLabel(toolName: unknown, args: unknown): string {
     case "write":
       return `✎ write > ${pathOf()}`;
     case "edit":
-      return `✑ edit > ${pathOf()}`;
+      return `✎ edit > ${pathOf()}`;
     case "bash": {
       const cmd = a.command;
       if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
