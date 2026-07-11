@@ -3,6 +3,12 @@ import { GithubAppAuth } from "./app-auth.js";
 import { GitHubClient } from "./client.js";
 
 /**
+ * The GitHub REST API version to target (silences the deprecation warning from
+ * requests without the header). See auth.ts for details.
+ */
+const GH_API_VERSION = "2022-11-28";
+
+/**
  * One interface for getting GitHub credentials for a job, regardless of whether
  * Noodle is running in PAT mode (Phase 1) or GitHub-App mode (Phase 2).
  *
@@ -19,7 +25,7 @@ export class PatAuthProvider implements AuthProvider {
   constructor(private readonly token: string) {}
 
   async forRepo(): Promise<{ gh: GitHubClient; token: string }> {
-    return { gh: new GitHubClient(new Octokit({ auth: this.token })), token: this.token };
+    return { gh: new GitHubClient(new Octokit({ auth: this.token, request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } })), token: this.token };
   }
 }
 
@@ -47,7 +53,7 @@ export class GithubAppAuthProvider implements AuthProvider {
       );
     }
     const token = await this.appAuth.getInstallationToken(instId);
-    return { gh: new GitHubClient(new Octokit({ auth: token })), token };
+    return { gh: new GitHubClient(new Octokit({ auth: token, request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } })), token };
   }
 }
 
