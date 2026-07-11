@@ -16,7 +16,8 @@
     "skills"
   ],
   "scripts": {
-    "build": "tsc && npm run build:client",
+    "build": "npm run build:server && npm run build:client",
+    "build:server": "tsc",
     "build:client": "npm --prefix client run build",
     "dev": "tsx src/cli.ts",
     "dev:client": "npm --prefix client run dev",

@@ -10,7 +10,7 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/ src/
-RUN npm run build
+RUN npm run build:server
 
 # Drop dev deps so only what the runtime needs is copied to the next stage.
 # Native modules (.node) built above against musl carry through untouched.
