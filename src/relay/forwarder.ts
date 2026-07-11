@@ -5,6 +5,7 @@ import { log } from "../util/log.js";
  * - Adding the correct Authorization header
  * - Retrying on 429 with exponential backoff
  * - Respecting Retry-After headers
+ * - Streaming: returns the raw Response for SSE pass-through
  */
 
 export interface ForwardResult {
@@ -14,12 +15,8 @@ export interface ForwardResult {
 }
 
 /**
- * Forward a chat completions request to the real API.
- *
- * @param baseUrl - The provider's base URL (e.g. https://integrate.api.nvidia.com/v1)
- * @param apiKey - The resolved API key
- * @param body - The request body (already validated)
- * @param maxRetries - Max retry attempts for 429s (default: 3)
+ * Forward a chat completions request to the real API (non-streaming).
+ * Parses the JSON response body.
  */
 export async function forwardRequest(
   baseUrl: string,
@@ -93,6 +90,49 @@ export async function forwardRequest(
 
   // Should never reach here, but TypeScript wants it.
   throw new Error("relay: max retries exceeded");
+}
+
+/**
+ * Forward a streaming chat completions request. Returns the raw fetch Response
+ * so the caller can pipe the SSE stream directly to the client.
+ *
+ * Does NOT retry on 429 for streaming — the client handles reconnection.
+ */
+export async function forwardRequestStream(
+  baseUrl: string,
+  apiKey: string,
+  body: unknown,
+): Promise<{ status: number; headers: Record<string, string>; stream: ReadableStream }> {
+  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (response.status >= 400) {
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(`Upstream ${response.status}: ${errorBody || response.statusText}`);
+  }
+
+  const responseHeaders: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    responseHeaders[key] = value;
+  });
+
+  if (!response.body) {
+    throw new Error("Upstream returned no body for streaming response");
+  }
+
+  return {
+    status: response.status,
+    headers: responseHeaders,
+    stream: response.body,
+  };
 }
 
 function parseRetryAfter(value: string): number {

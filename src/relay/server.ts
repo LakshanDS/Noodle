@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import { Readable } from "node:stream";
 import { log } from "../util/log.js";
 import { RateLimiter, type ProfileConfig } from "./rate-limiter.js";
-import { forwardRequest } from "./forwarder.js";
+import { forwardRequest, forwardRequestStream } from "./forwarder.js";
 import type { NoodleConfig } from "../config/schema.js";
 
 /**
@@ -90,10 +91,28 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
       return reply.code(400).send({ error: `No base_url configured for model "${model}"` });
     }
 
+    const isStreaming = body.stream === true;
+
     // 4. Forward to the real API.
     try {
       const forwardUrl = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
-      log.info({ model, baseUrl, url: forwardUrl, bodyKeys: Object.keys(body), stream: body.stream, messages: Array.isArray(body.messages) ? body.messages.length : 0 }, "relay: forwarding request");
+      log.info({ model, baseUrl, url: forwardUrl, stream: isStreaming, bodyKeys: Object.keys(body), messages: Array.isArray(body.messages) ? body.messages.length : 0 }, "relay: forwarding request");
+
+      if (isStreaming) {
+        // Streaming: pipe the SSE response directly to the client.
+        const result = await forwardRequestStream(baseUrl, apiKey, body);
+        reply.raw.writeHead(result.status, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        });
+        const nodeStream = Readable.fromWeb(result.stream as any);
+        nodeStream.pipe(reply.raw);
+        reply.hijack();
+        return;
+      }
+
+      // Non-streaming: parse JSON response.
       const result = await forwardRequest(baseUrl, apiKey, body);
       if (result.status >= 400) {
         log.warn({ model, status: result.status, body: result.body }, "relay: upstream error");
