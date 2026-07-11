@@ -241,10 +241,6 @@ export async function runCronJob(
       const { session, sessionManager, watcher, unsubStall } = booted;
       try {
         await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
-        promptError = null;
-        watcher.dispose();
-        unsubStall?.();
-        break;
       } catch (e) {
         watcher.dispose();
         unsubStall?.();
@@ -256,20 +252,39 @@ export async function runCronJob(
           );
         }
         promptError = e;
-        if (attempt >= SESSION_RESTART_ATTEMPTS) break;
-
-        // Capture the session file path, dispose, wait, then reopen for the next attempt.
-        const sessionPath = sessionManager.getSessionFile();
-        try { await session.dispose?.(); } catch { /* best-effort */ }
-        log_.warn(
-          { err: (e as Error).message ?? String(e), restartAttempt: attempt + 1, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
-          "session.prompt() failed — will restart with same session after backoff",
-        );
-        await sleep(SESSION_RESTART_DELAY_MS);
-        currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
-        booted = await bootSession(currentManager);
-        log_.info({ restartAttempt: attempt + 1 }, "restarted session from saved context");
       }
+      // Even when prompt() doesn't throw, pi may have resolved with an error
+      // stop reason (retryable errors that exhausted all pi-internal retries
+      // resolve gracefully instead of throwing). Treat that as a failure too.
+      if (!promptError) {
+        const sr = lastAssistantStopReason(session);
+        if (sr.stopReason === "error") {
+          promptError = new Error(sr.errorMessage ?? "agent run ended on error (stopReason=error)");
+        }
+      }
+
+      // Success — clean up and exit the restart loop.
+      if (!promptError) {
+        watcher.dispose();
+        unsubStall?.();
+        break;
+      }
+
+      // Failure — dispose, optionally restart.
+      watcher.dispose();
+      unsubStall?.();
+      if (attempt >= SESSION_RESTART_ATTEMPTS) break;
+
+      const sessionPath = sessionManager.getSessionFile();
+      try { await session.dispose?.(); } catch { /* best-effort */ }
+      log_.warn(
+        { err: (promptError as Error).message ?? String(promptError), restartAttempt: attempt + 1, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
+        "session.prompt() failed — will restart with same session after backoff",
+      );
+      await sleep(SESSION_RESTART_DELAY_MS);
+      currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
+      booted = await bootSession(currentManager);
+      log_.info({ restartAttempt: attempt + 1 }, "restarted session from saved context");
     }
 
     if (promptError) {
