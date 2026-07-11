@@ -114,7 +114,7 @@ async function onSubmit(): Promise<void> {
   border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
 }
 .brand-name {
-  font-size: var(--text-lg);
+  font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   color: var(--text);
 }

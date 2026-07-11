@@ -355,7 +355,7 @@ onMounted(checkStatus);
 
 /* Step body */
 .step-body h2 {
-  font-size: var(--text-lg);
+  font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   margin-bottom: var(--space-1);
 }

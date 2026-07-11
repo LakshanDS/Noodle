@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
 import { CronStore } from "../src/server/cron-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
+import { ProfileStore } from "../src/server/profile-store.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
 import { signToken } from "../src/server/ui-auth.js";
 
@@ -42,6 +43,7 @@ function makeApp() {
     secret: PASSWORD,
     cronStore: CronStore.fromDb(db),
     settingsStore,
+    profileStore: ProfileStore.fromDb(db),
     queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
     authProvider: {} as never,
     agentName: "TestBot",

@@ -1,20 +1,21 @@
 <script setup lang="ts">
 /**
- * Crons list — a table of scheduled jobs inside the app shell. Each row opens
- * the editor; the "New cron" action in the top bar opens the create form.
+ * Skills list — a table of agent skills. The bundled ones mirror the real
+ * skills/ directory at the repo root; custom ones come from the Add form.
+ *
+ * MOCK ONLY: backed by src/lib/mock.ts. Swap mockListSkills →
+ * getJson<SkillsResponse>("/api/skills") to migrate.
  */
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { getJson, ApiRequestError } from "../api/client.js";
-import type { CronsResponse, CronRow } from "../api/types.js";
-import { cronScheduleText } from "../lib/format.js";
+import { mockListSkills } from "../lib/mock.js";
+import type { SkillRow } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
-import StatusPill from "../components/ui/StatusPill.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
 
 const router = useRouter();
-const crons = ref<CronRow[]>([]);
+const skills = ref<SkillRow[]>([]);
 const loading = ref(false);
 const loadError = ref("");
 
@@ -22,20 +23,20 @@ async function load(): Promise<void> {
   loading.value = true;
   loadError.value = "";
   try {
-    const body = await getJson<CronsResponse>("/api/crons");
-    crons.value = body.crons ?? [];
+    const body = await mockListSkills();
+    skills.value = body.skills ?? [];
   } catch (e) {
-    loadError.value = e instanceof ApiRequestError ? e.message : "Could not load crons.";
+    loadError.value = e instanceof Error ? e.message : "Could not load skills.";
   } finally {
     loading.value = false;
   }
 }
 
-function open(id: number): void {
-  void router.push({ name: "cron-detail", params: { id: String(id) } });
+function open(name: string): void {
+  void router.push({ name: "skill-detail", params: { name } });
 }
 function create(): void {
-  void router.push({ name: "cron-new" });
+  void router.push({ name: "skill-new" });
 }
 
 onMounted(load);
@@ -47,46 +48,42 @@ onMounted(load);
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
         Refresh
       </Button>
-      <Button variant="primary" size="sm" icon="plus" @click="create">New schedule</Button>
+      <Button variant="primary" size="sm" icon="plus" @click="create">Add skill</Button>
     </template>
 
     <div v-if="loadError" class="banner err">{{ loadError }}</div>
 
-    <div v-if="loading && crons.length === 0" class="loading-row">Loading schedules…</div>
+    <div v-if="loading && skills.length === 0" class="loading-row">Loading skills…</div>
 
     <EmptyState
-      v-else-if="crons.length === 0"
-      icon="cron"
-      title="No schedules"
-      desc="Create a schedule to run the agent on a recurring basis — it commits to a branch and opens issues with its findings."
+      v-else-if="skills.length === 0"
+      icon="book"
+      title="No skills"
+      desc="Skills are markdown instructions (SKILL.md) that the agent loads to learn a workflow. Add one to teach the agent a new behavior."
     >
-      <Button variant="primary" icon="plus" @click="create">New schedule</Button>
+      <Button variant="primary" icon="plus" @click="create">Add skill</Button>
     </EmptyState>
 
     <div v-else class="table-wrap">
       <table class="table">
         <thead>
           <tr>
-            <th class="col-status">State</th>
             <th>Name</th>
-            <th class="col-sched">Schedule</th>
-            <th class="col-repo">Repository</th>
-            <th class="col-next">Next run</th>
+            <th>Description</th>
+            <th class="col-source">Source</th>
+            <th class="col-updated">Updated</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="c in crons" :key="c.id" class="row" @click="open(c.id)">
+          <tr v-for="s in skills" :key="s.name" class="row" @click="open(s.name)">
             <td>
-              <StatusPill :status="c.enabled ? 'enabled' : 'disabled'" />
+              <span class="skill-name mono">{{ s.name }}</span>
             </td>
-            <td>
-              <span class="cron-name">{{ c.name }}</span>
+            <td class="muted ellipsis">{{ s.description }}</td>
+            <td class="col-source">
+              <span class="badge" :class="s.source">{{ s.source }}</span>
             </td>
-            <td class="col-sched">
-              <code class="tag">{{ cronScheduleText(c.cron_expression) }}</code>
-            </td>
-            <td class="col-repo muted ellipsis">{{ c.repo }}</td>
-            <td class="col-next muted">{{ c.next_run_at ? c.next_run_at.replace("T", " ").slice(0, 16) : "—" }}</td>
+            <td class="col-updated muted">{{ s.updated_at ? s.updated_at.replace("T", " ").slice(0, 16) : "—" }}</td>
           </tr>
         </tbody>
       </table>
@@ -148,22 +145,31 @@ tbody tr:last-child td {
 .row:hover {
   background: var(--surface-3);
 }
-.cron-name {
+.skill-name {
   font-weight: var(--weight-medium);
   color: var(--text);
 }
-.tag {
-  font-family: var(--font-mono);
+.badge {
   font-size: var(--text-xs);
-  background: var(--surface-4);
-  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
   padding: 2px 7px;
   border-radius: var(--radius-sm);
+  background: var(--surface-4);
+  color: var(--text-3);
 }
-.col-status,
-.col-sched,
-.col-repo,
-.col-next {
+.badge.bundled {
+  background: var(--accent-weak);
+  color: var(--accent);
+}
+.col-source,
+.col-updated {
+  white-space: nowrap;
+}
+.ellipsis {
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 </style>

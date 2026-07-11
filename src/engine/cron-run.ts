@@ -377,15 +377,16 @@ export async function runCronJob(
       const issueTitle = errored
         ? templateTitle(input.prompt)
         : await generateIssueTitle(agentAnswer ?? "", input.prompt, config, profile);
-      // Ensure the agent-name label exists with the brand teal color so cron
+      // Ensure the cron-issue label exists with the brand teal color so cron
       // output issues are visually identifiable in a triage list. Idempotent.
+      const cronLabel = `${config.agent_name}-Issue`;
       await gh.ensureLabel(
         input.repo,
-        config.agent_name,
+        cronLabel,
         CRON_LABEL_COLOR,
-        `${config.agent_name} cron output`,
+        `${config.agent_name}-Agent scheduled job result`,
       );
-      const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [config.agent_name]);
+      const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [cronLabel]);
       log_.info({ issue: issue.number, url: issue.html_url, errored }, "opened cron output issue");
 
       if (runStore) {

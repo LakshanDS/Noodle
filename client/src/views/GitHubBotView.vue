@@ -1,11 +1,10 @@
 <script setup lang="ts">
 /**
- * Settings — sectioned cards for editing DB-backed instance secrets. Catalog-
- * driven from the server; secret fields mask on GET and send only when edited.
- * A top banner surfaces after a write, flagging whether a restart is needed.
- *
- * GitHub bot credentials live in their own tab (GitHubBotView); the GitHub
- * keys are filtered out here so they aren't editable in two places.
+ * GitHub bot — credentials the agent uses to talk to GitHub. Same DB-backed
+ * settings store as the Settings page (GET/PUT /api/settings), filtered to the
+ * GitHub keys only (GITHUB_* + NOODLE_LOGIN). Secrets mask on GET and send only
+ * when edited. All of these require a restart to take effect — they're read once
+ * at boot — so a restart banner shows after every successful save.
  */
 import { computed, onMounted, reactive, ref } from "vue";
 import { getJson, sendJson, ApiRequestError } from "../api/client.js";
@@ -15,7 +14,6 @@ import Button from "../components/ui/Button.vue";
 import Card from "../components/ui/Card.vue";
 import Field from "../components/ui/Field.vue";
 import Icon from "../components/ui/Icon.vue";
-import type { IconName } from "../components/ui/Icon.vue";
 
 interface FieldState {
   meta: SettingMeta;
@@ -26,34 +24,16 @@ interface FieldState {
 
 const catalog = ref<SettingMeta[]>([]);
 const fields = reactive<Record<string, FieldState>>({});
-const restartKeys = ref<string[]>([]);
 const loading = ref(false);
 const saving = ref(false);
 const banner = ref<{ kind: "ok" | "warn" | "err"; text: string } | null>(null);
 
-// Group icon + copy for each section.
-const SECTIONS = [
-  { key: "llm", title: "LLM API keys", icon: "key" as IconName, desc: "Provider keys, read per-request. New runs pick these up immediately — no restart needed." },
-  { key: "access", title: "Dashboard access", icon: "lock" as IconName, desc: "The dashboard password and the agent's GitHub login. Restart required." },
-];
-
-/** GitHub keys are owned by the GitHub bot tab — exclude them here. */
+/** A key belongs here if it's a GitHub credential or the agent's bot login. */
 function isGithubKey(key: string): boolean {
   return key.startsWith("GITHUB_") || key === "NOODLE_LOGIN";
 }
 
-function sectionOf(meta: SettingMeta): string {
-  if (meta.key.endsWith("_API_KEY") && !meta.key.startsWith("GITHUB_")) return "llm";
-  if (meta.key.startsWith("NOODLE_")) return "access";
-  return "llm";
-}
-
-const grouped = computed(() =>
-  SECTIONS.map((s) => ({
-    ...s,
-    items: catalog.value.filter((m) => !isGithubKey(m.key) && sectionOf(m) === s.key),
-  })).filter((s) => s.items.length > 0),
-);
+const githubKeys = computed(() => catalog.value.filter((m) => isGithubKey(m.key)));
 
 async function load(): Promise<void> {
   loading.value = true;
@@ -61,10 +41,8 @@ async function load(): Promise<void> {
   try {
     const body = await getJson<SettingsResponse>("/api/settings");
     catalog.value = body.catalog;
-    restartKeys.value = body.restartKeys;
-    // Reset fields map.
     for (const k of Object.keys(fields)) delete fields[k];
-    for (const meta of body.catalog.filter((m) => !isGithubKey(m.key))) {
+    for (const meta of body.catalog.filter((m) => isGithubKey(m.key))) {
       fields[meta.key] = {
         meta,
         value: body.values[meta.key] ?? "",
@@ -73,7 +51,7 @@ async function load(): Promise<void> {
       };
     }
   } catch (e) {
-    banner.value = { kind: "err", text: e instanceof ApiRequestError ? e.message : "Could not load settings." };
+    banner.value = { kind: "err", text: e instanceof ApiRequestError ? e.message : "Could not load GitHub settings." };
   } finally {
     loading.value = false;
   }
@@ -97,6 +75,7 @@ async function save(): Promise<void> {
   }
   try {
     const body = await sendJson<SettingsPutResponse>("/api/settings", "PUT", { values });
+    // Every GitHub key is restart-required, so this always warns.
     banner.value = body.needsRestart
       ? { kind: "warn", text: `Saved. Restart Noodle to apply: ${body.restartKeys.join(", ")}.` }
       : { kind: "ok", text: "Saved." };
@@ -130,27 +109,42 @@ onMounted(load);
       <span>{{ banner.text }}</span>
     </div>
 
-    <div v-if="loading" class="loading-row">Loading settings…</div>
+    <div v-if="loading" class="loading-row">Loading GitHub settings…</div>
 
     <div v-else class="sections">
-      <Card v-for="section in grouped" :key="section.key">
+      <Card>
         <template #header>
           <div class="sec-head">
-            <span class="sec-icon"><Icon :name="section.icon" :size="15" /></span>
-            <h3 class="sec-title">{{ section.title }}</h3>
+            <span class="sec-icon"><Icon name="github" :size="15" /></span>
+            <h3 class="sec-title">GitHub credentials</h3>
           </div>
         </template>
 
-        <p class="sec-desc">{{ section.desc }}</p>
+        <p class="sec-desc">
+          Credentials the agent uses to clone, push, and open PRs. Use either a Personal Access
+          Token (PAT) or a GitHub App (App ID + private key). Real environment variables override
+          values stored here.
+        </p>
 
         <Field
-          v-for="meta in section.items"
+          v-for="meta in githubKeys"
           :key="meta.key"
           :label="meta.label"
           :hint="meta.hint"
         >
           <div class="input-row">
+            <textarea
+              v-if="meta.key === 'GITHUB_PRIVATE_KEY'"
+              v-model="fields[meta.key]!.value"
+              :type="fields[meta.key]?.revealed ? 'text' : 'password'"
+              class="ctrl mono key-area"
+              :placeholder="meta.secret ? 'Not set' : ''"
+              autocomplete="off"
+              rows="4"
+              @input="onInput(meta.key)"
+            />
             <input
+              v-else
               v-model="fields[meta.key]!.value"
               :type="!meta.secret || fields[meta.key]?.revealed ? 'text' : 'password'"
               class="ctrl"
@@ -160,7 +154,7 @@ onMounted(load);
               @input="onInput(meta.key)"
             />
             <button
-              v-if="meta.secret && fields[meta.key]?.value"
+              v-if="meta.secret && fields[meta.key]?.value && meta.key !== 'GITHUB_PRIVATE_KEY'"
               class="reveal"
               type="button"
               @click="toggleReveal(meta.key)"
@@ -175,8 +169,7 @@ onMounted(load);
       </Card>
 
       <p class="foot-note">
-        Real environment variables always override values stored here. Edit
-        <code>noodle.config.yaml</code> for profiles, routing rules, and triggers.
+        All of these are read once at boot, so changes take effect after a restart.
       </p>
     </div>
   </AppShell>
@@ -250,6 +243,10 @@ onMounted(load);
 .input-row .ctrl {
   padding-right: 64px;
 }
+.input-row .key-area {
+  padding-right: var(--space-3);
+  resize: vertical;
+}
 .reveal {
   position: absolute;
   right: 8px;
@@ -283,12 +280,5 @@ onMounted(load);
   color: var(--text-3);
   line-height: var(--leading-normal);
   padding: 0 var(--space-2);
-}
-.foot-note code {
-  font-family: var(--font-mono);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
 }
 </style>

@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
 import { CronStore } from "../src/server/cron-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
+import { ProfileStore } from "../src/server/profile-store.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
 import { createWebhookApp } from "../src/server/http.js";
 import { signToken } from "../src/server/ui-auth.js";
@@ -55,6 +56,7 @@ function makeApp() {
     secret: PASSWORD,
     cronStore,
     settingsStore,
+    profileStore: ProfileStore.fromDb(db),
     // Stubs for deps not exercised by these tests:
     queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
     authProvider: {} as never,

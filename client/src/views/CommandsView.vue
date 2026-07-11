@@ -1,20 +1,22 @@
 <script setup lang="ts">
 /**
- * Crons list — a table of scheduled jobs inside the app shell. Each row opens
- * the editor; the "New cron" action in the top bar opens the create form.
+ * Commands list — a table of user-defined slash commands inside the app shell.
+ * Each row opens the editor; the "New command" action opens the create form.
+ *
+ * MOCK ONLY: backed by src/lib/mock.ts until the command-store/API lands. Swap
+ * mockListCommands → getJson<CommandsResponse>("/api/commands") to migrate.
  */
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { getJson, ApiRequestError } from "../api/client.js";
-import type { CronsResponse, CronRow } from "../api/types.js";
-import { cronScheduleText } from "../lib/format.js";
+import { mockListCommands } from "../lib/mock.js";
+import type { CommandRow } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import StatusPill from "../components/ui/StatusPill.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
 
 const router = useRouter();
-const crons = ref<CronRow[]>([]);
+const commands = ref<CommandRow[]>([]);
 const loading = ref(false);
 const loadError = ref("");
 
@@ -22,20 +24,20 @@ async function load(): Promise<void> {
   loading.value = true;
   loadError.value = "";
   try {
-    const body = await getJson<CronsResponse>("/api/crons");
-    crons.value = body.crons ?? [];
+    const body = await mockListCommands();
+    commands.value = body.commands ?? [];
   } catch (e) {
-    loadError.value = e instanceof ApiRequestError ? e.message : "Could not load crons.";
+    loadError.value = e instanceof Error ? e.message : "Could not load commands.";
   } finally {
     loading.value = false;
   }
 }
 
 function open(id: number): void {
-  void router.push({ name: "cron-detail", params: { id: String(id) } });
+  void router.push({ name: "command-detail", params: { id: String(id) } });
 }
 function create(): void {
-  void router.push({ name: "cron-new" });
+  void router.push({ name: "command-new" });
 }
 
 onMounted(load);
@@ -47,20 +49,20 @@ onMounted(load);
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
         Refresh
       </Button>
-      <Button variant="primary" size="sm" icon="plus" @click="create">New schedule</Button>
+      <Button variant="primary" size="sm" icon="plus" @click="create">New command</Button>
     </template>
 
     <div v-if="loadError" class="banner err">{{ loadError }}</div>
 
-    <div v-if="loading && crons.length === 0" class="loading-row">Loading schedules…</div>
+    <div v-if="loading && commands.length === 0" class="loading-row">Loading commands…</div>
 
     <EmptyState
-      v-else-if="crons.length === 0"
-      icon="cron"
-      title="No schedules"
-      desc="Create a schedule to run the agent on a recurring basis — it commits to a branch and opens issues with its findings."
+      v-else-if="commands.length === 0"
+      icon="bolt"
+      title="No slash commands"
+      desc="Define a slash command like /question or /search. Typing it in a GitHub issue wakes the agent with your custom instructions."
     >
-      <Button variant="primary" icon="plus" @click="create">New schedule</Button>
+      <Button variant="primary" icon="plus" @click="create">New command</Button>
     </EmptyState>
 
     <div v-else class="table-wrap">
@@ -68,25 +70,25 @@ onMounted(load);
         <thead>
           <tr>
             <th class="col-status">State</th>
+            <th class="col-trigger">Trigger</th>
             <th>Name</th>
-            <th class="col-sched">Schedule</th>
-            <th class="col-repo">Repository</th>
-            <th class="col-next">Next run</th>
+            <th>Description</th>
+            <th class="col-profile">Profile</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="c in crons" :key="c.id" class="row" @click="open(c.id)">
+          <tr v-for="c in commands" :key="c.id" class="row" @click="open(c.id)">
             <td>
               <StatusPill :status="c.enabled ? 'enabled' : 'disabled'" />
             </td>
+            <td class="col-trigger">
+              <code class="tag">/{{ c.trigger }}</code>
+            </td>
             <td>
-              <span class="cron-name">{{ c.name }}</span>
+              <span class="cmd-name">{{ c.name }}</span>
             </td>
-            <td class="col-sched">
-              <code class="tag">{{ cronScheduleText(c.cron_expression) }}</code>
-            </td>
-            <td class="col-repo muted ellipsis">{{ c.repo }}</td>
-            <td class="col-next muted">{{ c.next_run_at ? c.next_run_at.replace("T", " ").slice(0, 16) : "—" }}</td>
+            <td class="muted ellipsis">{{ c.description }}</td>
+            <td class="col-profile muted">{{ c.profile ?? "Default" }}</td>
           </tr>
         </tbody>
       </table>
@@ -148,7 +150,7 @@ tbody tr:last-child td {
 .row:hover {
   background: var(--surface-3);
 }
-.cron-name {
+.cmd-name {
   font-weight: var(--weight-medium);
   color: var(--text);
 }
@@ -161,9 +163,14 @@ tbody tr:last-child td {
   border-radius: var(--radius-sm);
 }
 .col-status,
-.col-sched,
-.col-repo,
-.col-next {
+.col-trigger,
+.col-profile {
+  white-space: nowrap;
+}
+.ellipsis {
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 </style>

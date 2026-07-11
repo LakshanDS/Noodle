@@ -20,7 +20,7 @@ import {
   requireAuth,
   verifyPassword,
 } from "./ui-auth.js";
-import { log } from "../util/log.js";
+import { log, getRecentLogs } from "../util/log.js";
 
 /**
  * Register the web UI routes on an existing Fastify app: the HTML shell at
@@ -39,6 +39,11 @@ import { log } from "../util/log.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // dist/server/ui-routes.js → ../../public (repo root's public/).
 const HTML_PATH = join(__dirname, "..", "..", "public", "index.html");
+
+/** Pino level → numeric, for `?level=` filtering on GET /api/logs. */
+const LEVEL_ORDER: Record<string, number> = {
+  trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60,
+};
 
 export interface UiDeps {
   runStore: RunStore;
@@ -215,6 +220,25 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       log.warn({ err: e, jobId: id }, "could not remove cooking label after cancel");
     }
     return { ok: true };
+  });
+
+  // --- System log (in-memory ring buffer; mirrors `docker logs`). Auth-guarded. ---
+  // Returns the most recent captured log lines, newest-first by default. The
+  // buffer is tee'd from pino's stdout destination (see util/log.ts), so this is
+  // the same output `docker logs` shows — bounded to the last LOG_BUFFER_MAX
+  // lines and cleared on each boot. Optional `?limit=N` caps the count; optional
+  // `?level=warn` filters to that severity and above (trace<debug<info<warn<error<fatal).
+  app.get("/api/logs", { preHandler: auth }, async (req) => {
+    const q = req.query as { limit?: string; level?: string };
+    let limit: number | undefined;
+    if (q.limit) {
+      const n = parseInt(q.limit, 10);
+      if (Number.isFinite(n) && n > 0) limit = n;
+    }
+    const entries = getRecentLogs(limit);
+    const minLevel = LEVEL_ORDER[q.level?.toLowerCase() ?? ""] ?? 0;
+    const filtered = minLevel > 0 ? entries.filter((e) => e.level >= minLevel) : entries;
+    return { entries: filtered.reverse() };
   });
 
   // --- Cron job management (all auth-guarded). ---

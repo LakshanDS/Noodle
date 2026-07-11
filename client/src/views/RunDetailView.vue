@@ -239,7 +239,7 @@ onMounted(load);
   flex-direction: column;
   gap: var(--space-4);
   position: sticky;
-  top: calc(var(--topbar-h) + var(--space-6));
+  top: var(--space-6);
 }
 .facts {
   margin: 0;

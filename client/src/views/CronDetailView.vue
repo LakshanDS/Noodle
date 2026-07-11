@@ -186,7 +186,7 @@ onMounted(async () => {
     <div v-else class="cron-layout">
       <!-- Form -->
       <div class="form-col">
-        <Card :title="editing ? 'Edit cron' : 'New cron'">
+        <Card :title="editing ? 'Edit schedule' : 'New schedule'">
           <div v-if="errorMsg" class="banner err">{{ errorMsg }}</div>
 
           <Field label="Name">
@@ -272,7 +272,7 @@ onMounted(async () => {
   flex-direction: column;
   gap: var(--space-4);
   position: sticky;
-  top: calc(var(--topbar-h) + var(--space-6));
+  top: var(--space-6);
 }
 .banner {
   padding: var(--space-3) var(--space-4);

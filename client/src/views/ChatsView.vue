@@ -1,20 +1,20 @@
 <script setup lang="ts">
 /**
- * Crons list — a table of scheduled jobs inside the app shell. Each row opens
- * the editor; the "New cron" action in the top bar opens the create form.
+ * Chats list — a mock-backed list of agent conversations. Mirrors the CronsView
+ * pattern (AppShell + #actions + three-state body) but pulls from the in-memory
+ * mock store instead of the real API. Each row opens the full thread in
+ * ChatDetailView. Swap `mock*` for real `getJson` calls once the backend lands.
  */
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { getJson, ApiRequestError } from "../api/client.js";
-import type { CronsResponse, CronRow } from "../api/types.js";
-import { cronScheduleText } from "../lib/format.js";
+import { mockListChats, type MockChat } from "../lib/mock.js";
+import { fmtTime } from "../lib/format.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
-import StatusPill from "../components/ui/StatusPill.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
 
 const router = useRouter();
-const crons = ref<CronRow[]>([]);
+const chats = ref<MockChat[]>([]);
 const loading = ref(false);
 const loadError = ref("");
 
@@ -22,20 +22,20 @@ async function load(): Promise<void> {
   loading.value = true;
   loadError.value = "";
   try {
-    const body = await getJson<CronsResponse>("/api/crons");
-    crons.value = body.crons ?? [];
-  } catch (e) {
-    loadError.value = e instanceof ApiRequestError ? e.message : "Could not load crons.";
+    const body = await mockListChats();
+    chats.value = body.chats ?? [];
+  } catch {
+    loadError.value = "Could not load chats.";
   } finally {
     loading.value = false;
   }
 }
 
-function open(id: number): void {
-  void router.push({ name: "cron-detail", params: { id: String(id) } });
+function open(id: string): void {
+  void router.push({ name: "chat-detail", params: { id } });
 }
 function create(): void {
-  void router.push({ name: "cron-new" });
+  void router.push({ name: "chat-new" });
 }
 
 onMounted(load);
@@ -47,46 +47,41 @@ onMounted(load);
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
         Refresh
       </Button>
-      <Button variant="primary" size="sm" icon="plus" @click="create">New schedule</Button>
+      <Button variant="primary" size="sm" icon="plus" @click="create">New chat</Button>
     </template>
 
     <div v-if="loadError" class="banner err">{{ loadError }}</div>
 
-    <div v-if="loading && crons.length === 0" class="loading-row">Loading schedules…</div>
+    <div v-if="loading && chats.length === 0" class="loading-row">Loading chats…</div>
 
     <EmptyState
-      v-else-if="crons.length === 0"
-      icon="cron"
-      title="No schedules"
-      desc="Create a schedule to run the agent on a recurring basis — it commits to a branch and opens issues with its findings."
+      v-else-if="chats.length === 0"
+      icon="message"
+      title="No chats yet"
+      desc="Start a conversation with the agent and it will appear here."
     >
-      <Button variant="primary" icon="plus" @click="create">New schedule</Button>
+      <Button variant="primary" icon="plus" @click="create">New chat</Button>
     </EmptyState>
 
     <div v-else class="table-wrap">
       <table class="table">
         <thead>
           <tr>
-            <th class="col-status">State</th>
-            <th>Name</th>
-            <th class="col-sched">Schedule</th>
-            <th class="col-repo">Repository</th>
-            <th class="col-next">Next run</th>
+            <th class="col-status"></th>
+            <th>Conversation</th>
+            <th class="col-time">Last active</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="c in crons" :key="c.id" class="row" @click="open(c.id)">
+          <tr v-for="c in chats" :key="c.id" class="row" @click="open(c.id)">
+            <td class="col-status"><span class="dot" /></td>
             <td>
-              <StatusPill :status="c.enabled ? 'enabled' : 'disabled'" />
+              <div class="chat-cell">
+                <span class="chat-title">{{ c.title }}</span>
+                <span class="chat-preview">{{ c.preview || "No messages yet" }}</span>
+              </div>
             </td>
-            <td>
-              <span class="cron-name">{{ c.name }}</span>
-            </td>
-            <td class="col-sched">
-              <code class="tag">{{ cronScheduleText(c.cron_expression) }}</code>
-            </td>
-            <td class="col-repo muted ellipsis">{{ c.repo }}</td>
-            <td class="col-next muted">{{ c.next_run_at ? c.next_run_at.replace("T", " ").slice(0, 16) : "—" }}</td>
+            <td class="col-time muted">{{ fmtTime(c.updated_at) }}</td>
           </tr>
         </tbody>
       </table>
@@ -105,12 +100,14 @@ onMounted(load);
   background: var(--danger-weak);
   color: var(--danger);
 }
+
 .loading-row {
   padding: var(--space-12);
   text-align: center;
   color: var(--text-3);
   font-size: var(--text-sm);
 }
+
 .table-wrap {
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -148,22 +145,38 @@ tbody tr:last-child td {
 .row:hover {
   background: var(--surface-3);
 }
-.cron-name {
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+}
+
+.chat-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.chat-title {
   font-weight: var(--weight-medium);
   color: var(--text);
 }
-.tag {
-  font-family: var(--font-mono);
+.chat-preview {
   font-size: var(--text-xs);
-  background: var(--surface-4);
-  color: var(--text-2);
-  padding: 2px 7px;
-  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 520px;
 }
-.col-status,
-.col-sched,
-.col-repo,
-.col-next {
+
+.col-status {
+  width: 1%;
+  white-space: nowrap;
+}
+.col-time {
   white-space: nowrap;
 }
 </style>

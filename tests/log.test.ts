@@ -30,6 +30,24 @@ async function loadLog() {
   return { mod, output: () => chunks.join(""), spy };
 }
 
+/**
+ * Like loadLog, but also exposes getRecentLogs so we can assert on the ring
+ * buffer contents (the dashboard's System log source). Same stdout spy.
+ */
+async function loadLogWithBuffer() {
+  const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    chunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+    return true;
+  });
+  const mod = await import("../src/util/log.js");
+  return {
+    mod,
+    output: () => chunks.join(""),
+    getRecentLogs: mod.getRecentLogs,
+    spy,
+  };
+}
+
 describe("log", () => {
   it("renders a human-readable line: [timestamp] LEVEL: message", async () => {
     const { mod, output } = await loadLog();
@@ -75,6 +93,21 @@ describe("log", () => {
     expect(out).toMatch(/\bINFO: i/);
     expect(out).toMatch(/\bWARN: w/);
     expect(out).toMatch(/\bERROR: e/);
+  });
+
+  it("captures every line into the ring buffer when pino batches multiple records per write", async () => {
+    // Pino may coalesce several log calls into one Writable.write() call — the
+    // chunk arrives as newline-delimited JSON. Each record must still reach the
+    // buffer (and stdout) individually, not just the first parseable line.
+    process.env.LOG_LEVEL = "info";
+    const { mod, getRecentLogs } = await loadLogWithBuffer();
+    mod.log.info("first");
+    mod.log.info("second");
+    mod.log.info("third");
+    const msgs = getRecentLogs().map((e) => e.msg);
+    expect(msgs).toContain("first");
+    expect(msgs).toContain("second");
+    expect(msgs).toContain("third");
   });
 });
 

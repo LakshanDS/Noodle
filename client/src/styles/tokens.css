@@ -1,70 +1,65 @@
 /*
  * Noodle dashboard — design tokens.
  *
- * Aesthetic: "developer premium," dark-only. Near-black canvas, glassy elevated
- * surfaces, a single violet accent, hairline borders, refined type. Inspired by
- * Linear / Vercel / Raycast. Every color, size, and motion value flows from
- * these custom properties so the whole UI stays coherent and themeable in one
- * place.
+ * Aesthetic: warm monochrome, dark-only. A soft-black canvas (#1C1C1C) with
+ * silver copy (#C0C0C0) and a single warm cream accent (#F0EAD6) — no blue,
+ * no purple. Hairline borders, refined type. Every color, size, and motion
+ * value flows from these custom properties so the whole UI stays coherent and
+ * themeable in one place.
  *
  * Color naming is semantic (surface-0, surface-1, border, text, …) not literal
- * (#161b22) so components read by intent and a future re-skin only touches this
- * file. Opacity tints (--accent-*) are used for subtle backgrounds / glows so
- * the accent never appears as a flat fill where a tint reads better.
+ * so components read by intent and a future re-skin only touches this file.
+ * Opacity tints (--accent-*) are used for subtle backgrounds / glows so the
+ * accent never appears as a flat fill where a tint reads better.
  */
 
 :root {
-  /* --- Surfaces (dark, each step lifts off the last) --- */
-  --surface-0: #08080c; /* app canvas — the deepest layer */
-  --surface-1: #0e0e14; /* sidebar / panels */
-  --surface-2: #14141c; /* cards, elevated content */
-  --surface-3: #1b1b25; /* inputs, hover, nested */
-  --surface-4: #23232f; /* active, pressed */
+  /* --- Surfaces (dark neutral grey ramp off #1C1C1C, each step lifts) --- */
+  --surface-0: #1c1c1c; /* app canvas — the deepest layer */
+  --surface-1: #242424; /* sidebar / panels */
+  --surface-2: #2c2c2c; /* cards, elevated content */
+  --surface-3: #343434; /* inputs, hover, nested */
+  --surface-4: #3c3c3c; /* active, pressed */
 
   /* --- Borders / dividers --- */
-  --border: #23232f; /* hairline between elements */
-  --border-strong: #34343f; /* emphasis borders (focus-adjacent, popovers) */
-  --border-subtle: #1a1a23; /* very faint separators */
+  --border: #383838; /* hairline between elements */
+  --border-strong: #4a4a4a; /* emphasis borders (focus-adjacent, popovers) */
+  --border-subtle: #2a2a2a; /* very faint separators */
 
-  /* --- Text --- */
-  --text: #ecedf1; /* primary copy */
-  --text-2: #a4a6b0; /* secondary labels, metadata */
-  --text-3: #6b6d78; /* tertiary hints, placeholders */
-  --text-inverse: #08080c; /* text on accent fills */
+  /* --- Text (silver ramp) --- */
+  --text: #dcdcdc; /* primary copy */
+  --text-2: #c0c0c0; /* secondary labels, metadata */
+  --text-3: #828282; /* tertiary hints, placeholders */
+  --text-inverse: #1c1c1c; /* text on accent fills */
 
-  /* --- Accent (single violet) --- */
-  --accent: #7c5cfc; /* primary actions, active states */
-  --accent-hover: #8d70fd; /* hover lift */
-  --accent-active: #6a47f6; /* pressed */
-  --accent-weak: rgba(124, 92, 252, 0.14); /* tinted backgrounds */
-  --accent-weaker: rgba(124, 92, 252, 0.08); /* ghost fills */
-  --accent-ring: rgba(124, 92, 252, 0.38); /* focus ring */
+  /* --- Accent (warm cream) --- */
+  --accent: #f0ead6; /* primary actions, active states */
+  --accent-hover: #f5f0e0; /* hover lift */
+  --accent-active: #e3dcc4; /* pressed */
+  --accent-weak: rgba(240, 234, 214, 0.14); /* tinted backgrounds */
+  --accent-weaker: rgba(240, 234, 214, 0.08); /* ghost fills */
+  --accent-ring: rgba(240, 234, 214, 0.35); /* focus ring */
 
-  /* --- Status colors (used sparingly, only for state) --- */
-  --success: #4ade80;
-  --success-weak: rgba(74, 222, 128, 0.14);
-  --warning: #fbbf24;
-  --warning-weak: rgba(251, 191, 36, 0.14);
-  --danger: #f87171;
-  --danger-weak: rgba(248, 113, 113, 0.14);
-  --info: #60a5fa;
-  --info-weak: rgba(96, 165, 250, 0.14);
-  --neutral: #8b8d98; /* "no changes" / idle */
-  --neutral-weak: rgba(139, 141, 152, 0.14);
+  /* --- Status colors (muted, no blue — used sparingly for state only) --- */
+  --success: #6fae6f;
+  --success-weak: rgba(111, 174, 111, 0.14);
+  --warning: #d4a942;
+  --warning-weak: rgba(212, 169, 66, 0.14);
+  --danger: #c76b6b;
+  --danger-weak: rgba(199, 107, 107, 0.14);
+  --neutral: #8b8b8b; /* "no changes" / idle */
+  --neutral-weak: rgba(139, 139, 139, 0.14);
 
   /* --- Type --- */
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 
-  /* Compact, information-dense scale (Linear-ish). */
-  --text-xs: 11px;
-  --text-sm: 13px;
-  --text-base: 14px;
-  --text-md: 15px;
-  --text-lg: 17px;
-  --text-xl: 20px;
-  --text-2xl: 24px;
-  --text-3xl: 30px;
+  /* Compact, information-dense scale. Five steps keep the UI coherent. */
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-md: 16px;
+  --text-xl: 21px;
+  --text-3xl: 32px;
 
   --leading-tight: 1.25;
   --leading-normal: 1.5;
@@ -116,6 +111,5 @@
 
   /* --- Layout --- */
   --sidebar-w: 232px;
-  --topbar-h: 56px;
   --content-max: 1240px;
 }

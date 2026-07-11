@@ -108,6 +108,101 @@ export interface CronInput {
   profile: string | null;
 }
 
+/* ----- Slash commands (mock until the backend store lands) ----- */
+
+/**
+ * A user-defined slash command. When someone types `/<trigger>` in a GitHub
+ * issue/comment, the agent wakes with `system_prompt` as its custom
+ * instructions. Mirrors what a future command-store row will look like.
+ */
+export interface CommandRow {
+  id: number;
+  /** Trigger word without the leading slash, e.g. "question". */
+  trigger: string;
+  name: string;
+  description: string;
+  /** The custom instructions the agent wakes up with. */
+  system_prompt: string;
+  profile: string | null;
+  enabled: number; // 0 | 1
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CommandsResponse {
+  commands: CommandRow[];
+}
+export interface CommandDetailResponse {
+  command: CommandRow;
+}
+export interface CommandMutationResponse {
+  command: CommandRow;
+}
+
+/** Payload for creating/updating a command. */
+export interface CommandInput {
+  trigger: string;
+  name: string;
+  description: string;
+  system_prompt: string;
+  profile: string | null;
+}
+
+/* ----- Skills (mock until the SKILL.md read/write layer lands) ----- */
+
+/**
+ * A skill — mirrors the frontmatter + body of a bundled SKILL.md file. Keyed by
+ * name (the folder identifier), like profiles are keyed by name.
+ */
+export interface SkillRow {
+  /** Folder / frontmatter name, e.g. "noodle-fix". */
+  name: string;
+  description: string;
+  /** SKILL.md markdown body (everything below the frontmatter). */
+  body: string;
+  /** "bundled" for the seeded built-ins, "custom" for UI-created skills. */
+  source: "bundled" | "custom";
+  updated_at: string;
+}
+
+export interface SkillsResponse {
+  skills: SkillRow[];
+}
+export interface SkillDetailResponse {
+  skill: SkillRow;
+}
+export interface SkillMutationResponse {
+  skill: SkillRow;
+}
+
+/** Payload for creating/updating a skill. */
+export interface SkillInput {
+  name: string;
+  description: string;
+  body: string;
+}
+
+/* ----- System log (in-memory ring buffer; mirrors `docker logs`) ----- */
+
+/** One captured log line from the server's pino ring buffer. */
+export interface LogEntry {
+  /** ISO timestamp (UTC, no trailing Z) — same string the pretty line shows. */
+  ts: string;
+  /** Numeric pino level (10 trace … 60 fatal). */
+  level: number;
+  /** Uppercase level label (INFO, WARN, …). */
+  levelLabel: string;
+  /** The log message. */
+  msg: string;
+  /** Trailing per-event fields, stringified (key → value). */
+  fields: Record<string, string>;
+}
+
+export interface LogsResponse {
+  /** Entries newest-first. */
+  entries: LogEntry[];
+}
+
 /* ----- Settings (DB-backed instance secrets) ----- */
 
 /** One entry in the settings catalog — tells the UI how to render the field. */

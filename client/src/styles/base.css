@@ -22,7 +22,7 @@ body {
   background: var(--surface-0);
   color: var(--text);
   font-family: var(--font-sans);
-  font-size: var(--text-base);
+  font-size: var(--text-md);
   line-height: var(--leading-normal);
   letter-spacing: var(--tracking-tight);
   -webkit-font-smoothing: antialiased;
