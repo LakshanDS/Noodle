@@ -62,6 +62,20 @@ export function labelsFor(agentName: string) {
 /** Default labels using the built-in agent name. */
 export const LABELS = labelsFor("Noodle");
 
+/**
+ * Session restart loop: when session.prompt() throws after pi's own 5-attempt
+ * retry is exhausted, we reopen the SAME session file (full context survives on
+ * disk), create a fresh session, and try again. This catches sustained provider
+ * outages that outlast both the forwarder's 429-absorption and pi's internal
+ * retry. Flat 2-minute backoff between each restart.
+ */
+const SESSION_RESTART_ATTEMPTS = 3;
+const SESSION_RESTART_DELAY_MS = 120_000; // 2 minutes
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export interface RunInput {
   repo: string; // owner/name
   issueNumber: number;
@@ -353,65 +367,94 @@ export async function runJob(
     // survives workspace disposal — so the full conversation (messages, tool
     // calls, tool results) is on disk for resume/inspection without us having
     // to log it ourselves. The runs row (if any) points at the session file.
+    //
+    // The prompt runs in a restart loop: if session.prompt() throws (after pi's
+    // own 5-attempt retry exhausted), we dispose the session, wait 2 minutes,
+    // reopen the SAME session file (full context survives on disk), create a
+    // fresh session, and try again. Up to 3 restarts before giving up.
     const sessionDir = sessionsDirFor(jobId);
-    const sessionManager = SessionManager.create(ws.path, sessionDir);
     const create = deps?.createAgentSessionFn ?? createAgentSession;
-    const { session } = await create({
+    const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
+    const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+    const sessionCreateOpts = {
       cwd: ws.path,
       model,
       authStorage,
       modelRegistry,
-      sessionManager,
       settingsManager,
       resourceLoader: loader,
       // Forward the profile's thinking level. pi-ai clamps it to what the model
       // supports (gated on model.reasoning === true), so passing "medium" to a
-      // non-reasoning model (gpt-4o) is a safe no-op. Custom endpoints must set
-      // `reasoning: true` in the profile config for this to take effect.
+      // non-reasoning model (gpt-4o) is a safe no-op.
       thinkingLevel: profile.thinking_level,
       tools: profile.tools,
       customTools: [
         createCommentOnIssueTool(gh, input.repo, input.issueNumber, agentName),
       ],
-    });
+    };
 
-    subscribeForLogging(session, log_);
-
-    // Stall watcher: abort the run if pi emits no events for the active budget.
-    // TWO budgets: a tight one for silence while waiting on the LLM
-    // (stall_timeout_minutes, default 15) and a looser one for silence while a
-    // tool is running (tool_stall_minutes, default 60) — a bash command that's
-    // building/testing legitimately produces no events until it writes output.
-    // The watcher switches budgets on tool_execution_start/end and resets the
-    // clock on every event (incl. tool_execution_update, which a chatty build
-    // emits constantly). On stall it calls session.abort(), which rejects the
-    // in-flight prompt() below.
-    const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
-    const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
-    const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
-    const unsubStall = watcher.attach();
+    /** Create a session + attach logging + stall watcher. Caller disposes. */
+    const bootSession = async (sessionManager: SessionManager) => {
+      const { session } = await create({ ...sessionCreateOpts, sessionManager });
+      subscribeForLogging(session, log_);
+      const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
+      const unsubStall = watcher.attach();
+      return { session, sessionManager, watcher, unsubStall };
+    };
 
     log_.info(
       { idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" },
       "starting agent run",
     );
     const startedAt = Date.now();
-    try {
-      await session.prompt(prompt);
-    } catch (e) {
-      // Translate the abort-into-reject of a stalled run into a typed error so
-      // the queue can skip retrying it (a stall won't recover on its own).
-      if (watcher.didStall) {
-        throw new StallTimeoutError(
-          (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
-          watcher.activeBudget,
+
+    // First attempt: fresh session.
+    let currentManager = SessionManager.create(ws.path, sessionDir);
+    let booted = await bootSession(currentManager);
+    let promptError: unknown = null;
+
+    for (let attempt = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++) {
+      const { session, sessionManager, watcher, unsubStall } = booted;
+      try {
+        await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
+        promptError = null;
+        watcher.dispose();
+        unsubStall?.();
+        break;
+      } catch (e) {
+        watcher.dispose();
+        unsubStall?.();
+        // Translate the abort-into-reject of a stalled run into a typed error so
+        // the queue can skip retrying it (a stall won't recover on its own).
+        if (watcher.didStall) {
+          throw new StallTimeoutError(
+            (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
+            watcher.activeBudget,
+          );
+        }
+        promptError = e;
+        if (attempt >= SESSION_RESTART_ATTEMPTS) break;
+
+        // Capture the session file path, dispose, wait, then reopen for the next attempt.
+        const sessionPath = sessionManager.getSessionFile();
+        try { await session.dispose?.(); } catch { /* best-effort */ }
+        log_.warn(
+          { err: (e as Error).message ?? String(e), restartAttempt: attempt + 1, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
+          "session.prompt() failed — will restart with same session after backoff",
         );
+        await sleep(SESSION_RESTART_DELAY_MS);
+        currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
+        booted = await bootSession(currentManager);
+        log_.info({ restartAttempt: attempt + 1 }, "restarted session from saved context");
       }
-      throw e;
-    } finally {
-      watcher.dispose();
-      unsubStall?.();
     }
+
+    if (promptError) {
+      throw promptError;
+    }
+
+    const session = booted.session;
+    const sessionManager = booted.sessionManager;
     const durationMs = Date.now() - startedAt;
 
     // After dispose, a lingering pi bash-tool PTY socket can emit a final chunk
@@ -783,7 +826,7 @@ function subscribeForLogging(
         const text = extractMessageText(msg).trim();
         if (!text || text === lastToolOutput) break;
         lastToolOutput = "";
-        log_.info(`⦿ ${text}`);
+        log_.info(`» ${text}`);
         break;
       }
 

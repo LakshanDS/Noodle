@@ -40,6 +40,21 @@ type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
 const CRON_LABEL_COLOR = "008672";
 
 /**
+ * Session restart loop: when session.prompt() throws after pi's own 5-attempt
+ * retry is exhausted, we reopen the SAME session file (full context survives on
+ * disk), create a fresh session, and try again. This catches sustained provider
+ * outages that outlast both the forwarder's 429-absorption and pi's internal
+ * retry. Flat 2-minute backoff between each restart — enough for NVIDIA's
+ * shared-endpoint throttling to clear.
+ */
+const SESSION_RESTART_ATTEMPTS = 3;
+const SESSION_RESTART_DELAY_MS = 120_000; // 2 minutes
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
  * Input for a scheduled (cron) run. Unlike the issue-driven RunInput, there is
  * no source issue — the agent works a freeform prompt and its final message is
  * turned into a NEW issue by Noodle after the run.
@@ -183,44 +198,86 @@ export async function runCronJob(
     // writing its findings as a normal final text message, and Noodle opens a
     // single issue with that message as the body after the run (mirrors how
     // runJob turns the agent's answer into the issue comment + PR body).
+    //
+    // The prompt runs in a restart loop: if session.prompt() throws (after pi's
+    // own 5-attempt retry exhausted), we dispose the session, wait 2 minutes,
+    // reopen the SAME session file (full context survives), create a fresh
+    // session, and try again. Up to 3 restarts before giving up. This catches
+    // sustained provider outages that outlast both the forwarder's 429-absorption
+    // and pi's internal retry.
     const sessionDir = sessionsDirFor(jobId);
-    const sessionManager = SessionManager.create(ws.path, sessionDir);
     const create = deps?.createAgentSessionFn ?? createAgentSession;
-    const { session } = await create({
+    const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
+    const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+    const sessionCreateOpts = {
       cwd: ws.path,
       model,
       authStorage,
       modelRegistry,
-      sessionManager,
       settingsManager,
       resourceLoader: loader,
       thinkingLevel: profile.thinking_level,
       tools: profile.tools,
-    });
+    };
 
-    subscribeForLogging(session, log_);
-
-    const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
-    const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
-    const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
-    const unsubStall = watcher.attach();
+    /** Create a session + attach logging + stall watcher. Caller disposes. */
+    const bootSession = async (sessionManager: SessionManager) => {
+      const { session } = await create({ ...sessionCreateOpts, sessionManager });
+      subscribeForLogging(session, log_);
+      const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
+      const unsubStall = watcher.attach();
+      return { session, sessionManager, watcher, unsubStall };
+    };
 
     log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" }, "starting cron run");
     const startedAt = Date.now();
-    try {
-      await session.prompt(prompt);
-    } catch (e) {
-      if (watcher.didStall) {
-        throw new StallTimeoutError(
-          (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
-          watcher.activeBudget,
+
+    // First attempt: fresh session.
+    let currentManager = SessionManager.create(ws.path, sessionDir);
+    let booted = await bootSession(currentManager);
+    let promptError: unknown = null;
+
+    for (let attempt = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++) {
+      const { session, sessionManager, watcher, unsubStall } = booted;
+      try {
+        await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
+        promptError = null;
+        watcher.dispose();
+        unsubStall?.();
+        break;
+      } catch (e) {
+        watcher.dispose();
+        unsubStall?.();
+        if (watcher.didStall) {
+          // A stall won't recover on restart — surface immediately.
+          throw new StallTimeoutError(
+            (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
+            watcher.activeBudget,
+          );
+        }
+        promptError = e;
+        if (attempt >= SESSION_RESTART_ATTEMPTS) break;
+
+        // Capture the session file path, dispose, wait, then reopen for the next attempt.
+        const sessionPath = sessionManager.getSessionFile();
+        try { await session.dispose?.(); } catch { /* best-effort */ }
+        log_.warn(
+          { err: (e as Error).message ?? String(e), restartAttempt: attempt + 1, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
+          "session.prompt() failed — will restart with same session after backoff",
         );
+        await sleep(SESSION_RESTART_DELAY_MS);
+        currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
+        booted = await bootSession(currentManager);
+        log_.info({ restartAttempt: attempt + 1 }, "restarted session from saved context");
       }
-      throw e;
-    } finally {
-      watcher.dispose();
-      unsubStall?.();
     }
+
+    if (promptError) {
+      throw promptError;
+    }
+
+    const session = booted.session;
+    const sessionManager = booted.sessionManager;
     const durationMs = Date.now() - startedAt;
 
     // Guard the benign post-dispose bash-socket race (same as runJob).
@@ -394,7 +451,7 @@ function subscribeForLogging(
         const text = extractMessageText(msg).trim();
         if (!text || text === lastToolOutput) break;
         lastToolOutput = "";
-        log_.info(`⦿ ${text}`);
+        log_.info(`» ${text}`);
         break;
       }
       case "tool_execution_start":
