@@ -106,6 +106,37 @@ describe("JobQueue", () => {
     expect(queue.getById(job.id).profile).toBe("nim");
   });
 
+  it("setJobProfile commits the new profile even when throwing on capacity", () => {
+    // A previous run is already at the cap for `claude`. The new run was
+    // claimed with a null hint, so `claimNext`'s pre-check passed — the cap
+    // must still be enforced here so the row's profile is updated (so a
+    // future claim self-gates) AND an error thrown so QueueWorker requeues.
+    queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    const atCap = queue.claimNext((p) => (p === "claude" ? 1 : 99))!;
+    expect(atCap.profile).toBe("claude");
+
+    // Now a null-hint job arrives and is claimed (bypassing the pre-check).
+    const nullHint = queue.enqueue({ repo: "o/r", issueNumber: 2 });
+    expect(nullHint.profile).toBeNull();
+    queue.claimNext(); // claims nullHint; status='running', profile still null
+
+    // setJobProfile must throw AND commit the profile in the same operation.
+    expect(() => queue.setJobProfile(nullHint.id, "claude", (p) => (p === "claude" ? 1 : 99))).toThrow(/at capacity/);
+    // The committed hint lets future claims self-gate this profile.
+    expect(queue.getById(nullHint.id).profile).toBe("claude");
+  });
+
+  it("setJobProfile allows concurrent runs below the cap", () => {
+    const a = queue.enqueue({ repo: "o/r", issueNumber: 1, profile: "claude" });
+    const b = queue.enqueue({ repo: "o/r", issueNumber: 2, profile: "claude" });
+    queue.claimNext((p) => (p === "claude" ? 2 : 99));
+    queue.claimNext((p) => (p === "claude" ? 2 : 99));
+    // Cap is 2, both running — second setJobProfile should still succeed.
+    queue.setJobProfile(a.id, "claude", (p) => (p === "claude" ? 2 : 99));
+    queue.setJobProfile(b.id, "claude", (p) => (p === "claude" ? 2 : 99));
+    expect(queue.runningCountForProfile("claude")).toBe(2);
+  });
+
   it("migrates an existing DB adding the profile column", () => {
     // Simulate an old DB created before the profile column existed.
     queue.close();

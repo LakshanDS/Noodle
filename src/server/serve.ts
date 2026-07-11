@@ -114,9 +114,11 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       runStore,
       tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
       ghProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.gh),
-      // Correct the job row's profile hint once the authoritative profile is
-      // known, so per-profile concurrency gating stays accurate.
-      onProfileResolved: (profile) => queue.setJobProfile(job.id, profile),
+      // Correct the job row's profile hint AND enforce the per-profile
+      // `max_concurrent` cap atomically. See `setJobProfile` — must run BEFORE
+      // the agent talks to the LLM, otherwise two null-hint jobs could reach
+      // the API together. `capacityFor` is the closure defined further below.
+      onProfileResolved: (profile) => queue.setJobProfile(job.id, profile, capacityFor),
     });
   };
 

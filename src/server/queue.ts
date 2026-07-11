@@ -320,9 +320,40 @@ export class JobQueue {
     })();
   }
 
-  /** Update a job's profile hint (after authoritative resolution in runJob). */
-  setJobProfile(id: number, profile: string): void {
-    this.db.prepare("UPDATE jobs SET profile = ? WHERE id = ?").run(profile, id);
+  /**
+   * Update a job's profile hint. When `capacityFor` is supplied, the UPDATE and
+   * a count of currently-running rows for the new profile run inside one
+   * SQLite transaction so the per-profile `max_concurrent` cap stays
+   * race-safe. If the post-UPDATE running count exceeds the cap, the hint is
+   * still committed (so subsequent `claimNext` calls see it and self-gate),
+   * and an `Error` is thrown for the caller to handle — `QueueWorker` will
+   * requeue with backoff, preserving the cap invariant.
+   *
+   * Note this closes a TOCTOU window in `claimNext`: null-hint webhook jobs
+   * bypass the per-profile check at claim time, but `runJob` resolves the
+   * authoritative profile and calls this method BEFORE any LLM traffic. The
+   * cap is enforced authoritatively here, after the row is claimed.
+   *
+   * `capacityFor` is optional for backwards compat; without it the method
+   * behaves as a plain UPDATE (used by tests that don't model concurrency).
+   */
+  setJobProfile(id: number, profile: string, capacityFor?: (profile: string) => number): void {
+    if (!capacityFor) {
+      this.db.prepare("UPDATE jobs SET profile = ? WHERE id = ?").run(profile, id);
+      return;
+    }
+    const { count } = this.db.transaction(() => {
+      this.db.prepare("UPDATE jobs SET profile = ? WHERE id = ?").run(profile, id);
+      const row = this.db
+        .prepare("SELECT COUNT(*) AS count FROM jobs WHERE status = 'running' AND profile = ?")
+        .get(profile) as { count: number };
+      return row;
+    })();
+    if (count > capacityFor(profile)) {
+      throw new Error(
+        `profile "${profile}" at capacity (max_concurrent exceeded while picking up ${id})`,
+      );
+    }
   }
 
   /** Mark a job successfully done. */
