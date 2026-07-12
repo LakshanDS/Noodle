@@ -31,6 +31,29 @@ const cancelling = ref(false);
 
 const isRunning = computed(() => run.value?.status === "running");
 
+/** Human-readable run duration, e.g. "42s" or "3m 12s". Empty while running. */
+const duration = computed(() => {
+  const r = run.value;
+  if (!r || !r.finished_at) return "";
+  const start = new Date(r.started_at.endsWith("Z") ? r.started_at : r.started_at + "Z").getTime();
+  const end = new Date(r.finished_at.endsWith("Z") ? r.finished_at : r.finished_at + "Z").getTime();
+  const secs = Math.max(0, Math.round((end - start) / 1000));
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m ${s}s`;
+});
+
+/** What kicked off this run — an issue number (plus the command, if any). */
+const trigger = computed(() => {
+  const r = run.value;
+  if (!r) return "";
+  const cmd = r.command ? ` · /${r.command}` : "";
+  if (r.issue != null) return `Issue #${r.issue}${cmd}`;
+  if (r.cron_job_id != null) return "Cron";
+  return "Manual";
+});
+
 function isChat(m: ParsedMessage): m is Extract<ParsedMessage, { role: "user" | "assistant" }> {
   return m.role === "user" || m.role === "assistant";
 }
@@ -108,11 +131,6 @@ onMounted(load);
     <div v-else-if="run" class="run-layout">
       <!-- Conversation stream -->
       <div class="stream-col">
-        <div class="stream-head">
-          <StatusPill :status="run.status" size="md" />
-          <span v-if="run.model" class="model-tag mono">{{ run.model }}</span>
-        </div>
-
         <div class="stream">
           <div v-if="messages.length === 0" class="empty-chat">
             <Icon name="message" :size="20" />
@@ -136,13 +154,21 @@ onMounted(load);
 
       <!-- Meta sidebar -->
       <aside class="meta-col">
-        <Card title="Details">
+        <Card title="Details" class="details-card">
+          <template #actions>
+            <StatusPill :status="run.status" size="md" />
+          </template>
+
+          <!-- Run facts -->
           <dl class="facts">
             <div class="fact"><dt>Repository</dt><dd class="ellipsis">{{ run.repo }}</dd></div>
             <div class="fact"><dt>Branch</dt><dd class="mono ellipsis">{{ run.branch }}</dd></div>
+            <div class="fact"><dt>Trigger</dt><dd>{{ trigger }}</dd></div>
             <div v-if="run.profile" class="fact"><dt>Profile</dt><dd>{{ run.profile }}</dd></div>
+            <div v-if="run.model" class="fact"><dt>Model</dt><dd class="ellipsis">{{ run.model }}</dd></div>
+            <div class="fact"><dt>Runtime</dt><dd>{{ run.runtime || "pi" }}</dd></div>
             <div class="fact"><dt>Started</dt><dd>{{ fmtTime(run.started_at) }}</dd></div>
-            <div v-if="run.finished_at" class="fact"><dt>Finished</dt><dd>{{ fmtTime(run.finished_at) }}</dd></div>
+            <div v-if="duration" class="fact"><dt>Duration</dt><dd>{{ duration }}</dd></div>
           </dl>
         </Card>
 
@@ -161,10 +187,6 @@ onMounted(load);
 
         <Card v-if="run.error" title="Error">
           <p class="error-text">{{ run.error }}</p>
-        </Card>
-
-        <Card v-if="run.summary" title="Summary">
-          <p class="summary-text">{{ run.summary }}</p>
         </Card>
       </aside>
     </div>
@@ -200,12 +222,6 @@ onMounted(load);
 .stream-col {
   min-width: 0;
 }
-.stream-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  margin-bottom: var(--space-4);
-}
 .model-tag {
   font-size: var(--text-xs);
   color: var(--text-3);
@@ -234,18 +250,22 @@ onMounted(load);
 }
 
 /* ---------- Meta sidebar ---------- */
+/* Sticky so the Details card stays put at its page-load position (level with
+ * the first chat bubble) and remains visible while the conversation scrolls.
+ * `top` matches the card's natural load offset from the scrollport top: action
+ * panel height (44) + its bottom margin (16) = 60px. */
 .meta-col {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
   position: sticky;
-  top: var(--space-6);
+  top: 60px;
 }
 .facts {
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 .fact {
   display: flex;
@@ -291,20 +311,10 @@ onMounted(load);
   word-break: break-word;
   margin: 0;
 }
-.summary-text {
-  font-size: var(--text-sm);
-  color: var(--text);
-  line-height: var(--leading-relaxed);
-  white-space: pre-wrap;
-  margin: 0;
-}
 
 @media (max-width: 900px) {
   .run-layout {
     grid-template-columns: 1fr;
-  }
-  .meta-col {
-    position: static;
   }
 }
 </style>

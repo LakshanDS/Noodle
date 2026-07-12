@@ -1,17 +1,12 @@
 /**
- * TEMPORARY in-memory store for the Commands and Skills pages while the backend
- * store + SKILL.md read/write layer lands. Delete this whole file (and swap the
- * views' `mockXxx` calls back to `getJson`/`sendJson`) once the real API exists.
+ * TEMPORARY in-memory store for the Skills and Chats pages while the backend
+ * store + SKILL.md read/write layer lands. Commands have migrated to the real
+ * /api/commands API — the mock helpers for them were removed.
  *
  * Functions are async + return the same envelope shapes the server will, so the
  * views are written exactly like the cron views — the migration is mechanical.
  */
 import type {
-  CommandRow,
-  CommandsResponse,
-  CommandDetailResponse,
-  CommandMutationResponse,
-  CommandInput,
   SkillRow,
   SkillsResponse,
   SkillDetailResponse,
@@ -20,100 +15,8 @@ import type {
   ParsedChatMessage,
 } from "../api/types.js";
 
-/* ------------------------------------------------------------------ commands */
-
-let nextCommandId = 4;
-const commands: CommandRow[] = [
-  {
-    id: 1,
-    trigger: "question",
-    name: "Answer a question",
-    description: "Reads the issue as a question and posts a reasoned answer — no code changes.",
-    system_prompt:
-      "You answer questions about this repository. Read the relevant code, then post a clear, concise answer as a comment. Do not open a PR or edit files — this is research and explanation only.",
-    profile: null,
-    enabled: 1,
-    created_at: "2026-07-01T09:00:00",
-    updated_at: "2026-07-01T09:00:00",
-  },
-  {
-    id: 2,
-    trigger: "search",
-    name: "Search & summarize",
-    description: "Finds where something lives in the codebase and summarizes how it fits together.",
-    system_prompt:
-      "Someone has asked where/how something works in this codebase. Locate the relevant code with grep/find/read, trace how the pieces connect, and write a short architectural summary as a comment. Do not modify files.",
-    profile: null,
-    enabled: 1,
-    created_at: "2026-07-02T11:30:00",
-    updated_at: "2026-07-02T11:30:00",
-  },
-  {
-    id: 3,
-    trigger: "review",
-    name: "Review changes",
-    description: "Reviews the issue's PR the way a careful senior engineer would.",
-    system_prompt:
-      "Review the changes related to this issue as a senior engineer. Call out bugs, risks, and missing tests. Be specific — reference files and lines. Keep it to the highest-signal points rather than exhaustive nitpicks.",
-    profile: null,
-    enabled: 0,
-    created_at: "2026-07-03T14:10:00",
-    updated_at: "2026-07-03T14:10:00",
-  },
-];
-
 function nowIso(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
-}
-
-function normalizeTrigger(raw: string): string {
-  // Accept "/question" or "question"; store without the slash.
-  return raw.trim().replace(/^\/+/, "");
-}
-
-export async function mockListCommands(): Promise<CommandsResponse> {
-  return Promise.resolve({ commands: [...commands] });
-}
-
-export async function mockGetCommand(id: number): Promise<CommandDetailResponse> {
-  const command = commands.find((c) => c.id === id);
-  if (!command) throw new Error("Command not found");
-  return Promise.resolve({ command: { ...command } });
-}
-
-export async function mockCreateCommand(input: CommandInput): Promise<CommandMutationResponse> {
-  const ts = nowIso();
-  const command: CommandRow = {
-    id: nextCommandId++,
-    trigger: normalizeTrigger(input.trigger),
-    name: input.name.trim(),
-    description: input.description.trim(),
-    system_prompt: input.system_prompt,
-    profile: input.profile || null,
-    enabled: 1,
-    created_at: ts,
-    updated_at: ts,
-  };
-  commands.unshift(command);
-  return Promise.resolve({ command: { ...command } });
-}
-
-export async function mockUpdateCommand(id: number, input: Partial<CommandInput>): Promise<CommandMutationResponse> {
-  const command = commands.find((c) => c.id === id);
-  if (!command) throw new Error("Command not found");
-  if (input.trigger !== undefined) command.trigger = normalizeTrigger(input.trigger);
-  if (input.name !== undefined) command.name = input.name.trim();
-  if (input.description !== undefined) command.description = input.description.trim();
-  if (input.system_prompt !== undefined) command.system_prompt = input.system_prompt;
-  if (input.profile !== undefined) command.profile = input.profile || null;
-  command.updated_at = nowIso();
-  return Promise.resolve({ command: { ...command } });
-}
-
-export async function mockDeleteCommand(id: number): Promise<void> {
-  const idx = commands.findIndex((c) => c.id === id);
-  if (idx >= 0) commands.splice(idx, 1);
-  return Promise.resolve();
 }
 
 /* -------------------------------------------------------------------- skills */
