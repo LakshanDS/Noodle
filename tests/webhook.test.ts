@@ -236,4 +236,41 @@ describe("parseWebhookEvent", () => {
     };
     expect(parseWebhookEvent("issue_comment", payload, undefined, "MyBot")).toBeNull();
   });
+
+  it("wakes on any active command trigger (not just the agent slug)", () => {
+    const payload = {
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "/review please look at this" },
+    };
+    // No commandTriggers → /review does NOT wake (back-compat).
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle", optIn)).toBeNull();
+    // With "review" as an active command trigger → wakes.
+    expect(
+      parseWebhookEvent("issue_comment", payload, undefined, "Noodle", optIn, [], ["review"]),
+    ).toEqual({
+      kind: "comment",
+      repo: "owner/name",
+      issueNumber: 7,
+      installationId: 42,
+    });
+  });
+
+  it("still wakes on /noodle even when commandTriggers is empty (slug backstop)", () => {
+    const payload = {
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "/noodle fix this" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle", optIn)).toEqual({
+      kind: "comment",
+      repo: "owner/name",
+      issueNumber: 7,
+      installationId: 42,
+    });
+  });
 });

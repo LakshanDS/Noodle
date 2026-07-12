@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { slugify } from "../util/slugify.js";
 import { extractProfileTag, mentionsAgent, shouldTrigger, type TriggerConfig } from "../triggers/check.js";
+import { matchesCommandTrigger } from "../commands/match.js";
 
 /**
  * Pure webhook helpers — HMAC signature verification and event parsing.
@@ -74,6 +75,13 @@ export function parseWebhookEvent(
   agentName = "Noodle",
   triggers?: TriggerConfig,
   profileNames: string[] = [],
+  /**
+   * Active command triggers (from the command store). Any `/<trigger>` in a
+   * comment wakes the agent. When omitted, falls back to just `/<agent-slug>`
+   * so the built-in `/noodle` still works (back-compat for CLI/tests that
+   * haven't wired the command store through).
+   */
+  commandTriggers: string[] = [],
 ): WebhookIntent | null {
   const p = payload as {
     action?: string;
@@ -139,15 +147,20 @@ export function parseWebhookEvent(
   if (event === "issue_comment") {
     if (p.action !== "created") return null;
     // A new comment wakes the agent when it explicitly invites it:
-    //   - `/<agent>` slash command (e.g. /noodle fix this), OR
+    //   - `/<command>` slash command for any active command (e.g. /noodle, /review), OR
     //   - `@<agent>` mention (e.g. @noodle can you look?), OR
     //   - `#<profile>` tag (e.g. #claude rerun with claude)
     // trigger_keywords / trigger_on_open are body-level concerns handled by
     // the scheduler scan; the webhook only needs to react to explicit nudges.
     const body = (p.comment?.body ?? "").trim();
     if (!body) return null;
+    // Triggers to test = active command triggers, plus the agent slug as a
+    // backstop so `/noodle` wakes even if the built-in command row is missing
+    // or disabled.
     const slug = slugify(agentName);
-    const isSlash = new RegExp(`^\\/${slug}\\b`, "i").test(body);
+    const triggers = commandTriggers.length > 0 ? commandTriggers : [slug].filter((s) => s);
+    if (slug && !triggers.includes(slug)) triggers.push(slug);
+    const isSlash = matchesCommandTrigger(body, triggers);
     const isMention = mentionsAgent(body, agentName);
     const hasProfileTag = profileNames.some(
       (name) => name && new RegExp(`(?:^|\\s)#${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(body),

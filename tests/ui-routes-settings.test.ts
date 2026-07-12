@@ -6,6 +6,7 @@ import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
 import { CronStore } from "../src/server/cron-store.js";
+import { CommandStore } from "../src/server/command-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
 import { ProfileStore } from "../src/server/profile-store.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
@@ -29,6 +30,7 @@ beforeEach(() => {
   settingsStore = SettingStore.fromDb(db);
   RunStore.fromDb(db); // ensure runs table exists
   CronStore.fromDb(db); // ensure cron table exists
+  CommandStore.fromDb(db); // ensure command table exists
 });
 
 afterEach(() => {
@@ -42,6 +44,7 @@ function makeApp() {
     runStore: RunStore.fromDb(db),
     secret: PASSWORD,
     cronStore: CronStore.fromDb(db),
+    commandStore: CommandStore.fromDb(db),
     settingsStore,
     profileStore: ProfileStore.fromDb(db),
     queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,

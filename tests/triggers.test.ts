@@ -177,4 +177,36 @@ describe("shouldTrigger", () => {
     });
     expect(r.wake).toBe(true);
   });
+
+  it("wakes on any active command trigger, not just the agent slug", () => {
+    const r = shouldTrigger({
+      body: "/review please look at this",
+      comments: [],
+      agentName: "Noodle",
+      triggers: optIn,
+      commandTriggers: ["noodle", "review"],
+    });
+    expect(r.wake).toBe(true);
+  });
+
+  it("does NOT wake on a command trigger that isn't in the active list", () => {
+    const r = shouldTrigger({
+      body: "/search the repo",
+      comments: [],
+      agentName: "Noodle",
+      triggers: optIn,
+      commandTriggers: ["noodle", "review"],
+    });
+    expect(r.wake).toBe(false);
+  });
+
+  it("falls back to the agent slug when no commandTriggers supplied", () => {
+    const r = shouldTrigger({
+      body: "/noodle fix it",
+      comments: [],
+      agentName: "Noodle",
+      triggers: optIn,
+    });
+    expect(r.wake).toBe(true);
+  });
 });
