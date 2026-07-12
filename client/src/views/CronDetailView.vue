@@ -32,6 +32,7 @@ const form = ref({
   branch_name: "",
   cron_expression: "0 0 * * *",
   profile: "",
+  runtime: "" as string,
   prompt: "",
   enabled: 1,
 });
@@ -47,7 +48,7 @@ const editing = computed(() => !props.isNew && props.id != null);
 const schedulePreview = computed(() => cronScheduleText(form.value.cron_expression));
 
 function emptyForm() {
-  return { name: "", repo: "", branch_name: "", cron_expression: "0 0 * * *", profile: "", prompt: "", enabled: 1 };
+  return { name: "", repo: "", branch_name: "", cron_expression: "0 0 * * *", profile: "", runtime: "", prompt: "", enabled: 1 };
 }
 
 async function ensureProfiles(): Promise<void> {
@@ -76,6 +77,7 @@ async function loadCron(): Promise<void> {
       branch_name: c.branch_name,
       cron_expression: c.cron_expression,
       profile: c.profile ?? "",
+      runtime: c.runtime ?? "",
       prompt: c.prompt,
       enabled: c.enabled,
     };
@@ -94,6 +96,7 @@ function payload(): CronInput {
     branch_name: form.value.branch_name.trim(),
     cron_expression: form.value.cron_expression.trim(),
     profile: form.value.profile || null,
+    runtime: form.value.runtime || null,
     prompt: form.value.prompt,
   };
 }
@@ -207,6 +210,13 @@ onMounted(async () => {
               <option v-for="p in profiles" :key="p" :value="p">
                 {{ p }}{{ p === defaultProfile ? " (default)" : "" }}
               </option>
+            </select>
+          </Field>
+          <Field label="Runtime" hint="Override the agent engine for this cron. Leave as Default to use the profile/config runtime.">
+            <select v-model="form.runtime" class="ctrl">
+              <option value="">Default (from profile)</option>
+              <option value="pi">pi</option>
+              <option value="opencode">opencode</option>
             </select>
           </Field>
           <Field label="Prompt / Instructions">

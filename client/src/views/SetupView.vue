@@ -29,10 +29,11 @@ const PROVIDERS = [
   { value: "groq", label: "Groq", keyEnv: "GROQ_API_KEY" },
   { value: "deepseek", label: "DeepSeek", keyEnv: "DEEPSEEK_API_KEY" },
   { value: "google", label: "Google (Gemini)", keyEnv: "GEMINI_API_KEY" },
+  { value: "opencode", label: "OpenCode Zen (free models)", keyEnv: "OPENCODE_API_KEY" },
   { value: "custom", label: "Custom (OpenAI-compatible)", keyEnv: "" },
 ] as const;
 
-const llm = reactive({ provider: "anthropic", model: "", apiKey: "", baseUrl: "", api: "openai-completions" });
+const llm = reactive({ provider: "anthropic", model: "", apiKey: "", baseUrl: "", api: "openai-completions", runtime: "pi" as "pi" | "opencode" });
 const currentProvider = computed(() => PROVIDERS.find((p) => p.value === llm.provider));
 const uiPassword = ref("");
 const uiPasswordConfirm = ref("");
@@ -44,6 +45,16 @@ function canAdvance(): boolean {
   if (step.value === 1) return !!llm.provider && !!llm.model && (!!llm.apiKey || llm.provider === "custom");
   if (step.value === 2) return uiPassword.value.length > 0 && uiPassword.value === uiPasswordConfirm.value;
   return true;
+}
+
+/**
+ * When the OpenCode Zen provider is selected, auto-switch the runtime to
+ * opencode (that's the whole point of the free-model provider — it only works
+ * through the OpenCode runtime). Selecting any other provider leaves the runtime
+ * as-is, so a user who explicitly picked opencode + anthropic keeps their choice.
+ */
+function onProviderChange(): void {
+  if (llm.provider === "opencode") llm.runtime = "opencode";
 }
 
 function next(): void {
@@ -83,6 +94,7 @@ async function submit(): Promise<void> {
       apiKeyEnv: currentProvider.value?.keyEnv || undefined,
       baseUrl: llm.provider === "custom" ? llm.baseUrl.trim() || undefined : undefined,
       api: llm.provider === "custom" ? llm.api || undefined : undefined,
+      runtime: llm.runtime,
     },
     uiPassword: uiPassword.value,
   };
@@ -168,12 +180,18 @@ onMounted(checkStatus);
           <h2>Pick a model</h2>
           <p class="step-desc">Choose the LLM profile Noodle uses by default. You can add more profiles in the config later.</p>
 
+          <Field label="Runtime" hint="Which agent engine processes runs. pi is the default; opencode offers free models + MCP tool servers.">
+            <select v-model="llm.runtime" class="ctrl">
+              <option value="pi">pi (default)</option>
+              <option value="opencode">opencode (free models + MCP)</option>
+            </select>
+          </Field>
           <Field label="Provider">
-            <select v-model="llm.provider" class="ctrl">
+            <select v-model="llm.provider" class="ctrl" @change="onProviderChange">
               <option v-for="p in PROVIDERS" :key="p.value" :value="p.value">{{ p.label }}</option>
             </select>
           </Field>
-          <Field label="Model">
+          <Field label="Model" :hint="llm.provider === 'opencode' ? 'A free OpenCode Zen model id (e.g. claude-sonnet-4). Get a key at opencode.ai/auth.' : ''">
             <input v-model="llm.model" class="ctrl" type="text" :placeholder="llm.provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'model-name'" />
           </Field>
           <Field label="API key" :hint="`Stored as ${currentProvider?.keyEnv || '(custom)'} — applies to new runs immediately.`">

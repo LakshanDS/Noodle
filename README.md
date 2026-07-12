@@ -146,6 +146,9 @@ Noodle posts a short "already cooking" note and skips. The terminal labels
 - A **GitHub Personal Access Token** with `repo` scope (or fine-grained:
   `contents:write`, `pull-requests:write`, `issues:write`)
 - At least one **LLM API key** (Anthropic, OpenAI, OpenRouter, …)
+- **Optional:** the [OpenCode CLI](https://opencode.ai) installed on PATH, if you
+  want runs to use the `opencode` runtime (free models + MCP). pi runs need nothing
+  extra.
 
 ## Install
 
@@ -300,6 +303,68 @@ Open an issue — Noodle clones, fixes, opens a PR, comments, done.
 - Noodle is currently **issue-driven**. `pull_request` events aren't wired up
   yet — point the Action at issues (or run the server with webhooks for issues
   + commented `/noodle`) for now.
+
+### Choosing a runtime: `pi` vs `opencode`
+
+Noodle supports two interchangeable agent engines behind one interface. Each run
+resolves which engine to use from **command → profile → config default**:
+
+| | `pi` (default) | `opencode` |
+|---|---|---|
+| Package | `@earendil-works/pi-coding-agent` | `@opencode-ai/sdk` |
+| Install needed | nothing extra | [OpenCode CLI](https://opencode.ai) on PATH |
+| Models | 6+ providers via pi-ai | 75+ providers, **OpenCode Zen free models**, local |
+| MCP servers | not supported | first-class (via profile `mcp_servers`) |
+| Skills | `.agents/skills/` (shared) | `.agents/skills/` (shared) |
+| Stall watcher, restart loop, stats | shared | shared |
+
+Pick `pi` if you want the lean default; pick `opencode` for free models, MCP tool
+servers, or its broader provider ecosystem. Both share Noodle's git/PR/comment
+machinery, queue, skills, and dashboard — only the agent loop differs.
+
+**Select it per profile:**
+
+```yaml
+# noodle.config.yaml
+default_runtime: pi           # instance-wide fallback
+profiles:
+  free:                       # an OpenCode-runtime profile using free Zen models
+    runtime: opencode
+    provider: opencode
+    model: claude-sonnet-4
+  fast:                       # a pi-runtime profile
+    runtime: pi
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+```
+
+**Or override per command/cron** in the dashboard — each slash command and
+scheduled task can pin a runtime that wins over the profile's choice.
+
+**Free models (OpenCode Zen):** in the first-run wizard, pick the *OpenCode Zen
+(free models)* provider, paste your key from `opencode.ai/auth`, and the seeded
+profile runs on the OpenCode runtime with no provider billing. Add more
+`opencode`-runtime profiles any time from the dashboard.
+
+**MCP servers:** MCP (Model Context Protocol) servers are managed as a shared
+library via the **MCP Servers** nav item in the dashboard. Define each server
+once (name, transport type, command/url), then toggle it on/off per profile via
+the profile editor's *MCP servers* checkbox list. Both pi and opencode profiles
+can select servers; only the OpenCode runtime actually loads them at run time (pi
+silently ignores the selection). This keeps profiles runtime-portable — switch
+between pi and opencode without losing your MCP configuration.
+
+```yaml
+# noodle.config.yaml — profiles reference servers by name
+profiles:
+  coding:
+    runtime: opencode
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    mcp_servers:
+      - filesystem    # defined in the MCP Servers dashboard page
+      - github-mcp
+```
 
 ### Custom endpoints (any OpenAI-compatible or Anthropic-compatible server)
 

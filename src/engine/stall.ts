@@ -4,38 +4,43 @@
  * A wall-clock timeout can't be used here: a healthy agent run may legitimately
  * take hours. What we actually want to catch is a *hung* run — a dropped
  * socket, a deadlocked tool, an infinite spinner — where the agent is doing
- * nothing at all. pi emits an event on every action (tool call, turn boundary,
- * assistant message, tool output, compaction, retry), so "no event for N
- * minutes" is a strong signal that the run is stuck.
+ * nothing at all. The runtime emits a normalized event on every action (tool
+ * call, turn boundary, assistant message, tool output, compaction, retry), so
+ * "no event for N minutes" is a strong signal that the run is stuck.
  *
  * ## Two budgets, not one — the silent-build problem
  *
- * pi emits no heartbeat, and a bash tool only emits `tool_execution_update`
- * when the underlying process actually writes output. So a legitimate 20-minute
- * build that prints nothing is *indistinguishable* from a hung process at the
- * event level: both are silent. To avoid killing such builds, the watcher uses
- * TWO inactivity budgets:
+ * A runtime emits no heartbeat, and a bash tool only emits output events when
+ * the underlying process actually writes. So a legitimate 20-minute build that
+ * prints nothing is *indistinguishable* from a hung process at the event level:
+ * both are silent. To avoid killing such builds, the watcher uses TWO
+ * inactivity budgets:
  *
  *   - `idleTimeoutMs` — applies when NO tool is running (agent is between
  *     turns, or waiting on an LLM call). Silence here usually means a dropped
  *     connection or deadlocked loop. Catch fast. Default 15 min.
- *   - `toolTimeoutMs` — applies while a tool is in flight (between
- *     `tool_execution_start` and `tool_execution_end`). Silence here is normal:
- *     a build, a test suite, a slow git clone. Use a much larger budget; reset
- *     on `tool_execution_update` so a chatty build never trips it. Default 60 min.
+ *   - `toolTimeoutMs` — applies while a tool is in flight (between `tool_start`
+ *     and `tool_end`). Silence here is normal: a build, a test suite, a slow
+ *     git clone. Use a much larger budget; reset on `activity` (the catch-all
+ *     for runtime-specific output events) so a chatty build never trips it.
+ *     Default 60 min.
  *
  * The watcher switches budgets the moment a tool starts or ends, re-arming the
  * timer with the now-applicable budget.
  *
- * On stall we call pi's `session.abort()` — a clean shutdown ("abort current
- * operation and wait for agent to become idle") — which causes the in-flight
- * `session.prompt()` to reject. The run is tagged with `StallTimeoutError` so
- * the queue can avoid retrying it (a stall won't recover on its own).
+ * On stall we call the runtime's `session.abort()` — a clean shutdown ("abort
+ * current operation and wait for agent to become idle") — which causes the
+ * in-flight `session.prompt()` to reject. The run is tagged with
+ * `StallTimeoutError` so the queue can avoid retrying it (a stall won't recover
+ * on its own).
  *
- * Mirrors the `Throttle` pattern: `now` is injected for deterministic tests.
+ * Runtime-agnostic: consumes the `RuntimeEvent` union, not any runtime's native
+ * events. Mirrors the `Throttle` pattern: `now` is injected for deterministic
+ * tests.
  */
 
 import { log } from "../util/log.js";
+import type { RuntimeEvent } from "./runtime.js";
 
 /**
  * Thrown when a run is aborted for inactivity. Distinct type so the queue's
@@ -53,9 +58,12 @@ export class StallTimeoutError extends Error {
   }
 }
 
-/** Minimal session surface StallWatcher needs: subscribe to events + abort. */
+/**
+ * Minimal session surface StallWatcher needs: subscribe to normalized runtime
+ * events + abort. Runtime-agnostic — works against any `RuntimeSession`.
+ */
 export interface StallSession {
-  subscribe?(fn: (event: unknown) => void): (() => void) | void;
+  subscribe?(fn: (e: RuntimeEvent) => void): (() => void) | void;
   abort(): Promise<void>;
 }
 
@@ -64,14 +72,6 @@ export type SetTimer = (ms: number, fn: () => void) => NodeJS.Timeout;
 export type ClearTimer = (t: NodeJS.Timeout) => void;
 const defaultSetTimer: SetTimer = (ms, fn) => setTimeout(fn, ms);
 const defaultClearTimer: ClearTimer = (t) => clearTimeout(t);
-
-/** Event-shape helper: pull `type` off a pi event defensively. */
-function eventType(e: unknown): string | undefined {
-  if (e && typeof e === "object" && "type" in e) {
-    return (e as { type?: string }).type;
-  }
-  return undefined;
-}
 
 /** Configuration for the two stall budgets. Either may be 0 (disabled). */
 export interface StallBudgets {
@@ -158,27 +158,27 @@ export class StallWatcher {
   }
 
   /**
-   * Pi-event handler. Flips the tool-in-flight flag on tool lifecycle events
-   * (which also re-arms with the new budget), and pokes (re-arms) on every
-   * other event. `tool_execution_update` is the load-bearing one for long
-   * chatty builds — it keeps resetting the tool budget.
+   * Runtime-event handler. Flips the tool-in-flight flag on tool lifecycle
+   * events (which also re-arms with the new budget), and pokes (re-arms) on
+   * every other event. `activity` (the catch-all for runtime-specific output
+   * events, e.g. pi's `tool_execution_update`) keeps resetting the tool budget
+   * during long chatty builds.
    */
-  private handleEvent(e: unknown): void {
-    const type = eventType(e);
-    if (type === "tool_execution_start") {
+  private handleEvent(e: RuntimeEvent): void {
+    if (e.type === "tool_start") {
       this.toolInFlight = true;
       // Re-arm with the (larger) tool budget.
       this.arm();
       return;
     }
-    if (type === "tool_execution_end") {
+    if (e.type === "tool_end") {
       this.toolInFlight = false;
       // Re-arm with the idle budget.
       this.arm();
       return;
     }
-    // Any other event (turn_*, message_*, compaction_*, auto_retry_*,
-    // tool_execution_update, agent_start/end) — poke to reset the clock.
+    // Any other event (agent_start/end, message_end, retry, compaction,
+    // activity) — poke to reset the clock.
     this.poke();
   }
 

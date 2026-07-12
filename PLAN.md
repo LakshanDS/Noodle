@@ -332,6 +332,50 @@ Noodle open a PR automatically with no manual command. Cron scan runs on schedul
 
 ---
 
+## Phase 4 — Agent runtime selector (pi + OpenCode)
+
+Make `pi` and `opencode` first-class, interchangeable agent engines. A run goes
+to one or the other based on a `runtime` field resolved from command → profile →
+config default. Both share the same skills, prompts, git/PR/comment machinery,
+queue, stall watcher, and dashboard — only the agent loop differs.
+
+### Architecture
+
+- `src/engine/runtime.ts` — `AgentRuntime` interface, `RuntimeEvent` union
+  (normalized events both adapters translate to), `runAgentLoop` (shared restart
+  + stall + stats loop), `resolveRuntimeName`, `runtimeForName` (lazy registry).
+- `src/engine/runtimes/pi.ts` — `PiRuntime` adapter (wraps pi's
+  `createAgentSession`, translates `AgentSessionEvent` → `RuntimeEvent`).
+- `src/engine/runtimes/opencode.ts` — `OpenCodeRuntime` adapter (drives
+  `@opencode-ai/sdk`, writes `opencode.json` from the profile, translates
+  OpenCode SSE events → `RuntimeEvent`, wires MCP servers).
+- `src/engine/stall.ts` — now consumes `RuntimeEvent` (runtime-agnostic).
+- `src/engine/runtime-events.ts` — shared `subscribeForLogging` (was duplicated
+  in run.ts + cron-run.ts).
+
+### Selection precedence
+
+1. command / cron `runtime` override (per-trigger)
+2. profile `runtime`
+3. `config.default_runtime` (default `pi`)
+
+### OpenCode-specific features
+
+- **Free models:** the *OpenCode Zen (free models)* provider in the setup wizard
+  + profile editor seeds an `opencode`-runtime profile using the Zen endpoint.
+  Auth key stored as `OPENCODE_API_KEY`.
+- **MCP servers:** profiles carry an `mcp_servers` map (stdio/sse/http); the
+  OpenCode adapter writes them into `opencode.json`. pi ignores the field.
+
+### Schema additions
+
+- `ProfileSchema.runtime` (`"pi" | "opencode"`, default `"pi"`)
+- `ProfileSchema.mcp_servers` (record of `{type, command?, args?, env?, url?}`)
+- `NoodleConfigSchema.default_runtime` (default `"pi"`)
+- `runs.runtime`, `commands.runtime`, `cron_jobs.runtime` columns + migrations
+
+---
+
 ## Implementation order (what I'll actually do first)
 
 1. Scaffold package, tsconfig, deps, `.env.example`, config example.

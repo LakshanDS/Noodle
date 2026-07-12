@@ -1,32 +1,29 @@
-import { createAgentSession } from "@earendil-works/pi-coding-agent";
-import type { Model, Api } from "@earendil-works/pi-ai/compat";
-import { join, resolve } from "node:path";
-import { mkdirSync } from "node:fs";
 import { log, runLogger } from "../util/log.js";
 import { resolveProfile } from "../profiles/resolve.js";
-import { registerCustomProviders } from "../profiles/custom-providers.js";
+import { resolveCommand } from "../commands/resolve.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
-import { buildPrompt } from "./prompt.js";
+import { buildRunPrompt, defaultCommandPrompt } from "./prompt.js";
 import { createCommentOnIssueTool } from "./tools.js";
+import { phraseOutput } from "./title.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
-import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
-import { buildSettingsManager } from "./pi-settings.js";
-import { StallWatcher, StallTimeoutError } from "./stall.js";
 import { slugify } from "../util/slugify.js";
 import { extractProfileTag } from "../triggers/check.js";
 import {
-  AuthStorage,
-  ModelRegistry,
-  SessionManager,
-  DefaultResourceLoader,
-} from "@earendil-works/pi-coding-agent";
+  runAgentLoop,
+  extractLastAssistantText,
+  lastAssistantStopReason,
+  sessionsDirFor,
+  resolveRuntimeName,
+  runtimeForName,
+  type AgentRuntime,
+  type RuntimeBootOptions,
+} from "./runtime.js";
+import { subscribeForLogging } from "./runtime-events.js";
 import type { RunStore } from "../server/run-store.js";
+import type { CommandRow } from "../server/command-store.js";
 import type { NoodleConfig } from "../config/schema.js";
-
-/** AuthStorage instance type (its constructor is private; use the factory's return type). */
-type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
 
 /**
  * Status labels applied to issues the agent works on. All three are ensured to
@@ -61,23 +58,6 @@ export function labelsFor(agentName: string) {
 
 /** Default labels using the built-in agent name. */
 export const LABELS = labelsFor("Noodle");
-
-/**
- * Session restart loop: when session.prompt() throws after pi's own 5-attempt
- * retry is exhausted, we reopen the SAME session file (full context survives on
- * disk), create a fresh session, and try again. This catches sustained provider
- * outages that outlast both the forwarder's 429-absorption and pi's internal
- * retry. Flat 2-minute backoff between each restart.
- */
-const SESSION_RESTART_ATTEMPTS = 3;
-const SESSION_RESTART_DELAY_MS = 120_000; // 2 minutes
-/** Hard cap on total restarts across all reset cycles, so progress-based resets
- *  can't loop forever on a provider that keeps failing after partial work. */
-const SESSION_RESTART_HARD_CAP = 9;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 export interface RunInput {
   repo: string; // owner/name
@@ -129,24 +109,37 @@ export interface RunStats {
 }
 
 /**
- * Run one job end-to-end: fetch issue → route profile → clone → run pi →
+ * Run one job end-to-end: fetch issue → route profile → clone → run agent →
  * commit → push → open PR → comment on issue.
  *
  * The agent's conversation is persisted to a session file under `./sessions/`
- * (survives workspace disposal, resumable via SessionManager.open). When a
- * `runStore` is supplied (serve mode), a `runs` row records status/PR/summary.
+ * (survives workspace disposal, resumable). When a `runStore` is supplied
+ * (serve mode), a `runs` row records status/PR/summary.
+ *
+ * The agent runs via `runAgentLoop` (src/engine/runtime.ts), which owns the
+ * restart loop + stall watcher + stats capture and is runtime-agnostic. The
+ * runtime (pi by default, opencode when the profile selects it) is resolved by
+ * `resolveRuntimeName` from command → profile → config default.
  */
 export async function runJob(
   config: NoodleConfig,
   gh: GitHubClient,
   input: RunInput,
   deps?: {
-    /** Optional pre-built auth storage (carrying API keys). */
-    authStorage?: AuthStorageInstance;
     /** Optional run store — when set, the run is recorded in the `runs` table. */
     runStore?: RunStore;
-    /** Override for tests. Defaults to pi's createAgentSession. */
-    createAgentSessionFn?: typeof createAgentSession;
+    /**
+     * Which agent runtime to use. Defaults to `PiRuntime`; tests inject a fake
+     * runtime to avoid spinning up a real agent. (OpenCode runs pass an
+     * `OpenCodeRuntime` instance here in Milestone 2.)
+     */
+    runtime?: AgentRuntime;
+    /**
+     * Test-only: bypass the runtime entirely and return a bare `RuntimeSession`
+     * directly. `runAgentLoop` wraps it with a stall watcher. Production calls
+     * leave this unset.
+     */
+    bootFn?: RuntimeBootOptions["bootFn"];
     /**
      * Fresh-credential providers — serve mode passes these so long jobs
      * (2h+) re-mint their GitHub token / client at each git+HTTP op instead
@@ -163,6 +156,20 @@ export async function runJob(
      * concurrency gating. CLI runs don't set this (no queue).
      */
     onProfileResolved?: (profile: string) => void;
+    /**
+     * Available slash commands (rows from the command store). When supplied,
+     * the run resolves which command (if any) matches the issue+comments and
+     * uses its `system_prompt` as the agent framing + its profile override.
+     * Omit to run with the built-in default framing (legacy behaviour).
+     */
+    commands?: CommandRow[];
+    /**
+     * MCP server store — when set and the resolved profile has `mcp_servers`
+     * names, `runJob` resolves them to full definitions (via `store.getByNames`)
+     * and passes them through to the runtime's boot options. Omit for CLI/tests
+     * (OpenCode runs without MCP servers when no store is available).
+     */
+    mcpServerStore?: { getByNames(names: string[]): Record<string, import("../config/schema.js").McpServerDefinition> };
   },
 ): Promise<RunResult> {
   const agentName = config.agent_name;
@@ -272,7 +279,7 @@ export async function runJob(
   const tagProfile = extractProfileTag(issue.body ?? "", profileNames)
     ?? comments.map((c) => extractProfileTag(c.body ?? "", profileNames)).find((p) => p !== null)
     ?? null;
-  const profile = tagProfile && config.profiles[tagProfile]
+  let profile = tagProfile && config.profiles[tagProfile]
     ? { name: tagProfile, ...config.profiles[tagProfile] }
     : resolveProfile(config, {
         title: issue.title,
@@ -280,37 +287,47 @@ export async function runJob(
         labels: issue.labels,
         comments: comments.map((c) => c.body),
       });
-  log_.info({ profile: profile.name, model: profile.model, via: tagProfile ? "#tag" : "routing" }, "routed profile");
+
+  // Resolve the slash command that drove this run (if commands are wired in).
+  // A matching command overrides the routed profile when it pins one, and its
+  // system_prompt becomes the agent framing. With no command list supplied
+  // (CLI/tests) we fall back to the built-in default framing — today's behaviour.
+  const command = deps?.commands?.length
+    ? resolveCommand(deps.commands, {
+        title: issue.title,
+        body: issue.body ?? "",
+        labels: issue.labels,
+        comments: comments.map((c) => c.body ?? ""),
+      })
+    : null;
+  let commandName: string | null = null;
+  if (command) {
+    commandName = command.trigger;
+    if (command.profile && config.profiles[command.profile]) {
+      profile = { name: command.profile, ...config.profiles[command.profile] };
+    }
+  }
+  log_.info(
+    { profile: profile.name, model: profile.model, via: tagProfile ? "#tag" : "routing", command: commandName },
+    "routed profile",
+  );
   if (runStore) {
-    runStore.updateRun(jobId, { profile: profile.name, model: profile.model });
+    runStore.updateRun(jobId, { profile: profile.name, model: profile.model, ...(commandName ? { command: commandName } : {}) });
   }
   // Correct the job row's enqueue-time profile hint if authoritative resolution
   // differed (e.g. label routing overrode the default). Keeps per-profile
   // concurrency gating accurate.
   deps?.onProfileResolved?.(profile.name);
 
-  // 3. Resolve the model via the registry.
-  const authStorage = deps?.authStorage ?? AuthStorage.create();
-  const modelRegistry = ModelRegistry.create(authStorage);
-  // Register any custom-endpoint profiles (Ollama/vLLM/proxies) with pi first.
-  // Returns a map from profile name → provider key used in the registry (handles
-  // dedup when multiple profiles share the same provider name).
-  const providerKeyMap = registerCustomProviders(config, modelRegistry);
-  const providerKey = providerKeyMap.get(profile.name) ?? profile.provider;
-  let model: Model<Api> | undefined;
-  try {
-    model = modelRegistry.find(providerKey, profile.model);
-  } catch (e) {
-    throw new Error(
-      `Could not resolve model "${providerKey}/${profile.model}". ` +
-        `Check the profile config and that the model id is valid. (${(e as Error).message})`,
-    );
-  }
-  if (!model) {
-    throw new Error(
-      `Could not resolve model "${providerKey}/${profile.model}". ` +
-        `Check the profile config and that the model id is valid.`,
-    );
+  // 3. Resolve the agent runtime for this run (pi default, opencode when the
+  // profile/command selects it). Recorded on the runs row for the dashboard.
+  // Tests inject a fake `runtime` directly (bypassing resolution); production
+  // resolves from command-runtime-override → profile → config default.
+  const runtimeName = resolveRuntimeName(config, profile, (command as { runtime?: string } | null)?.runtime ?? null);
+  const runtime = deps?.runtime ?? await runtimeForName(runtimeName);
+  log_.info({ runtime: runtimeName, profile: profile.name, model: profile.model }, "resolved runtime");
+  if (runStore) {
+    runStore.updateRun(jobId, { runtime: runtimeName });
   }
 
   // 4. Clone + branch. Base = repo default branch (resolved dynamically).
@@ -341,154 +358,51 @@ export async function runJob(
     }
     await installSkills(ws.path);
 
-    // 5. Build prompt + resource loader.
-    // Probe the host hardware up front so the agent knows whether this box can
-    // run builds/tests or must verify by reasoning — a small VPS / container
-    // often can't, and a "let me run the build" attempt will hang or crash.
+    // 5. Build the prompt. Probe the host hardware up front so the agent knows
+    // whether this box can run builds/tests or must verify by reasoning — a
+    // small VPS / container often can't, and a "let me run the build" attempt
+    // will hang or crash. Framing = the matched command's system_prompt, or the
+    // built-in default.
     const sysFacts = collectSysFacts();
     log_.debug({ sysFacts }, "probed system info for agent prompt");
-    const prompt = buildPrompt(issue, comments, input.repo, agentName, buildSysInfoGuidance(sysFacts));
-    // Optional per-profile rate-limit throttle (e.g. NVIDIA NIM's 40 rpm).
-    const throttle = throttleForRpm(profile.api_rpm);
-    // pi retry settings tuned from the profile config so 429 retries don't cascade.
-    const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
-    const loader = new DefaultResourceLoader({
-      cwd: ws.path,
-      agentDir: join(ws.path, ".noodle-agent"),
-      settingsManager,
-      ...(throttle
-        ? { extensionFactories: [throttleExtensionFactory(throttle, `${profile.provider}/${profile.model}`)] }
-        : {}),
-    });
-    await loader.reload();
+    const framing = command?.system_prompt?.trim()
+      ? command.system_prompt
+      : defaultCommandPrompt(agentName);
+    const prompt = buildRunPrompt(framing, issue, comments, input.repo, buildSysInfoGuidance(sysFacts));
 
-    // 6. Create pi session + run. The agent ends by posting its full final
-    // answer as a normal text message; Noodle phrases it into the issue
-    // comment / PR body via one post-run LLM call (below).
+    // 6. Run the agent via the runtime abstraction. `runAgentLoop` owns the
+    // session boot, the restart loop (same persisted session on failure), the
+    // stall watcher, and stats capture — all runtime-agnostic. The runtime
+    // (pi by default) handles session construction + event translation.
     //
     // The session is PERSISTED to a stable dir (./sessions/<jobId>/) that
     // survives workspace disposal — so the full conversation (messages, tool
     // calls, tool results) is on disk for resume/inspection without us having
     // to log it ourselves. The runs row (if any) points at the session file.
-    //
-    // The prompt runs in a restart loop: if session.prompt() throws (after pi's
-    // own 5-attempt retry exhausted), we dispose the session, wait 2 minutes,
-    // reopen the SAME session file (full context survives on disk), create a
-    // fresh session, and try again. Up to 3 restarts before giving up.
     const sessionDir = sessionsDirFor(jobId);
-    const create = deps?.createAgentSessionFn ?? createAgentSession;
     const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
     const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
-    const sessionCreateOpts = {
+    // Resolve MCP server names from the store after profile resolution. The
+    // profile's mcp_servers is a string[] (names); the store has the full defs.
+    const resolvedMcpServers = deps?.mcpServerStore && profile.mcp_servers?.length
+      ? deps.mcpServerStore.getByNames(profile.mcp_servers)
+      : undefined;
+
+    const runtimeOpts: RuntimeBootOptions = {
       cwd: ws.path,
-      model,
-      authStorage,
-      modelRegistry,
-      settingsManager,
-      resourceLoader: loader,
-      // Forward the profile's thinking level. pi-ai clamps it to what the model
-      // supports (gated on model.reasoning === true), so passing "medium" to a
-      // non-reasoning model (gpt-4o) is a safe no-op.
-      thinkingLevel: profile.thinking_level,
-      tools: profile.tools,
-      customTools: [
-        createCommentOnIssueTool(gh, input.repo, input.issueNumber, agentName),
-      ],
+      sessionDir,
+      profile,
+      resolvedMcpServers,
+      stallBudgets: { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs },
+      log_,
+      customTools: [createCommentOnIssueTool(gh, input.repo, input.issueNumber, agentName)],
+      // Attach the log subscriber to each freshly-booted session (initial boot
+      // and every restart) so events are mirrored into the run log in real time.
+      onSession: (s) => subscribeForLogging(s, log_),
+      ...(deps?.bootFn ? { bootFn: deps.bootFn } : {}),
     };
 
-    /** Create a session + attach logging + stall watcher. Caller disposes. */
-    const bootSession = async (sessionManager: SessionManager) => {
-      const { session } = await create({ ...sessionCreateOpts, sessionManager });
-      subscribeForLogging(session, log_);
-      const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
-      const unsubStall = watcher.attach();
-      return { session, sessionManager, watcher, unsubStall };
-    };
-
-    log_.info(
-      { idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" },
-      "starting agent run",
-    );
-    const startedAt = Date.now();
-
-    // First attempt: fresh session.
-    let currentManager = SessionManager.create(ws.path, sessionDir);
-    let booted = await bootSession(currentManager);
-    let promptError: unknown = null;
-
-    for (let attempt = 0, totalRestarts = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++, totalRestarts++) {
-      if (totalRestarts > SESSION_RESTART_HARD_CAP) {
-        log_.warn({ totalRestarts }, "hit hard cap on total restarts — giving up");
-        break;
-      }
-      const { session, sessionManager, watcher, unsubStall } = booted;
-      const turnsBefore = session.getSessionStats?.()?.assistantMessages ?? 0;
-      try {
-        await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
-      } catch (e) {
-        watcher.dispose();
-        unsubStall?.();
-        // Translate the abort-into-reject of a stalled run into a typed error so
-        // the queue can skip retrying it (a stall won't recover on its own).
-        if (watcher.didStall) {
-          throw new StallTimeoutError(
-            (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
-            watcher.activeBudget,
-          );
-        }
-        promptError = e;
-      }
-      // Even when prompt() doesn't throw, pi may have resolved with an error
-      // stop reason (retryable errors that exhausted all pi-internal retries
-      // resolve gracefully instead of throwing). Treat that as a failure too.
-      if (!promptError) {
-        const sr = lastAssistantStopReason(session);
-        if (sr.stopReason === "error") {
-          promptError = new Error(sr.errorMessage ?? "agent run ended on error (stopReason=error)");
-        }
-      }
-
-      // Success — clean up and exit the restart loop.
-      if (!promptError) {
-        watcher.dispose();
-        unsubStall?.();
-        break;
-      }
-
-      // Failure — dispose, optionally restart.
-      watcher.dispose();
-      unsubStall?.();
-
-      // If the agent completed new turns before failing, it made real progress.
-      // Reset the restart counter so a run that's actively working always gets
-      // 3 fresh restarts — instead of burning its budget on one bad stretch.
-      const turnsAfter = session.getSessionStats?.()?.assistantMessages ?? 0;
-      if (turnsAfter > turnsBefore) {
-        log_.info({ turnsBefore, turnsAfter }, "agent made progress before failure — resetting restart budget");
-        attempt = -1; // loop increments to 0 → 3 fresh attempts
-      }
-
-      if (attempt >= SESSION_RESTART_ATTEMPTS) break;
-
-      const sessionPath = sessionManager.getSessionFile();
-      try { await session.dispose?.(); } catch { /* best-effort */ }
-      log_.warn(
-        { err: (promptError as Error).message ?? String(promptError), restartAttempt: attempt + 2, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
-        "session.prompt() failed — will restart with same session after backoff",
-      );
-      await sleep(SESSION_RESTART_DELAY_MS);
-      currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
-      booted = await bootSession(currentManager);
-      log_.info({ restartAttempt: attempt + 2 }, "restarted session from saved context");
-    }
-
-    if (promptError) {
-      throw promptError;
-    }
-
-    const session = booted.session;
-    const sessionManager = booted.sessionManager;
-    const durationMs = Date.now() - startedAt;
+    const { session, sessionPath, durationMs } = await runAgentLoop(runtime, runtimeOpts, prompt);
 
     // After dispose, a lingering pi bash-tool PTY socket can emit a final chunk
     // whose handler throws "Agent listener invoked outside active run" from an
@@ -530,7 +444,7 @@ export async function runJob(
       log_.info("agent run finished");
 
       // Capture the persisted session file path (for the runs row + RunResult).
-      const sessionPath = sessionManager.getSessionFile() ?? undefined;
+      // sessionPath comes from runAgentLoop (the runtime's persisted file, if any).
       if (runStore && sessionPath) {
         runStore.updateRun(jobId, { session_path: sessionPath });
       }
@@ -546,12 +460,15 @@ export async function runJob(
         const errMsg = stopReason.errorMessage ?? "unknown error";
         log_.error({ errorMessage: errMsg, stopReason: stopReason.stopReason }, "agent run ended on error");
       } else {
-        // Capture the agent's final message — its actual answer. Posted verbatim
-        // as the issue comment / PR body (with a signature footer), so the
-        // agent's own words reach the reader.
+        // Capture the agent's final message — its actual answer. Then phrase it
+        // into a clean comment/PR body via a single relay LLM call (cleans
+        // formatting + strips tool residue WITHOUT losing detail). Falls back to
+        // the raw answer on any failure, so the run is never blocked by phrasing.
         agentAnswer = extractLastAssistantText(session);
         if (!agentAnswer) {
           log_.warn("agent produced no final assistant message; comment will use the generic template");
+        } else {
+          agentAnswer = await phraseOutput(agentAnswer, config, profile);
         }
       }
 
@@ -736,246 +653,10 @@ export function suppressPostDisposeBashRace(log_: typeof log): () => void {
   return () => process.removeListener("uncaughtException", guard);
 }
 
-/**
- * Stable directory for a run's persisted pi session. Lives OUTSIDE the temp
- * workspace (which is rm'd on dispose) so the conversation survives for resume
- * and inspection. Read from NOODLE_SESSIONS_DIR, default ./sessions/<jobId>/.
- */
-function sessionsDirFor(jobId: string): string {
-  const base = resolve(process.env.NOODLE_SESSIONS_DIR ?? "./sessions");
-  const dir = join(base, jobId);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-/**
- * Pull the last assistant text message out of a pi session's message history.
- * This is the agent's actual answer — posted verbatim as the issue comment /
- * PR body. Only trustworthy when the run didn't end on an error (see
- * `lastAssistantStopReason`); an error-stopped run may have only an opening
- * utterance, not a real answer.
- *
- * Duck-typed (not relying on the AgentMessage type from a transitive dep) and
- * tolerant of both shapes pi uses: `content` as a string, or as an array of
- * parts where each part has `{ type: "text", text }`. Walks messages in
- * reverse and returns the first non-empty assistant text, or undefined.
- *
- * Exported for unit testing.
- */
-export function extractLastAssistantText(session: unknown): string | undefined {
-  const messages = (session as { messages?: unknown[] })?.messages;
-  if (!Array.isArray(messages)) return undefined;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as { role?: string; content?: unknown };
-    if (m?.role !== "assistant") continue;
-    const text = textFromContent(m.content);
-    if (text) return text;
-  }
-  return undefined;
-}
-
-/** Coerce a pi message `content` (string or array of parts) into plain text. */
-function textFromContent(content: unknown): string | undefined {
-  if (typeof content === "string") return content.trim() || undefined;
-  if (!Array.isArray(content)) return undefined;
-  const parts = content
-    .filter((p) => (p as { type?: string })?.type === "text")
-    .map((p) => (p as { text?: string }).text ?? "")
-    .join("\n")
-    .trim();
-  return parts || undefined;
-}
-
-/**
- * Read the `stopReason` (+ `errorMessage`, if any) of the LAST assistant
- * message in a pi session. pi records a turn that ended in an internal error as
- * `{ stopReason: "error", errorMessage: "..." }` — the run resolves normally
- * but the agent never reached a real conclusion.
- *
- * When `stopReason === "error"`, any earlier assistant text is just an opening
- * utterance (e.g. "I'll load the skills first…"), NOT an answer. The runner
- * uses this to detect error-stopped runs and surface the failure instead of
- * posting that utterance as if it were a real response.
- *
- * Returns `{ stopReason: undefined }` when there are no assistant messages.
- *
- * Exported for unit testing.
- */
-export function lastAssistantStopReason(
-  session: unknown,
-): { stopReason: string | undefined; errorMessage?: string } {
-  const messages = (session as { messages?: unknown[] })?.messages;
-  if (!Array.isArray(messages)) return { stopReason: undefined };
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as { role?: string; stopReason?: string; errorMessage?: string };
-    if (m?.role !== "assistant") continue;
-    return { stopReason: m.stopReason, errorMessage: m.errorMessage };
-  }
-  return { stopReason: undefined };
-}
-
-/**
- * Mirror pi agent events into the run log — kept deliberately minimal so
- * `docker logs` stays readable. One short line per thing that matters:
- *
- *   ▶ agent started
- *   💬 <full assistant reply>
- *   ▸ grep                       (tool call — name only)
- *   $ npm test                   (bash — the actual command)
- *   ✓ grep                       (tool finished ok)
- *   ✗ bash: <first line of err>  (tool errored)
- *   ↻ retry 1/3: 429 …
- *   ■ agent finished
- *
- * Tool outputs, args, turn boundaries, and streaming updates are dropped here —
- * they live in the persisted session file (./sessions/<jobId>/) if ever needed.
- * pi also echoes each tool result back as a follow-up assistant message; we
- * suppress that echo so a result isn't logged twice.
- */
-function subscribeForLogging(
-  session: { subscribe?: (fn: (e: unknown) => void) => unknown },
-  log_: typeof log,
-) {
-  if (typeof session.subscribe !== "function") return;
-  // Text of the most recent tool result, so a follow-up assistant message that
-  // just echoes it can be detected and skipped.
-  let lastToolOutput = "";
-  session.subscribe((event: unknown) => {
-    const e = event as Record<string, unknown>;
-    switch (e.type) {
-      case "agent_start":
-        log_.info("▶ agent started");
-        break;
-
-      case "agent_end":
-        log_.info(e.willRetry === true ? "■ agent finished (will retry)" : "■ agent finished");
-        break;
-
-      case "message_end": {
-        const msg = e.message as { role?: string } | undefined;
-        // pi emits message_end for tool/user messages too — only the assistant's
-        // own reply is useful as a log line.
-        if (msg?.role && msg.role !== "assistant") break;
-        const text = extractMessageText(msg).trim();
-        if (!text || text === lastToolOutput) break;
-        lastToolOutput = "";
-        log_.info(`» ${text}`);
-        break;
-      }
-
-      case "tool_execution_start":
-        lastToolOutput = "";
-        log_.info(toolStartLabel(e.toolName, e.args));
-        break;
-
-      case "tool_execution_end": {
-        const isError = e.isError === true;
-        const out = extractToolResultText(e.result).trim();
-        lastToolOutput = out.slice(0, 300);
-        if (isError) {
-          log_.warn(`✗ ${e.toolName}: ${truncate(firstLine(out), 200)}`);
-        } else {
-          log_.info(`✓ ${e.toolName}`);
-        }
-        break;
-      }
-
-      case "auto_retry_start":
-        log_.warn(`↻ retry ${e.attempt}/${e.maxAttempts}: ${e.errorMessage}`);
-        break;
-
-      case "compaction_start":
-        log_.info("♻ compacting context");
-        break;
-
-      case "compaction_end":
-        if (e.errorMessage) log_.warn("♻ compaction failed");
-        break;
-
-      default:
-        // Drop the rest (turn_*, message_start/update, tool_execution_update,
-        // queue_update, auto_retry_end, …) — noise for log readability.
-    }
-  });
-}
-
-/**
- * Pull the concatenated text out of a pi AgentMessage (an assistant message's
- * content is an array of TextContent | ThinkingContent | ToolCall). Returns the
- * full assistant reply text, or "" if there's no text content.
- */
-function extractMessageText(message: unknown): string {
-  if (!message || typeof message !== "object") return "";
-  const content = (message as { content?: unknown[] }).content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-/**
- * Pull the returned text out of a pi AgentToolResult. The result's `content` is
- * an array of TextContent | ImageContent — concatenate the text blocks.
- */
-function extractToolResultText(result: unknown): string {
-  if (!result || typeof result !== "object") return "";
-  const content = (result as { content?: unknown[] }).content;
-  if (!Array.isArray(content)) {
-    // Some tools return a plain string or other shape — coerce to string.
-    return String(result);
-  }
-  return content
-    .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + `… (+${s.length - max} more chars)` : s;
-}
-
-/** First non-empty line of `s`, trimmed — used to summarize a tool error. */
-function firstLine(s: string): string {
-  for (const line of s.split("\n")) {
-    const t = line.trim();
-    if (t) return t;
-  }
-  return "";
-}
-
-/**
- * Label for a `tool_execution_start` event. Each tool gets a short symbol +
- * the one arg that matters for log readability (a file path, a pattern, the
- * shell command). Matches the cron-run.ts labels so both run paths read the
- * same in the console.
- */
-function toolStartLabel(toolName: unknown, args: unknown): string {
-  const a = (args as Record<string, unknown> | null) ?? {};
-  const pathOf = () => (typeof a.path === "string" ? a.path : "?");
-  const patternOf = () => (typeof a.pattern === "string" ? a.pattern : "?");
-  switch (toolName) {
-    case "read":
-      return `☰ read > ${pathOf()}`;
-    case "write":
-      return `✎ write > ${pathOf()}`;
-    case "edit":
-      return `✎ edit > ${pathOf()}`;
-    case "bash": {
-      const cmd = a.command;
-      if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
-      return "$ ?";
-    }
-    case "find":
-      return `⌖ find > ${patternOf()}`;
-    case "grep":
-      return `⌕ grep > ${patternOf()}`;
-    case "ls":
-      return `≡ ls > ${pathOf()}`;
-    default:
-      return `▸ ${toolName}`;
-  }
-}
+// Re-export the runtime-neutral helpers (now living in runtime.ts) so existing
+// imports from run.js — cron-run.ts + the stop-reason / summary-fallback tests —
+// keep resolving. The canonical implementations are in runtime.ts.
+export { extractLastAssistantText, lastAssistantStopReason } from "./runtime.js";
 
 /**
  * Terminal label state for a finished run: `cooked` (success / clean no-change)
