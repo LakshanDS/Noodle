@@ -1,15 +1,13 @@
 <script setup lang="ts">
 /**
- * Commands list — a table of user-defined slash commands inside the app shell.
+ * Commands list — a table of slash-command runners inside the app shell.
  * Each row opens the editor; the "New command" action opens the create form.
- *
- * MOCK ONLY: backed by src/lib/mock.ts until the command-store/API lands. Swap
- * mockListCommands → getJson<CommandsResponse>("/api/commands") to migrate.
+ * Backed by the DB command store via GET /api/commands.
  */
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { mockListCommands } from "../lib/mock.js";
-import type { CommandRow } from "../api/types.js";
+import { getJson } from "../api/client.js";
+import type { CommandRow, CommandsResponse } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import StatusPill from "../components/ui/StatusPill.vue";
@@ -24,7 +22,7 @@ async function load(): Promise<void> {
   loading.value = true;
   loadError.value = "";
   try {
-    const body = await mockListCommands();
+    const body = await getJson<CommandsResponse>("/api/commands");
     commands.value = body.commands ?? [];
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : "Could not load commands.";
@@ -83,6 +81,7 @@ onMounted(load);
             </td>
             <td class="col-trigger">
               <code class="tag">/{{ c.trigger }}</code>
+              <span v-if="c.is_builtin" class="builtin-badge" title="Built-in command — cannot be deleted">built-in</span>
             </td>
             <td>
               <span class="cmd-name">{{ c.name }}</span>
@@ -160,6 +159,16 @@ tbody tr:last-child td {
   background: var(--surface-4);
   color: var(--text-2);
   padding: 2px 7px;
+  border-radius: var(--radius-sm);
+}
+.builtin-badge {
+  margin-left: var(--space-2);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
   border-radius: var(--radius-sm);
 }
 .col-status,

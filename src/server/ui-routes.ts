@@ -6,8 +6,11 @@ import type { RunStore } from "./run-store.js";
 import type { JobQueue } from "./queue.js";
 import { CronStore } from "./cron-store.js";
 import type { NewCron, CronUpdate } from "./cron-store.js";
+import { CommandStore, normalizeTrigger } from "./command-store.js";
+import type { CommandUpdate } from "./command-store.js";
 import { SettingStore, SETTING_CATALOG } from "./settings-store.js";
 import { ProfileStore, validateProfileInput, type StoredProfile } from "./profile-store.js";
+import { McpServerStore, type NewMcpServer, type McpServerUpdate } from "./mcp-server-store.js";
 import { SETUP_PROFILE_KEY, type SetupProfile } from "../config/setup-fallback.js";
 import { isAppMode } from "../github/auth-provider.js";
 import type { AuthProvider } from "../github/auth-provider.js";
@@ -54,16 +57,20 @@ export interface UiDeps {
   agentName: string;
   /** Cron job store — for the /api/crons CRUD + manual-run routes. */
   cronStore: CronStore;
+  /** Command store — for the /api/commands CRUD routes (slash-command runners). */
+  commandStore: CommandStore;
   /** Settings store — for the /api/settings read/write routes (secrets etc.). */
   settingsStore: SettingStore;
   /** Profile store — for the /api/profiles CRUD routes (DB-managed profiles). */
   profileStore: ProfileStore;
+  /** MCP server store — for the /api/mcp-servers CRUD routes (shared server library). */
+  mcpServerStore: McpServerStore;
   /** Resolved config — for the profile-name dropdown + default profile. */
   config: NoodleConfig;
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, secret, queue, authProvider, agentName, cronStore, settingsStore, profileStore, config } = deps;
+  const { runStore, secret, queue, authProvider, agentName, cronStore, commandStore, settingsStore, profileStore, mcpServerStore, config } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   const auth = async (req: FastifyRequest, reply: FastifyReply) => requireAuth(req, reply, secret);
@@ -154,6 +161,7 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       ...(parsed.llm.apiKeyEnv ? { api_key_env: parsed.llm.apiKeyEnv } : {}),
       ...(parsed.llm.baseUrl ? { base_url: parsed.llm.baseUrl } : {}),
       ...(parsed.llm.api ? { api: parsed.llm.api } : {}),
+      ...(parsed.llm.runtime ? { runtime: parsed.llm.runtime } : {}),
     };
     values[SETUP_PROFILE_KEY] = JSON.stringify(seed);
 
@@ -433,6 +441,133 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     return { ok: true };
   });
 
+  // --- Commands (slash-command runners). All auth-guarded. ---
+  // A command is a `/<trigger>` wake that supplies the agent framing prompt
+  // and an optional profile override. The built-in `/<agent>` command (e.g.
+  // /noodle) is seeded on boot, marked is_builtin, and cannot be deleted.
+  app.get("/api/commands", { preHandler: auth }, async () => {
+    return { commands: commandStore.list() };
+  });
+
+  app.post("/api/commands", { preHandler: auth }, async (req, reply) => {
+    const body = readJsonBody(req.body);
+    const parsed = parseCommandInput(body);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    // Enforce trigger uniqueness (case-insensitive) before the DB constraint.
+    if (commandStore.getByTrigger(parsed.trigger)) {
+      return reply.code(409).send({ error: `command "/${parsed.trigger}" already exists` });
+    }
+    try {
+      const command = commandStore.create(parsed);
+      return { command };
+    } catch (e) {
+      return reply.code(409).send({ error: (e as Error).message });
+    }
+  });
+
+  app.get("/api/commands/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    try {
+      const command = commandStore.get(id);
+      return { command };
+    } catch {
+      return reply.code(404).send({ error: "command not found" });
+    }
+  });
+
+  app.patch("/api/commands/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    const body = readJsonBody(req.body);
+    const parsed = parseCommandUpdate(body);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    // If renaming the trigger, enforce uniqueness against the OTHER rows.
+    if (parsed.trigger !== undefined) {
+      const clash = commandStore.getByTrigger(parsed.trigger);
+      if (clash && clash.id !== id) {
+        return reply.code(409).send({ error: `command "/${parsed.trigger}" already exists` });
+      }
+    }
+    try {
+      const command = commandStore.update(id, parsed);
+      return { command };
+    } catch {
+      return reply.code(404).send({ error: "command not found" });
+    }
+  });
+
+  app.delete("/api/commands/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid id" });
+    try {
+      commandStore.delete(id);
+      return { ok: true };
+    } catch (e) {
+      const msg = (e as Error).message ?? String(e);
+      if (/built-in/.test(msg)) return reply.code(403).send({ error: msg });
+      return reply.code(404).send({ error: "command not found" });
+    }
+  });
+
+  // --- MCP Servers (shared library of server definitions). All auth-guarded. ---
+  // Profiles reference servers by name in their mcp_servers list. Only the
+  // OpenCode runtime loads them at run time; pi runs silently ignore the list.
+  app.get("/api/mcp-servers", { preHandler: auth }, async () => {
+    const servers = mcpServerStore.list().map((s) => ({
+      name: s.name,
+      type: s.server.type,
+      description: s.server.description ?? "",
+      created_at: s.created_at,
+      updated_at: s.updated_at,
+    }));
+    return { servers };
+  });
+
+  app.post("/api/mcp-servers", { preHandler: auth }, async (req, reply) => {
+    const parsed = parseMcpServerInput(req.body as Record<string, unknown> | null);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    try {
+      const stored = mcpServerStore.create(parsed);
+      return { server: stored };
+    } catch (e) {
+      const msg = (e as Error).message ?? String(e);
+      if (/already exists/.test(msg)) return reply.code(409).send({ error: msg });
+      return reply.code(400).send({ error: msg });
+    }
+  });
+
+  app.get("/api/mcp-servers/:name", { preHandler: auth }, async (req, reply) => {
+    const name = (req.params as { name: string }).name;
+    const stored = mcpServerStore.get(name);
+    if (!stored) return reply.code(404).send({ error: "mcp server not found" });
+    return { server: stored };
+  });
+
+  app.patch("/api/mcp-servers/:name", { preHandler: auth }, async (req, reply) => {
+    const name = (req.params as { name: string }).name;
+    const parsed = parseMcpServerUpdate(req.body as Record<string, unknown> | null);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    try {
+      const updated = mcpServerStore.update(name, parsed);
+      return { server: updated };
+    } catch (e) {
+      const msg = (e as Error).message ?? String(e);
+      if (/not found/.test(msg)) return reply.code(404).send({ error: msg });
+      return reply.code(400).send({ error: msg });
+    }
+  });
+
+  app.delete("/api/mcp-servers/:name", { preHandler: auth }, async (req, reply) => {
+    const name = (req.params as { name: string }).name;
+    try {
+      mcpServerStore.delete(name);
+      return { ok: true };
+    } catch {
+      return reply.code(404).send({ error: "mcp server not found" });
+    }
+  });
+
   // --- Settings (DB-backed instance secrets). All auth-guarded. ---
   // GET returns the catalog + masked values; PUT accepts new values. Secret
   // values are masked so a GET never leaks them to the browser — the UI sends
@@ -502,6 +637,50 @@ function readJsonBody(body: unknown): Record<string, unknown> | null {
   return body && typeof body === "object" ? (body as Record<string, unknown>) : null;
 }
 
+/** Validate a command create payload. Returns the typed input or { error }. */
+function parseCommandInput(
+  body: Record<string, unknown> | null,
+): { trigger: string; name: string; description: string; system_prompt: string; profile: string | null; runtime: string | null; enabled: number } | { error: string } {
+  if (!body) return { error: "missing body" };
+  const name = strField(body, "name");
+  if (!name) return { error: "name is required" };
+  const trigger = normalizeTrigger(strField(body, "trigger") ?? "");
+  if (!trigger) return { error: "trigger is required" };
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(trigger)) {
+    return { error: "trigger must be lowercase letters, digits, and hyphens only" };
+  }
+  const description = strField(body, "description") ?? "";
+  const system_prompt = typeof body.system_prompt === "string" ? body.system_prompt : "";
+  const profile = body.profile === null || body.profile === undefined ? null : (strField(body, "profile") ?? null);
+  const runtime = parseRuntimeField(body.runtime);
+  return { trigger, name, description, system_prompt, profile, runtime, enabled: 1 };
+}
+
+/** Validate a command update payload (all fields optional). Returns the typed update or { error }. */
+function parseCommandUpdate(body: Record<string, unknown> | null): CommandUpdate | { error: string } {
+  if (!body) return { error: "missing body" };
+  const out: CommandUpdate = {};
+  if (body.trigger !== undefined) {
+    const trigger = normalizeTrigger(strField(body, "trigger") ?? "");
+    if (!trigger) return { error: "trigger cannot be empty" };
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(trigger)) {
+      return { error: "trigger must be lowercase letters, digits, and hyphens only" };
+    }
+    out.trigger = trigger;
+  }
+  const name = strField(body, "name");
+  if (name !== undefined) out.name = name;
+  if (body.description !== undefined) out.description = typeof body.description === "string" ? body.description : "";
+  if (body.system_prompt !== undefined) out.system_prompt = typeof body.system_prompt === "string" ? body.system_prompt : "";
+  if (body.profile !== undefined) {
+    // null clears the override; any other value is treated as a profile name.
+    out.profile = body.profile === null ? null : (strField(body, "profile") ?? null);
+  }
+  if (body.runtime !== undefined) out.runtime = parseRuntimeField(body.runtime);
+  if (body.enabled !== undefined) out.enabled = body.enabled ? 1 : 0;
+  return out;
+}
+
 /** Validate a cron create payload. Returns the typed input or { error }. */
 function parseCronInput(body: Record<string, unknown> | null): NewCron | { error: string } {
   if (!body) return { error: "missing body" };
@@ -517,7 +696,8 @@ function parseCronInput(body: Record<string, unknown> | null): NewCron | { error
     return { error: `repo "${repo}" is not a valid "owner/name"` };
   }
   const profile = body.profile === null || body.profile === undefined ? null : strField(body, "profile");
-  return { name, repo, prompt, branch_name, cron_expression, profile, enabled: 1 };
+  const runtime = parseRuntimeField(body.runtime);
+  return { name, repo, prompt, branch_name, cron_expression, profile, runtime, enabled: 1 };
 }
 
 /** Validate a cron update payload (all fields optional). Returns the typed update or { error }. */
@@ -528,8 +708,78 @@ function parseCronUpdate(body: Record<string, unknown> | null): CronUpdate | { e
     const v = strField(body, key === "branch_name" ? "branch_name" : key);
     if (v !== undefined) (out as Record<string, unknown>)[key] = v;
   }
+  if (body.runtime !== undefined) out.runtime = parseRuntimeField(body.runtime);
   if (body.enabled !== undefined) {
     out.enabled = body.enabled ? 1 : 0;
+  }
+  return out;
+}
+
+/**
+ * Coerce a `runtime` field from the API body into the stored shape. Accepts
+ * "pi", "opencode", or null (clears the override). Any other value is rejected
+ * so the UI gets a clear error on a bad selection.
+ */
+function parseRuntimeField(v: unknown): string | null {
+  if (v === null || v === undefined || v === "") return null;
+  if (v === "pi" || v === "opencode") return v;
+  throw new Error(`runtime must be "pi", "opencode", or null (got: ${String(v)})`);
+}
+
+/** Validate an MCP server create payload. Returns the typed input or { error }. */
+function parseMcpServerInput(body: Record<string, unknown> | null): NewMcpServer | { error: string } {
+  if (!body) return { error: "missing body" };
+  const name = strField(body, "name");
+  if (!name) return { error: "name is required" };
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(name)) {
+    return { error: "name must be lowercase letters, digits, hyphens, and underscores only" };
+  }
+  const type = strField(body, "type");
+  if (!type || !["stdio", "sse", "http"].includes(type)) {
+    return { error: "type must be stdio, sse, or http" };
+  }
+  const description = strField(body, "description") ?? undefined;
+  if (type === "stdio") {
+    const command = strField(body, "command");
+    if (!command) return { error: "command is required for stdio type" };
+    const argsStr = typeof body.args === "string" ? body.args : "";
+    const args = argsStr.split(/\s+/).filter(Boolean);
+    const env = typeof body.env === "object" && body.env !== null ? body.env as Record<string, string> : undefined;
+    return { name, server: { type: "stdio", command, args, env, description } };
+  }
+  // sse or http
+  const url = strField(body, "url");
+  if (!url) return { error: `url is required for ${type} type` };
+  return { name, server: { type: type as "sse" | "http", url, args: [], description } };
+}
+
+/** Validate an MCP server update payload (all fields optional). Returns the typed update or { error }. */
+function parseMcpServerUpdate(body: Record<string, unknown> | null): McpServerUpdate | { error: string } {
+  if (!body) return { error: "missing body" };
+  const out: McpServerUpdate = {};
+  if (body.type !== undefined) {
+    const type = strField(body, "type");
+    if (!type || !["stdio", "sse", "http"].includes(type)) return { error: "type must be stdio, sse, or http" };
+    out.type = type as McpServerUpdate["type"];
+  }
+  if (body.description !== undefined) {
+    out.description = typeof body.description === "string" ? body.description || undefined : undefined;
+  }
+  if (body.command !== undefined) {
+    out.command = typeof body.command === "string" ? body.command || undefined : undefined;
+  }
+  if (body.args !== undefined) {
+    if (typeof body.args === "string") {
+      out.args = body.args.split(/\s+/).filter(Boolean);
+    } else if (Array.isArray(body.args)) {
+      out.args = body.args.map(String);
+    }
+  }
+  if (body.env !== undefined) {
+    out.env = typeof body.env === "object" && body.env !== null ? body.env as Record<string, string> : undefined;
+  }
+  if (body.url !== undefined) {
+    out.url = typeof body.url === "string" ? body.url || undefined : undefined;
   }
   return out;
 }
@@ -612,6 +862,8 @@ interface SetupPayload {
     apiKeyEnv?: string;
     baseUrl?: string;
     api?: string;
+    /** Agent runtime for the seeded profile: "pi" (default) or "opencode". */
+    runtime?: "pi" | "opencode";
   };
   uiPassword: string;
 }
@@ -650,6 +902,7 @@ function parseSetupPayload(body: Record<string, unknown>): SetupPayload | { erro
       apiKeyEnv: strField(llm, "apiKeyEnv"),
       baseUrl: strField(llm, "baseUrl"),
       api: strField(llm, "api"),
+      runtime: llm.runtime === "opencode" ? "opencode" : "pi",
     },
     uiPassword,
   };
