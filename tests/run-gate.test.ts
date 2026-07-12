@@ -1,13 +1,17 @@
 import { describe, it, expect, vi } from "vitest";
 import { NoodleConfigSchema } from "../src/config/schema.js";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { RuntimeSession } from "../src/engine/runtime.js";
 
 /**
  * Tests for the run.ts concurrency gate (cooking label) and #profile routing.
  * Heavy deps (git/skills) mocked, mirroring run-thinking.test.ts.
+ *
+ * Post-runtime-abstraction: tests inject a `bootFn` (bare RuntimeSession
+ * factory) instead of the old `createAgentSessionFn` + `authStorage`. The gate
+ * and routing logic live above the runtime, so the assertions are unchanged.
  */
 
 vi.mock("../src/util/paths.js", () => ({
@@ -19,6 +23,7 @@ vi.mock("../src/engine/workspace.js", () => ({
     clone: vi.fn().mockResolvedValue({
       path: mkdtempSync(join(tmpdir(), "noodle-gate-")),
       branch: vi.fn(),
+      checkoutOrReuse: vi.fn(),
       removeInternals: vi.fn(),
       commitAll: vi.fn().mockResolvedValue(false),
       push: vi.fn(),
@@ -55,16 +60,17 @@ function mockGh(labels: string[] = []) {
   } as any;
 }
 
-function mockSessionFn() {
+/** A bootFn stub returning a bare no-op RuntimeSession (the new contract). */
+function mockBootFn() {
   return vi.fn(() =>
     Promise.resolve({
-      session: {
-        subscribe: () => {},
-        prompt: async () => {},
-        dispose: async () => {},
-        getSessionStats: () => ({ tokens: { total: 0 }, cost: 0, toolCalls: 0, assistantMessages: 0 }),
-      },
-    }),
+      prompt: async () => {},
+      subscribe: () => () => {},
+      abort: async () => {},
+      dispose: async () => {},
+      getSessionStats: () => ({ tokens: { total: 0 }, cost: 0, toolCalls: 0, assistantMessages: 0 }),
+      messages: [],
+    } as RuntimeSession),
   );
 }
 
@@ -72,16 +78,15 @@ describe("runJob concurrency gate (cooking label)", () => {
   it("skips the run when the issue already has the cooking label", async () => {
     const config = makeConfig();
     const gh = mockGh(["Noodle is cooking"]);
-    const createAgentSessionFn = mockSessionFn();
+    const bootFn = mockBootFn();
 
     const result = await runJob(config, gh, { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
-      createAgentSessionFn: createAgentSessionFn as any,
+      bootFn: bootFn as any,
       tokenProvider: async () => "fake-token",
     });
 
-    // Did NOT start a session — the gate short-circuited.
-    expect(createAgentSessionFn).not.toHaveBeenCalled();
+    // Did NOT boot a session — the gate short-circuited.
+    expect(bootFn).not.toHaveBeenCalled();
     // Returned a clean empty result (NOT a throw — worker won't retry).
     expect(result.profile).toBe("");
     expect(result.changedFiles).toEqual([]);
@@ -90,16 +95,15 @@ describe("runJob concurrency gate (cooking label)", () => {
   it("does NOT skip when only terminal labels are present (cooked/failed)", async () => {
     const config = makeConfig();
     const gh = mockGh(["Noodle cooked here"]);
-    const createAgentSessionFn = mockSessionFn();
+    const bootFn = mockBootFn();
 
     await runJob(config, gh, { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
-      createAgentSessionFn: createAgentSessionFn as any,
+      bootFn: bootFn as any,
       tokenProvider: async () => "fake-token",
     });
 
-    // Terminal label present → run proceeded normally.
-    expect(createAgentSessionFn).toHaveBeenCalledOnce();
+    // Terminal label present → run proceeded normally (booted a session).
+    expect(bootFn).toHaveBeenCalledOnce();
   });
 });
 
@@ -116,7 +120,7 @@ describe("runJob #profile routing", () => {
         number: 1, title: "t", body: "#claude fix this", labels: [], html_url: "https://x/1",
       }),
     };
-    const createAgentSessionFn = mockSessionFn();
+    const bootFn = mockBootFn();
     // runStore spy captures which profile was routed to.
     const updates: { profile?: string }[] = [];
     const runStore = {
@@ -125,8 +129,7 @@ describe("runJob #profile routing", () => {
     };
 
     await runJob(config, gh as any, { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
-      createAgentSessionFn: createAgentSessionFn as any,
+      bootFn: bootFn as any,
       tokenProvider: async () => "fake-token",
       runStore: runStore as any,
     });

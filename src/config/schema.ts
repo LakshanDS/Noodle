@@ -11,6 +11,50 @@ export const BUILTIN_TOOLS = [
   "ls",
 ] as const;
 
+/**
+ * The coding-agent engine a profile (or run) uses. `pi` is the default and
+ * historically only runtime (`@earendil-works/pi-coding-agent`); `opencode`
+ * drives `@opencode-ai/sdk` instead. Both implement the same `AgentRuntime`
+ * contract (see src/engine/runtime.ts), so the rest of the engine is agnostic
+ * to which one a run resolved to.
+ *
+ * Selection precedence (see `resolveRuntimeName`): the command/cron's runtime
+ * override wins, then the profile's runtime, then `config.default_runtime`.
+ */
+export const RuntimeName = z.enum(["pi", "opencode"]);
+
+/**
+ * The transport type for an MCP (Model Context Protocol) server. `stdio` runs a
+ * local command; `sse`/`http` connect to a remote URL. Matches OpenCode's
+ * "local" vs "remote" distinction (mapped in the OpenCode adapter).
+ */
+export const McpTransport = z.enum(["stdio", "sse", "http"]);
+
+/**
+ * The full definition of an MCP server — stored as a JSON blob in the
+ * `mcp_servers` SQLite table (see src/server/mcp-server-store.ts) and managed
+ * via the dashboard's "MCP Servers" nav item. Profiles reference servers by
+ * name (a `string[]` on `ProfileSchema.mcp_servers`); the serve-mode worker
+ * resolves names → definitions before passing the profile to the runtime.
+ *
+ * Only the OpenCode runtime loads MCP servers (pi has no MCP support); pi runs
+ * silently ignore the selection.
+ */
+export const McpServerDefinitionSchema = z.object({
+  type: McpTransport,
+  /** stdio only: the command to launch. Required when type is stdio. */
+  command: z.string().optional(),
+  /** stdio only: argv. Defaults to empty. */
+  args: z.array(z.string()).default([]),
+  /** stdio only: process environment variables. Optional. */
+  env: z.record(z.string(), z.string()).optional(),
+  /** sse/http only: the server URL. Required when type is sse or http. */
+  url: z.string().url().optional(),
+  /** Human-readable note shown in the server list. Optional. */
+  description: z.string().optional(),
+});
+export type McpServerDefinition = z.infer<typeof McpServerDefinitionSchema>;
+
 export const ThinkingLevel = z.enum([
   "off",
   "minimal",
@@ -45,6 +89,17 @@ export const ProviderName = z.string().min(1); // pi supports many; validated at
 
 /** A named agent profile pinned to one model + tool set. */
 export const ProfileSchema = z.object({
+  /**
+   * Which coding-agent engine runs use this profile. `pi` (default) keeps the
+   * historical behaviour; `opencode` drives the OpenCode runtime instead. A
+   * run's effective runtime is resolved by `resolveRuntimeName` — this field is
+   * the profile-level default and is overridden by a command/cron `runtime`.
+   *
+   * pi-specific fields (api_rpm, retry_*, the pi `tools` allowlist) are ignored
+   * when this is `opencode`; OpenCode-specific fields (mcp_servers) are ignored
+   * when this is `pi`. The UI renders only the relevant group per runtime.
+   */
+  runtime: RuntimeName.default("pi"),
   provider: ProviderName,
   model: z.string().min(1),
   /** Custom endpoint. When set with `api`, the profile is treated as a custom provider. */
@@ -118,6 +173,17 @@ export const ProfileSchema = z.object({
    * ALL profiles.
    */
   max_concurrent: z.number().int().min(1).optional(),
+  /**
+   * MCP (Model Context Protocol) servers enabled for this profile — a list of
+   * names from the shared MCP servers library (see the "MCP Servers" nav item +
+   * src/server/mcp-server-store.ts). The serve-mode worker resolves the names
+   * to full definitions before passing the profile to the runtime.
+   *
+   * Only the OpenCode runtime loads MCP servers (pi has no MCP support); pi
+   * runs silently ignore the selection. Leave empty for profiles that don't
+   * need external tool servers.
+   */
+  mcp_servers: z.array(z.string()).default([]),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
 
@@ -252,6 +318,13 @@ export type TriggersConfig = z.infer<typeof TriggersConfigSchema>;
 export const NoodleConfigSchema = z.object({
   /** Display name used in issue labels, comments, PR bodies, branch names, etc. */
   agent_name: z.string().min(1).default("Noodle"),
+  /**
+   * Default agent runtime for runs whose profile doesn't pin one and that have
+   * no command/cron override. `pi` keeps the historical behaviour; `opencode`
+   * drives the OpenCode runtime. Per-run resolution lives in
+   * `resolveRuntimeName()` (src/engine/runtime.ts). Default `pi`.
+   */
+  default_runtime: RuntimeName.default("pi"),
   default_profile: z.string().min(1),
   profiles: z.record(z.string(), ProfileSchema),
   routing: z.array(RoutingRuleSchema).nullish().transform((v) => v ?? []),

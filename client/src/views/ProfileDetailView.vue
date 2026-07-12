@@ -46,6 +46,7 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Default profile used when creating from scratch (mirrors schema defaults). */
 function emptyProfile(): ProfileData {
   return {
+    runtime: "pi",
     provider: "",
     model: "",
     input_token_price: 0,
@@ -58,6 +59,7 @@ function emptyProfile(): ProfileData {
     api_rpm: 30,
     retry_max_attempts: 5,
     retry_base_delay_ms: 3000,
+    mcp_servers: [],
   };
 }
 
@@ -82,6 +84,25 @@ function toggleTool(tool: string): void {
   form.value.tools = [...tools];
 }
 
+// --- MCP server selector (checkbox list from the shared library) ---
+const availableMcpServers = ref<{ name: string; type: string; description: string }[]>([]);
+
+async function loadMcpServers(): Promise<void> {
+  try {
+    const body = await getJson<{ servers: { name: string; type: string; description: string }[] }>("/api/mcp-servers");
+    availableMcpServers.value = body.servers ?? [];
+  } catch {
+    /* list just stays empty */
+  }
+}
+
+/** Toggle an MCP server name in/out of form.mcp_servers. */
+function toggleMcpServer(name: string): void {
+  const set = new Set(form.value.mcp_servers);
+  if (set.has(name)) set.delete(name); else set.add(name);
+  form.value.mcp_servers = [...set];
+}
+
 async function load(): Promise<void> {
   if (!editing.value || props.name == null) {
     name.value = "";
@@ -95,7 +116,7 @@ async function load(): Promise<void> {
     name.value = body.profile.name;
     originalName.value = body.profile.name;
     source.value = body.profile.source;
-    form.value = { ...emptyProfile(), ...body.profile.profile };
+    form.value = { ...emptyProfile(), ...body.profile.profile, runtime: body.profile.profile.runtime ?? "pi" };
   } catch (e) {
     errorMsg.value = e instanceof ApiRequestError ? e.message : "Could not load profile.";
   } finally {
@@ -126,6 +147,7 @@ function payload(): ProfileInput | null {
   }
   // Build a clean profile: drop empty optional strings + NaN/blank numbers.
   const clean: ProfileData = {
+    runtime: p.runtime,
     provider: p.provider.trim(),
     model: p.model.trim(),
     input_token_price: num(p.input_token_price),
@@ -138,6 +160,7 @@ function payload(): ProfileInput | null {
     api_rpm: numOr(p.api_rpm, 0),
     retry_max_attempts: numOr(p.retry_max_attempts, 0),
     retry_base_delay_ms: numOr(p.retry_base_delay_ms, 0),
+    mcp_servers: p.mcp_servers ?? [],
   };
   if (p.base_url?.trim()) clean.base_url = p.base_url.trim();
   if (p.api) clean.api = p.api;
@@ -213,7 +236,7 @@ async function deleteProfile(): Promise<void> {
 }
 
 watch(() => [props.name, props.isNew], () => void load());
-onMounted(load);
+onMounted(() => { load(); loadMcpServers(); });
 </script>
 
 <template>
@@ -248,7 +271,13 @@ onMounted(load);
           <Field label="Name" hint="The key jobs/crons reference, and the #&lt;name&gt; tag.">
             <input v-model="name" class="ctrl" type="text" placeholder="e.g. claude-fast" :disabled="isYaml && editing" />
           </Field>
-          <Field label="Provider" hint="e.g. anthropic, openai, openrouter, ollama.">
+          <Field label="Runtime" hint="Which agent engine runs this profile. pi is the default; opencode drives @opencode-ai/sdk with MCP support + free models.">
+            <select v-model="form.runtime" class="ctrl">
+              <option value="pi">pi (default)</option>
+              <option value="opencode">opencode</option>
+            </select>
+          </Field>
+          <Field label="Provider" hint="e.g. anthropic, openai, openrouter, ollama. For OpenCode Zen free models, use 'opencode'.">
             <input v-model="form.provider" class="ctrl" type="text" placeholder="anthropic" />
           </Field>
           <Field label="Model" hint="The model identifier the provider accepts.">
@@ -333,21 +362,40 @@ onMounted(load);
           </Field>
         </Card>
 
-        <!-- Limits -->
-        <Card title="Rate limits & retries">
+        <!-- Limits (pi-only — OpenCode ignores these) -->
+        <Card title="Rate limits & retries" subtitle="pi runtime only — ignored when runtime is opencode">
           <div class="grid-2">
             <Field label="API requests / minute" hint="0 = unlimited. Throttles before each provider call.">
-              <input v-model.number="form.api_rpm" class="ctrl" type="number" min="0" placeholder="30" />
+              <input v-model.number="form.api_rpm" class="ctrl" type="number" min="0" placeholder="30" :disabled="form.runtime === 'opencode'" />
             </Field>
             <Field label="Max retry attempts" hint="Agent-level retries after a failed LLM turn.">
-              <input v-model.number="form.retry_max_attempts" class="ctrl" type="number" min="0" placeholder="5" />
+              <input v-model.number="form.retry_max_attempts" class="ctrl" type="number" min="0" placeholder="5" :disabled="form.runtime === 'opencode'" />
             </Field>
             <Field label="Retry base delay (ms)" hint="Doubles each attempt.">
-              <input v-model.number="form.retry_base_delay_ms" class="ctrl" type="number" min="0" placeholder="3000" />
+              <input v-model.number="form.retry_base_delay_ms" class="ctrl" type="number" min="0" placeholder="3000" :disabled="form.runtime === 'opencode'" />
             </Field>
             <Field label="Max concurrent jobs" hint="Cap on simultaneous runs of this profile. Optional.">
               <input v-model.number="form.max_concurrent" class="ctrl" type="number" min="1" placeholder="(global)" />
             </Field>
+          </div>
+        </Card>
+
+        <!-- MCP servers — checkbox list from the shared library (any runtime can select; pi ignores the selection) -->
+        <Card title="MCP servers" subtitle="Select servers from the shared library. Only the OpenCode runtime loads them; pi runs ignore the selection.">
+          <div v-if="availableMcpServers.length === 0" class="muted">
+            No MCP servers defined yet. Create them via the <router-link :to="{ name: 'mcp-servers' }">MCP Servers</router-link> nav item.
+          </div>
+          <div v-else class="mcp-list">
+            <label v-for="s in availableMcpServers" :key="s.name" class="mcp-item">
+              <input
+                type="checkbox"
+                :checked="form.mcp_servers.includes(s.name)"
+                @change="toggleMcpServer(s.name)"
+              />
+              <span class="mcp-item-name"><code>{{ s.name }}</code></span>
+              <span class="mcp-item-type">{{ s.type }}</span>
+              <span class="mcp-item-desc">{{ s.description }}</span>
+            </label>
           </div>
         </Card>
 
@@ -450,6 +498,46 @@ onMounted(load);
 }
 .mono {
   font-family: var(--font-mono);
+}
+.muted {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-3);
+}
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.mcp-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.mcp-item:hover {
+  background: var(--surface-1);
+}
+.mcp-item input[type="checkbox"] {
+  flex-shrink: 0;
+}
+.mcp-item-name code {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+.mcp-item-type {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  background: var(--surface-1);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+}
+.mcp-item-desc {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  margin-left: auto;
 }
 @media (max-width: 640px) {
   .grid-2 {

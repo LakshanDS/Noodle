@@ -4,20 +4,14 @@
  * sidebar on the right (trigger preview). Save creates or updates; after a
  * create we navigate to the edit route so a subsequent save updates.
  *
- * MOCK ONLY: backed by src/lib/mock.ts. Swap the mockXxx calls to sendJson /
- * getJson against /api/commands to migrate. No "Run now" — execution isn't
- * wired yet.
+ * Backed by the DB command store via /api/commands. Built-in commands (the
+ * seeded /<agent> default) can be edited but not deleted.
  */
 import { computed, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { getJson } from "../api/client.js";
-import {
-  mockGetCommand,
-  mockCreateCommand,
-  mockUpdateCommand,
-  mockDeleteCommand,
-} from "../lib/mock.js";
+import { getJson, sendJson } from "../api/client.js";
 import type {
+  CommandDetailResponse,
   CommandMutationResponse,
   ProfilesResponse,
   CommandInput,
@@ -37,8 +31,10 @@ const form = ref({
   description: "",
   system_prompt: "",
   profile: "",
+  runtime: "" as string,
   enabled: 1,
 });
+const isBuiltin = ref(0);
 const profiles = ref<string[]>([]);
 const defaultProfile = ref("");
 const saving = ref(false);
@@ -56,6 +52,7 @@ function emptyForm() {
     description: "",
     system_prompt: "",
     profile: "",
+    runtime: "",
     enabled: 1,
   };
 }
@@ -74,11 +71,12 @@ async function ensureProfiles(): Promise<void> {
 async function loadCommand(): Promise<void> {
   if (!editing.value || props.id == null) {
     form.value = emptyForm();
+    isBuiltin.value = 0;
     return;
   }
   loading.value = true;
   try {
-    const body = await mockGetCommand(Number(props.id));
+    const body = await getJson<CommandDetailResponse>(`/api/commands/${props.id}`);
     const c = body.command;
     form.value = {
       trigger: c.trigger,
@@ -86,8 +84,10 @@ async function loadCommand(): Promise<void> {
       description: c.description,
       system_prompt: c.system_prompt,
       profile: c.profile ?? "",
+      runtime: c.runtime ?? "",
       enabled: c.enabled,
     };
+    isBuiltin.value = c.is_builtin;
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : "Could not load command.";
   } finally {
@@ -102,6 +102,7 @@ function payload(): CommandInput {
     description: form.value.description.trim(),
     system_prompt: form.value.system_prompt,
     profile: form.value.profile || null,
+    runtime: form.value.runtime || null,
   };
 }
 
@@ -114,10 +115,19 @@ async function save(): Promise<void> {
   saving.value = true;
   try {
     if (editing.value && props.id != null) {
-      await mockUpdateCommand(Number(props.id), payload());
+      const body = await sendJson<CommandMutationResponse>(
+        `/api/commands/${props.id}`,
+        "PATCH",
+        payload(),
+      );
+      isBuiltin.value = body.command.is_builtin;
       await loadCommand();
     } else {
-      const body: CommandMutationResponse = await mockCreateCommand(payload());
+      const body = await sendJson<CommandMutationResponse>(
+        "/api/commands",
+        "POST",
+        payload(),
+      );
       await router.replace({ name: "command-detail", params: { id: String(body.command.id) } });
     }
   } catch (e) {
@@ -130,17 +140,26 @@ async function save(): Promise<void> {
 async function toggleEnabled(): Promise<void> {
   if (!editing.value || props.id == null) return;
   const enable = form.value.enabled === 0;
-  form.value.enabled = enable ? 1 : 0;
+  try {
+    const body = await sendJson<CommandMutationResponse>(
+      `/api/commands/${props.id}`,
+      "PATCH",
+      { enabled: enable ? 1 : 0 },
+    );
+    form.value.enabled = body.command.enabled;
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : "Could not reach server";
+  }
 }
 
 async function deleteCommand(): Promise<void> {
   if (!editing.value || props.id == null) return;
   if (!confirm("Delete this command?")) return;
   try {
-    await mockDeleteCommand(Number(props.id));
+    await sendJson(`/api/commands/${props.id}`, "DELETE");
     await router.replace({ name: "commands" });
-  } catch {
-    /* ignore */
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : "Could not delete command.";
   }
 }
 
@@ -195,6 +214,13 @@ onMounted(async () => {
               </option>
             </select>
           </Field>
+          <Field label="Runtime" hint="Override the agent engine for this command. Leave as Default to use the profile/config runtime.">
+            <select v-model="form.runtime" class="ctrl">
+              <option value="">Default (from profile)</option>
+              <option value="pi">pi</option>
+              <option value="opencode">opencode</option>
+            </select>
+          </Field>
           <Field label="System prompt / instructions" hint="The custom instructions the agent wakes up with.">
             <textarea
               v-model="form.system_prompt"
@@ -209,10 +235,13 @@ onMounted(async () => {
               {{ editing ? "Save changes" : "Create command" }}
             </Button>
             <template v-if="editing">
-              <Button variant="secondary" @click="toggleEnabled">
+              <Button v-if="!isBuiltin" variant="secondary" @click="toggleEnabled">
                 {{ form.enabled ? "Disable" : "Enable" }}
               </Button>
-              <Button variant="danger" icon="trash" @click="deleteCommand">Delete</Button>
+              <Button v-if="!isBuiltin" variant="danger" icon="trash" @click="deleteCommand">
+                Delete
+              </Button>
+              <span v-else class="builtin-tag">Built-in · always on</span>
             </template>
           </div>
         </Card>
@@ -227,11 +256,11 @@ onMounted(async () => {
           </div>
           <p class="hint-text">
             Typing <code class="inline mono">{{ triggerPreview }}</code> in a GitHub issue or comment
-            will wake the agent with your instructions above.
+            wakes the agent with your instructions above.
           </p>
-          <p class="hint-text muted-note">
+          <p v-if="isBuiltin" class="hint-text muted-note">
             <Icon name="alert" :size="13" />
-            Execution isn't wired up yet — this page is a preview of the shape.
+            This is the built-in default command — it cannot be deleted or disabled, but its prompt and profile can be edited.
           </p>
         </Card>
       </aside>
@@ -272,6 +301,14 @@ onMounted(async () => {
   gap: var(--space-2);
   flex-wrap: wrap;
   margin-top: var(--space-4);
+  align-items: center;
+}
+.builtin-tag {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--text-3);
+  margin-left: var(--space-2);
 }
 
 .preview {

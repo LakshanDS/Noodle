@@ -6,9 +6,11 @@ import { randomBytes } from "node:crypto";
 import { RunStore } from "./run-store.js";
 import { Scheduler, SqliteScanState, runScanOnce, type SchedulerDeps } from "./scheduler.js";
 import { CronStore } from "./cron-store.js";
+import { CommandStore, seedBuiltinCommand } from "./command-store.js";
 import { CronScheduler, buildCronSchedulerDeps } from "./cron-scheduler.js";
 import { SettingStore } from "./settings-store.js";
 import { ProfileStore } from "./profile-store.js";
+import { McpServerStore } from "./mcp-server-store.js";
 import { hydrateEnvFromDb } from "./hydrate-env.js";
 import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/auth-provider.js";
 import { runJob } from "../engine/run.js";
@@ -56,8 +58,16 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const scanState = new SqliteScanState(queue.getDb());
   const runStore = new RunStore(queue.getDb());
   const cronStore = new CronStore(queue.getDb());
+  const commandStore = new CommandStore(queue.getDb());
   const settingsStore = new SettingStore(queue.getDb());
   const profileStore = new ProfileStore(queue.getDb());
+  const mcpServerStore = new McpServerStore(queue.getDb());
+
+  // Seed the built-in `/<agent>` command (e.g. /noodle) — the default fix
+  // workflow. Idempotent: refreshes the trigger + prompt if the agent was
+  // renamed, or seeds fresh on a first run. Always present so a bare
+  // `/<agent>` wake still works and resolves to today's exact prompt.
+  seedBuiltinCommand(commandStore, config.agent_name);
 
   // Merge DB-managed profiles into the in-memory config so they're runnable
   // immediately. DB profiles override same-named YAML profiles on a name clash
@@ -101,6 +111,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       }, {
         runStore,
         tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
+        mcpServerStore,
       });
       return;
     }
@@ -117,6 +128,13 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       // Correct the job row's profile hint once the authoritative profile is
       // known, so per-profile concurrency gating stays accurate.
       onProfileResolved: (profile) => queue.setJobProfile(job.id, profile),
+      // Commands drive both wake detection and the agent framing. Passed fresh
+      // per job so edits (new commands, disabled triggers) take effect at once
+      // without a server restart.
+      commands: commandStore.list(),
+      // Resolve MCP server names → definitions after profile resolution so the
+      // OpenCode adapter can build config.mcp at run time.
+      mcpServerStore,
     });
   };
 
@@ -169,6 +187,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     // honored and don't go through this filter.
     triggers: config.triggers,
     profileNames: Object.keys(config.profiles),
+    // Getter so the webhook always sees the current set of command triggers
+    // after UI edits — no restart needed.
+    commandTriggers: () => commandStore.activeTriggers(),
     enqueue: async (intent) => {
       queue.enqueue({
         repo: intent.repo,
@@ -194,7 +215,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // the wizard runs, but the wizard itself is unauthenticated and admitted
   // while isConfigured() is false.
   const cookieSecret = uiPassword || cryptoRandomSecret();
-  registerUiRoutes(app, { runStore, secret: cookieSecret, queue, authProvider, agentName: config.agent_name, cronStore, settingsStore, profileStore, config });
+  registerUiRoutes(app, { runStore, secret: cookieSecret, queue, authProvider, agentName: config.agent_name, cronStore, commandStore, settingsStore, profileStore, mcpServerStore, config });
   if (uiPassword) {
     log.info("web UI enabled (password-protected)");
   } else {

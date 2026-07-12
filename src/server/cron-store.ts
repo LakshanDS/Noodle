@@ -34,6 +34,12 @@ export interface CronRow {
   cron_expression: string;
   /** Resolved profile name, or null for the config's default_profile. */
   profile: string | null;
+  /**
+   * Runtime override for this cron: "pi", "opencode", or null to use the
+   * profile's runtime / config default. Lets a single scheduled task pin a
+   * different engine than its profile would otherwise select.
+   */
+  runtime: string | null;
   enabled: number; // 0 | 1 (SQLite has no native bool)
   /** ISO/SQLite timestamp of the last time this cron was enqueued. */
   last_run_at: string | null;
@@ -50,6 +56,7 @@ export interface NewCron {
   branch_name: string;
   cron_expression: string;
   profile?: string | null;
+  runtime?: string | null;
   enabled?: number;
 }
 
@@ -59,7 +66,7 @@ export interface NewCron {
  * All fields optional.
  */
 export type CronUpdate = Partial<
-  Pick<NewCron, "name" | "repo" | "prompt" | "branch_name" | "cron_expression" | "profile" | "enabled">
+  Pick<NewCron, "name" | "repo" | "prompt" | "branch_name" | "cron_expression" | "profile" | "runtime" | "enabled">
 >;
 
 const SCHEMA = `
@@ -71,6 +78,7 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
   branch_name TEXT NOT NULL,
   cron_expression TEXT NOT NULL,
   profile TEXT,
+  runtime TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   last_run_at TEXT,
   next_run_at TEXT,
@@ -86,6 +94,11 @@ export class CronStore {
   constructor(db: Db) {
     this.db = db;
     this.db.exec(SCHEMA);
+    // Add `runtime` to pre-existing tables. Fresh DBs have it via the CREATE.
+    const cols = db.prepare("PRAGMA table_info(cron_jobs)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "runtime")) {
+      db.exec("ALTER TABLE cron_jobs ADD COLUMN runtime TEXT");
+    }
   }
 
   /** For tests that want to inject an in-memory DB. */
@@ -113,8 +126,8 @@ export class CronStore {
     const nextRunAt = enabled ? CronStore.nextRunFromExpr(input.cron_expression) : null;
     this.db
       .prepare(
-        `INSERT INTO cron_jobs (name, repo, prompt, branch_name, cron_expression, profile, enabled, next_run_at)
-         VALUES (@name, @repo, @prompt, @branch_name, @cron_expression, @profile, @enabled, @next_run_at)`,
+        `INSERT INTO cron_jobs (name, repo, prompt, branch_name, cron_expression, profile, runtime, enabled, next_run_at)
+         VALUES (@name, @repo, @prompt, @branch_name, @cron_expression, @profile, @runtime, @enabled, @next_run_at)`,
       )
       .run({
         name: input.name,
@@ -123,6 +136,7 @@ export class CronStore {
         branch_name: input.branch_name,
         cron_expression: input.cron_expression,
         profile: input.profile ?? null,
+        runtime: input.runtime ?? null,
         enabled,
         next_run_at: nextRunAt,
       });
@@ -140,7 +154,7 @@ export class CronStore {
     const cols: string[] = [];
     const params: Record<string, unknown> = { id };
 
-    for (const key of ["name", "repo", "prompt", "branch_name", "cron_expression", "profile"] as const) {
+    for (const key of ["name", "repo", "prompt", "branch_name", "cron_expression", "profile", "runtime"] as const) {
       if (update[key] !== undefined) {
         cols.push(`${key} = @${key}`);
         params[key] = update[key];

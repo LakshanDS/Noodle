@@ -1,61 +1,35 @@
-import { createAgentSession } from "@earendil-works/pi-coding-agent";
-import type { Model, Api } from "@earendil-works/pi-ai/compat";
-import { join, resolve } from "node:path";
-import { mkdirSync } from "node:fs";
 import { log, runLogger } from "../util/log.js";
-import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildCronPrompt } from "./prompt.js";
-import { generateIssueTitle, templateTitle } from "./title.js";
+import { generateIssueTitle, templateTitle, phraseOutput } from "./title.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
-import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
-import { buildSettingsManager } from "./pi-settings.js";
-import { StallWatcher, StallTimeoutError } from "./stall.js";
 import {
-  AuthStorage,
-  ModelRegistry,
-  SessionManager,
-  DefaultResourceLoader,
-} from "@earendil-works/pi-coding-agent";
+  runAgentLoop,
+  extractLastAssistantText,
+  lastAssistantStopReason,
+  sessionsDirFor,
+  resolveRuntimeName,
+  runtimeForName,
+  type AgentRuntime,
+  type RuntimeBootOptions,
+} from "./runtime.js";
+import { subscribeForLogging } from "./runtime-events.js";
 import type { RunStore } from "../server/run-store.js";
 import type { NoodleConfig } from "../config/schema.js";
 import {
   buildFooter,
-  extractLastAssistantText,
-  lastAssistantStopReason,
   suppressPostDisposeBashRace,
   type RunResult,
   type RunStats,
 } from "./run.js";
-
-/** AuthStorage instance type (its constructor is private; use the factory's return type). */
-type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
 
 /**
  * Color applied to the agent-name label on cron output issues — teal (#008672,
  * without the leading '#'). Makes cron output visually distinct in a triage list.
  */
 const CRON_LABEL_COLOR = "008672";
-
-/**
- * Session restart loop: when session.prompt() throws after pi's own 5-attempt
- * retry is exhausted, we reopen the SAME session file (full context survives on
- * disk), create a fresh session, and try again. This catches sustained provider
- * outages that outlast both the forwarder's 429-absorption and pi's internal
- * retry. Flat 2-minute backoff between each restart — enough for NVIDIA's
- * shared-endpoint throttling to clear.
- */
-const SESSION_RESTART_ATTEMPTS = 3;
-const SESSION_RESTART_DELAY_MS = 120_000; // 2 minutes
-/** Hard cap on total restarts across all reset cycles, so progress-based resets
- *  can't loop forever on a provider that keeps failing after partial work. */
-const SESSION_RESTART_HARD_CAP = 9;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 /**
  * Input for a scheduled (cron) run. Unlike the issue-driven RunInput, there is
@@ -99,10 +73,14 @@ export async function runCronJob(
   gh: GitHubClient,
   input: CronRunInput,
   deps?: {
-    authStorage?: AuthStorageInstance;
     runStore?: RunStore;
-    createAgentSessionFn?: typeof createAgentSession;
+    /** Agent runtime (defaults to PiRuntime). Tests inject a fake. */
+    runtime?: AgentRuntime;
+    /** Test-only: bypass the runtime, return a bare RuntimeSession. */
+    bootFn?: RuntimeBootOptions["bootFn"];
     tokenProvider?: () => Promise<string>;
+    /** MCP server store — resolves profile's mcp_servers names to definitions. */
+    mcpServerStore?: { getByNames(names: string[]): Record<string, import("../config/schema.js").McpServerDefinition> };
   },
 ): Promise<RunResult> {
   const jobId = input.jobId ?? `cron-${input.repo.replace("/", "-")}`;
@@ -140,22 +118,14 @@ export async function runCronJob(
   const profile = { name: profileName, ...profileDef };
   log_.info({ profile: profile.name, model: profile.model }, "routed profile");
 
-  // 2. Resolve model via the registry (same as runJob).
-  const authStorage = deps?.authStorage ?? AuthStorage.create();
-  const modelRegistry = ModelRegistry.create(authStorage);
-  const providerKeyMap = registerCustomProviders(config, modelRegistry);
-  const providerKey = providerKeyMap.get(profile.name) ?? profile.provider;
-  let model: Model<Api> | undefined;
-  try {
-    model = modelRegistry.find(providerKey, profile.model);
-  } catch (e) {
-    throw new Error(
-      `Could not resolve model "${providerKey}/${profile.model}". ` +
-        `Check the profile config. (${(e as Error).message})`,
-    );
-  }
-  if (!model) {
-    throw new Error(`Could not resolve model "${providerKey}/${profile.model}".`);
+  // 2. Resolve the agent runtime (pi default, opencode when the profile/cron
+  // selects it). Cron runs don't have a per-cron runtime override yet, so this
+  // resolves from profile → config default.
+  const runtimeName = resolveRuntimeName(config, profile, null);
+  const runtime = deps?.runtime ?? await runtimeForName(runtimeName);
+  log_.info({ runtime: runtimeName, profile: profile.name, model: profile.model }, "resolved runtime");
+  if (runStore) {
+    runStore.updateRun(jobId, { runtime: runtimeName });
   }
 
   // 3. Clone.
@@ -180,138 +150,37 @@ export async function runCronJob(
     }
     await installSkills(ws.path);
 
-    // 5. Build prompt + resource loader.
-    const sysFacts = collectSysFacts();
-    log_.debug({ sysFacts }, "probed system info for cron prompt");
-    const prompt = buildCronPrompt(input.prompt, input.repo, config.agent_name, buildSysInfoGuidance(sysFacts));
-    const throttle = throttleForRpm(profile.api_rpm);
-    // pi retry settings tuned from the profile config so 429 retries don't cascade.
-    const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
-    const loader = new DefaultResourceLoader({
-      cwd: ws.path,
-      agentDir: join(ws.path, ".noodle-agent"),
-      settingsManager,
-      ...(throttle
-        ? { extensionFactories: [throttleExtensionFactory(throttle, `${profile.provider}/${profile.model}`)] }
-        : {}),
-    });
-    await loader.reload();
-
-    // 6. Create pi session + run. No custom output tool — the agent ends by
+    // 4. Build the cron prompt. No custom output tool — the agent ends by
     // writing its findings as a normal final text message, and Noodle opens a
     // single issue with that message as the body after the run (mirrors how
     // runJob turns the agent's answer into the issue comment + PR body).
-    //
-    // The prompt runs in a restart loop: if session.prompt() throws (after pi's
-    // own 5-attempt retry exhausted), we dispose the session, wait 2 minutes,
-    // reopen the SAME session file (full context survives), create a fresh
-    // session, and try again. Up to 3 restarts before giving up. This catches
-    // sustained provider outages that outlast both the forwarder's 429-absorption
-    // and pi's internal retry.
+    const sysFacts = collectSysFacts();
+    log_.debug({ sysFacts }, "probed system info for cron prompt");
+    const prompt = buildCronPrompt(input.prompt, input.repo, config.agent_name, buildSysInfoGuidance(sysFacts));
+
+    // 5. Run the agent via the runtime abstraction. `runAgentLoop` owns the
+    // session boot, the restart loop, the stall watcher, and stats capture —
+    // all runtime-agnostic. Cron runs pass no custom tools (no issue to comment on).
     const sessionDir = sessionsDirFor(jobId);
-    const create = deps?.createAgentSessionFn ?? createAgentSession;
     const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
     const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
-    const sessionCreateOpts = {
+    // Resolve MCP server names from the store after profile resolution.
+    const resolvedMcpServers = deps?.mcpServerStore && profile.mcp_servers?.length
+      ? deps.mcpServerStore.getByNames(profile.mcp_servers)
+      : undefined;
+
+    const runtimeOpts: RuntimeBootOptions = {
       cwd: ws.path,
-      model,
-      authStorage,
-      modelRegistry,
-      settingsManager,
-      resourceLoader: loader,
-      thinkingLevel: profile.thinking_level,
-      tools: profile.tools,
+      sessionDir,
+      profile,
+      resolvedMcpServers,
+      stallBudgets: { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs },
+      log_,
+      onSession: (s) => subscribeForLogging(s, log_),
+      ...(deps?.bootFn ? { bootFn: deps.bootFn } : {}),
     };
 
-    /** Create a session + attach logging + stall watcher. Caller disposes. */
-    const bootSession = async (sessionManager: SessionManager) => {
-      const { session } = await create({ ...sessionCreateOpts, sessionManager });
-      subscribeForLogging(session, log_);
-      const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
-      const unsubStall = watcher.attach();
-      return { session, sessionManager, watcher, unsubStall };
-    };
-
-    log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" }, "starting cron run");
-    const startedAt = Date.now();
-
-    // First attempt: fresh session.
-    let currentManager = SessionManager.create(ws.path, sessionDir);
-    let booted = await bootSession(currentManager);
-    let promptError: unknown = null;
-
-    for (let attempt = 0, totalRestarts = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++, totalRestarts++) {
-      if (totalRestarts > SESSION_RESTART_HARD_CAP) {
-        log_.warn({ totalRestarts }, "hit hard cap on total restarts — giving up");
-        break;
-      }
-      const { session, sessionManager, watcher, unsubStall } = booted;
-      const turnsBefore = session.getSessionStats?.()?.assistantMessages ?? 0;
-      try {
-        await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
-      } catch (e) {
-        watcher.dispose();
-        unsubStall?.();
-        if (watcher.didStall) {
-          // A stall won't recover on restart — surface immediately.
-          throw new StallTimeoutError(
-            (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
-            watcher.activeBudget,
-          );
-        }
-        promptError = e;
-      }
-      // Even when prompt() doesn't throw, pi may have resolved with an error
-      // stop reason (retryable errors that exhausted all pi-internal retries
-      // resolve gracefully instead of throwing). Treat that as a failure too.
-      if (!promptError) {
-        const sr = lastAssistantStopReason(session);
-        if (sr.stopReason === "error") {
-          promptError = new Error(sr.errorMessage ?? "agent run ended on error (stopReason=error)");
-        }
-      }
-
-      // Success — clean up and exit the restart loop.
-      if (!promptError) {
-        watcher.dispose();
-        unsubStall?.();
-        break;
-      }
-
-      // Failure — dispose, optionally restart.
-      watcher.dispose();
-      unsubStall?.();
-
-      // If the agent completed new turns before failing, it made real progress.
-      // Reset the restart counter so a run that's actively working always gets
-      // 3 fresh restarts — instead of burning its budget on one bad stretch.
-      const turnsAfter = session.getSessionStats?.()?.assistantMessages ?? 0;
-      if (turnsAfter > turnsBefore) {
-        log_.info({ turnsBefore, turnsAfter }, "agent made progress before failure — resetting restart budget");
-        attempt = -1; // loop increments to 0 → 3 fresh attempts
-      }
-
-      if (attempt >= SESSION_RESTART_ATTEMPTS) break;
-
-      const sessionPath = sessionManager.getSessionFile();
-      try { await session.dispose?.(); } catch { /* best-effort */ }
-      log_.warn(
-        { err: (promptError as Error).message ?? String(promptError), restartAttempt: attempt + 2, maxRestarts: SESSION_RESTART_ATTEMPTS, delayMs: SESSION_RESTART_DELAY_MS },
-        "session.prompt() failed — will restart with same session after backoff",
-      );
-      await sleep(SESSION_RESTART_DELAY_MS);
-      currentManager = SessionManager.open(sessionPath!, sessionDir, ws.path);
-      booted = await bootSession(currentManager);
-      log_.info({ restartAttempt: attempt + 2 }, "restarted session from saved context");
-    }
-
-    if (promptError) {
-      throw promptError;
-    }
-
-    const session = booted.session;
-    const sessionManager = booted.sessionManager;
-    const durationMs = Date.now() - startedAt;
+    const { session, sessionPath, durationMs } = await runAgentLoop(runtime, runtimeOpts, prompt);
 
     // Guard the benign post-dispose bash-socket race (same as runJob).
     const teardownDisposeGuard = suppressPostDisposeBashRace(log_);
@@ -339,7 +208,7 @@ export async function runCronJob(
       await session.dispose?.();
       log_.info("cron run finished");
 
-      const sessionPath = sessionManager.getSessionFile() ?? undefined;
+      // sessionPath comes from runAgentLoop (the runtime's persisted file, if any).
       if (runStore && sessionPath) {
         runStore.updateRun(jobId, { session_path: sessionPath });
       }
@@ -350,7 +219,11 @@ export async function runCronJob(
       if (errored) {
         log_.error({ errorMessage: stopReason.errorMessage, stopReason: stopReason.stopReason }, "cron run ended on error");
       } else {
-        agentAnswer = extractLastAssistantText(session);
+        // Capture the agent's findings, then phrase them into a clean issue body
+        // (cleans formatting + strips tool residue WITHOUT losing detail). Falls
+        // back to the raw answer on any failure.
+        const raw = extractLastAssistantText(session);
+        agentAnswer = raw ? await phraseOutput(raw, config, profile) : undefined;
       }
 
       // Commit + push the branch (traceability). No PR — the issue below is the output.
@@ -458,135 +331,10 @@ async function tryReuseBranch(
 }
 
 /**
- * Mirror pi agent events into the cron run log — same minimal shape as runJob's
- * subscriber (one line per notable event; full detail lives in the session file).
- * Duplicated from run.ts because that subscriber is a private function there;
- * keeping a cron-specific copy avoids coupling the two run paths and lets cron
- * logging evolve independently.
+ * Mirror agent events into the cron run log — delegated to the shared
+ * `subscribeForLogging` in runtime-events.ts (imported above), so both run paths
+ * log identically. Formerly a cron-specific duplicate; now one implementation.
  */
-function subscribeForLogging(
-  session: { subscribe?: (fn: (e: unknown) => void) => unknown },
-  log_: typeof log,
-) {
-  if (typeof session.subscribe !== "function") return;
-  let lastToolOutput = "";
-  session.subscribe((event: unknown) => {
-    const e = event as Record<string, unknown>;
-    switch (e.type) {
-      case "agent_start":
-        log_.info("▶ agent started");
-        break;
-      case "agent_end":
-        log_.info(e.willRetry === true ? "■ agent finished (will retry)" : "■ agent finished");
-        break;
-      case "message_end": {
-        const msg = e.message as { role?: string } | undefined;
-        if (msg?.role && msg.role !== "assistant") break;
-        const text = extractMessageText(msg).trim();
-        if (!text || text === lastToolOutput) break;
-        lastToolOutput = "";
-        log_.info(`» ${text}`);
-        break;
-      }
-      case "tool_execution_start":
-        lastToolOutput = "";
-        log_.info(toolStartLabel(e.toolName, e.args));
-        break;
-      case "tool_execution_end": {
-        const isError = e.isError === true;
-        const out = extractToolResultText(e.result).trim();
-        lastToolOutput = out.slice(0, 300);
-        if (isError) {
-          log_.warn(`✗ ${e.toolName}: ${truncate(firstLine(out), 200)}`);
-        } else {
-          log_.info("✓ done");
-        }
-        break;
-      }
-      case "auto_retry_start":
-        log_.warn(`↻ retry ${e.attempt}/${e.maxAttempts}: ${e.errorMessage}`);
-        break;
-      default:
-        // Drop the rest — same as runJob's subscriber.
-    }
-  });
-}
-
-/** Pull concatenated text out of a pi AgentMessage (mirrors run.ts). */
-function extractMessageText(message: unknown): string {
-  if (!message || typeof message !== "object") return "";
-  const content = (message as { content?: unknown[] }).content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-/** Pull returned text out of a pi AgentToolResult (mirrors run.ts). */
-function extractToolResultText(result: unknown): string {
-  if (!result || typeof result !== "object") return "";
-  const content = (result as { content?: unknown[] }).content;
-  if (!Array.isArray(content)) return String(result);
-  return content
-    .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as { type?: string }).type === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + `… (+${s.length - max} more chars)` : s;
-}
-
-function firstLine(s: string): string {
-  for (const line of s.split("\n")) {
-    const t = line.trim();
-    if (t) return t;
-  }
-  return "";
-}
-
-/**
- * Label for a `tool_execution_start` event. Each tool gets a short glyph +
- * the one arg that matters for log readability (a file path, a pattern, the
- * shell command). Args come from pi's tool schemas — the file-path key is
- * `path` (not `filePath`) for read/write/edit, the search key is `pattern`
- * for find/grep, and `ls` takes an optional `path`.
- */
-function toolStartLabel(toolName: unknown, args: unknown): string {
-  const a = (args as Record<string, unknown> | null) ?? {};
-  const pathOf = () => (typeof a.path === "string" ? a.path : "?");
-  const patternOf = () => (typeof a.pattern === "string" ? a.pattern : "?");
-  switch (toolName) {
-    case "read":
-      return `☰ read > ${pathOf()}`;
-    case "write":
-      return `✎ write > ${pathOf()}`;
-    case "edit":
-      return `✎ edit > ${pathOf()}`;
-    case "bash": {
-      const cmd = a.command;
-      if (typeof cmd === "string" && cmd.trim()) return `$ ${truncate(cmd.replace(/\s+/g, " ").trim(), 300)}`;
-      return "$ ?";
-    }
-    case "find":
-      return `⌖ find > ${patternOf()}`;
-    case "grep":
-      return `⌕ grep > ${patternOf()}`;
-    case "ls":
-      return `≡ ls > ${pathOf()}`;
-    default:
-      return `▸ ${toolName}`;
-  }
-}
-
-/** Stable sessions dir for a cron run (mirrors run.ts's helper). */
-function sessionsDirFor(jobId: string): string {
-  const base = resolve(process.env.NOODLE_SESSIONS_DIR ?? "./sessions");
-  const dir = join(base, jobId);
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
 
 function nowIso(): string {
   return new Date().toISOString();

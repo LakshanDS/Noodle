@@ -31,6 +31,8 @@ export interface SetupProfile {
   base_url?: string;
   /** Optional api style for custom providers. */
   api?: string;
+  /** Optional runtime selection: "pi" (default) or "opencode". */
+  runtime?: "pi" | "opencode";
 }
 
 /** Read + JSON-parse the setup profile from the DB. Returns null if absent/invalid. */
@@ -59,11 +61,15 @@ export function readSetupProfile(db: Db): SetupProfile | null {
 export function synthesizeConfig(seed: SetupProfile): NoodleConfig {
   const raw = {
     agent_name: "Noodle",
+    // If the wizard picked OpenCode, make it the instance default so untagged
+    // runs use it too — not just the seeded profile.
+    ...(seed.runtime === "opencode" ? { default_runtime: "opencode" as const } : {}),
     default_profile: "default",
     profiles: {
       default: {
         provider: seed.provider,
         model: seed.model,
+        ...(seed.runtime ? { runtime: seed.runtime } : {}),
         ...(seed.api_key_env ? { api_key_env: seed.api_key_env } : {}),
         ...(seed.base_url ? { base_url: seed.base_url } : {}),
         ...(seed.api ? { api: seed.api } : {}),

@@ -50,6 +50,7 @@ const PATHS: Record<string, string> = {
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
   log: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>',
   book: '<path d="M12 6.5C10.5 5 8 4.5 4 4.5v15c4 0 6.5.5 8 2"/><path d="M12 6.5C13.5 5 16 4.5 20 4.5v15c-4 0-6.5.5-8 2"/><path d="M12 6.5V21.5"/>',
+  plug: '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M3 13V8a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v5"/><path d="M9 13h6"/>',
 };
 
 export type IconName = keyof typeof PATHS | string;

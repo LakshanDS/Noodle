@@ -9,6 +9,9 @@
 
 export type RunStatus = "running" | "succeeded" | "failed" | "no_changes";
 
+/** The two supported agent engines. Mirrors RuntimeName in src/config/schema.ts. */
+export type RuntimeName = "pi" | "opencode";
+
 export interface RunRow {
   job_id: string;
   repo: string;
@@ -42,6 +45,8 @@ export interface CronRow {
   branch_name: string;
   cron_expression: string;
   profile: string | null;
+  /** Runtime override: "pi", "opencode", or null to use the profile/config default. */
+  runtime: string | null;
   enabled: number; // 0 | 1
   last_run_at: string | null;
   next_run_at: string | null;
@@ -110,25 +115,31 @@ export interface CronInput {
   branch_name: string;
   cron_expression: string;
   profile: string | null;
+  runtime: string | null;
 }
 
-/* ----- Slash commands (mock until the backend store lands) ----- */
+/* ----- Slash commands (DB-backed command runners) ----- */
 
 /**
- * A user-defined slash command. When someone types `/<trigger>` in a GitHub
- * issue/comment, the agent wakes with `system_prompt` as its custom
- * instructions. Mirrors what a future command-store row will look like.
+ * A slash command runner. When someone types `/<trigger>` in a GitHub
+ * issue/comment, the agent wakes with `system_prompt` as its framing and an
+ * optional `profile` override. The built-in `/<agent>` command (e.g. /noodle)
+ * is seeded on boot with `is_builtin = 1` and cannot be deleted.
  */
 export interface CommandRow {
   id: number;
-  /** Trigger word without the leading slash, e.g. "question". */
+  /** Trigger word without the leading slash, e.g. "question". Lowercase. */
   trigger: string;
   name: string;
   description: string;
   /** The custom instructions the agent wakes up with. */
   system_prompt: string;
   profile: string | null;
+  /** Runtime override: "pi", "opencode", or null to use the profile/config default. */
+  runtime: string | null;
   enabled: number; // 0 | 1
+  /** 1 for the seeded /<agent> default — non-deletable, non-disablable. */
+  is_builtin: number; // 0 | 1
   created_at: string;
   updated_at: string;
 }
@@ -150,6 +161,7 @@ export interface CommandInput {
   description: string;
   system_prompt: string;
   profile: string | null;
+  runtime: string | null;
 }
 
 /* ----- Skills (mock until the SKILL.md read/write layer lands) ----- */
@@ -184,6 +196,46 @@ export interface SkillInput {
   name: string;
   description: string;
   body: string;
+}
+
+/* ----- MCP Servers (shared library of server definitions) ----- */
+
+/** A row from the mcp_servers table — the server name + parsed definition. */
+export interface McpServerRow {
+  name: string;
+  type: McpTransport;
+  description: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Full server detail (includes the definition payload). */
+export interface McpServerDetailRow {
+  name: string;
+  server: McpServerDefinition;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpServersResponse {
+  servers: McpServerRow[];
+}
+export interface McpServerDetailResponse {
+  server: McpServerDetailRow;
+}
+export interface McpServerMutationResponse {
+  server: McpServerDetailRow;
+}
+
+/** Payload for creating/updating an MCP server. */
+export interface McpServerInput {
+  name: string;
+  type: McpTransport;
+  command?: string;
+  args?: string;
+  env?: Record<string, string>;
+  url?: string;
+  description?: string;
 }
 
 /* ----- System log (in-memory ring buffer; mirrors `docker logs`) ----- */
@@ -253,6 +305,8 @@ export interface SetupPayload {
     apiKeyEnv?: string;
     baseUrl?: string;
     api?: string;
+    /** Agent runtime for the seeded profile: "pi" (default) or "opencode". */
+    runtime?: RuntimeName;
   };
   uiPassword: string;
 }
@@ -273,11 +327,35 @@ export type Api = | "openai-completions" | "openai-responses" | "azure-openai-re
   | "anthropic-messages" | "google-generative-ai" | "google-vertex"
   | "mistral-conversations" | "bedrock-converse-stream";
 
+/** The transport type for an MCP server. */
+export type McpTransport = "stdio" | "sse" | "http";
+
+/**
+ * Full MCP server definition — mirrors McpServerDefinition in
+ * src/config/schema.ts. Stored as a JSON blob in the mcp_servers SQLite table;
+ * profiles reference servers by name via ProfileData.mcp_servers: string[].
+ */
+export interface McpServerDefinition {
+  type: McpTransport;
+  /** stdio only: the command to launch. */
+  command?: string;
+  /** stdio only: argv. Defaults to empty. */
+  args: string[];
+  /** stdio only: process environment variables. Optional. */
+  env?: Record<string, string>;
+  /** sse/http only: the server URL. */
+  url?: string;
+  /** Human-readable note shown in the server list. Optional. */
+  description?: string;
+}
+
 /**
  * The full per-profile field set — mirrors ProfileSchema in
  * src/config/schema.ts. Every field the engine applies to a run lives here.
  */
 export interface ProfileData {
+  /** Which agent runtime uses this profile. Mirrors ProfileSchema.runtime. */
+  runtime: RuntimeName;
   provider: string;
   model: string;
   base_url?: string;
@@ -297,6 +375,8 @@ export interface ProfileData {
   retry_max_attempts: number;
   retry_base_delay_ms: number;
   max_concurrent?: number;
+  /** MCP server names enabled for this profile (from the shared library). */
+  mcp_servers: string[];
 }
 
 /** Where a profile comes from — DB rows are editable/deletable; YAML are read-only. */

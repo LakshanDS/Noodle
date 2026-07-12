@@ -67,6 +67,7 @@ export const SETTING_CATALOG: readonly SettingMeta[] = [
   { key: "GROQ_API_KEY", label: "Groq API key", restartRequired: false, secret: true },
   { key: "DEEPSEEK_API_KEY", label: "DeepSeek API key", restartRequired: false, secret: true },
   { key: "GEMINI_API_KEY", label: "Google (Gemini) API key", restartRequired: false, secret: true },
+  { key: "OPENCODE_API_KEY", label: "OpenCode Zen API key", restartRequired: false, secret: true, hint: "For OpenCode-runtime runs using the free OpenCode Zen models. Get one at opencode.ai/auth." },
 ] as const;
 
 /** Keys whose change requires a restart. */

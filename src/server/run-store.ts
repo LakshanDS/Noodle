@@ -38,6 +38,17 @@ export interface RunRow {
   cron_job_id: number | null;
   /** URL of an issue a cron run opened (its output). NULL for normal runs. */
   output_issue_url: string | null;
+  /**
+   * The command trigger that drove this run (e.g. "noodle", "review"), stored
+   * WITHOUT the leading slash. NULL for cron/manual runs (no command matched).
+   */
+  command: string | null;
+  /**
+   * Which agent runtime executed this run: "pi" or "opencode". NULL for rows
+   * created before the runtime selector landed (treated as "pi"). Set at run
+   * start from `resolveRuntimeName`.
+   */
+  runtime: string | null;
 }
 
 /** Subset needed to create a row (the rest defaults/NULLs at insert time). */
@@ -56,7 +67,7 @@ export interface NewRun {
 export type RunUpdate = Partial<
   Pick<
     RunRow,
-    | "profile" | "model" | "status" | "pr_url" | "comment_url" | "summary" | "error" | "session_path" | "finished_at" | "output_issue_url"
+    | "profile" | "model" | "status" | "pr_url" | "comment_url" | "summary" | "error" | "session_path" | "finished_at" | "output_issue_url" | "command" | "runtime"
   >
 >;
 
@@ -77,7 +88,9 @@ CREATE TABLE IF NOT EXISTS runs (
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at TEXT,
   cron_job_id INTEGER,
-  output_issue_url TEXT
+  output_issue_url TEXT,
+  command TEXT,
+  runtime TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
@@ -138,10 +151,12 @@ function migrateAddCronColumns(db: Db): void {
         started_at TEXT NOT NULL DEFAULT (datetime('now')),
         finished_at TEXT,
         cron_job_id INTEGER,
-        output_issue_url TEXT
+        output_issue_url TEXT,
+        command TEXT,
+        runtime TEXT
       );
-      INSERT INTO runs_new (job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url)
-      SELECT job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url FROM runs;
+      INSERT INTO runs_new (job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url, command, runtime)
+      SELECT job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url, NULL, NULL FROM runs;
       DROP TABLE runs;
       ALTER TABLE runs_new RENAME TO runs;
       CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -151,6 +166,30 @@ function migrateAddCronColumns(db: Db): void {
   db.exec(IDX_CRON_JOB_ID);
 }
 
+/**
+ * Add the `command` column (which command drove this run) to pre-existing
+ * `runs` tables. Fresh DBs already have it via the CREATE above. Same
+ * PRAGMA-introspection + ALTER pattern as the cron migration.
+ */
+function migrateAddCommandColumn(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "command")) {
+    db.exec("ALTER TABLE runs ADD COLUMN command TEXT");
+  }
+}
+
+/**
+ * Add the `runtime` column (which agent engine ran this run: "pi"/"opencode")
+ * to pre-existing `runs` tables. Fresh DBs already have it via the CREATE above.
+ * NULL on old rows is treated as "pi" by the dashboard.
+ */
+function migrateAddRuntimeColumn(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "runtime")) {
+    db.exec("ALTER TABLE runs ADD COLUMN runtime TEXT");
+  }
+}
+
 export class RunStore {
   private readonly db: Db;
 
@@ -158,6 +197,8 @@ export class RunStore {
     this.db = db;
     this.db.exec(SCHEMA);
     migrateAddCronColumns(this.db);
+    migrateAddCommandColumn(this.db);
+    migrateAddRuntimeColumn(this.db);
   }
 
   /** For tests that want to inject an in-memory DB. */

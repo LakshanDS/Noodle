@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { StallWatcher, StallTimeoutError, type StallSession } from "../src/engine/stall.js";
+import type { RuntimeEvent } from "../src/engine/runtime.js";
 
 /**
  * Deterministic fake timer: captures the ms budget the watcher armed with and
@@ -35,15 +36,16 @@ class FakeTimers {
 }
 
 /**
- * Fake session: records abort() calls and lets tests emit events to subscribers
- * via the typed helpers (start/end/update/other). Mirrors the event names the
- * real pi bash tool emits.
+ * Fake session: records abort() calls and lets tests emit normalized
+ * RuntimeEvents to subscribers via the typed helpers (start/end/update/other).
+ * The stall watcher now consumes RuntimeEvent (not raw pi events), so the
+ * helpers emit the normalized shapes.
  */
 class FakeSession implements StallSession {
   aborted = 0;
-  private listeners: Array<(e: unknown) => void> = [];
+  private listeners: Array<(e: RuntimeEvent) => void> = [];
 
-  subscribe = (fn: (e: unknown) => void): (() => void) => {
+  subscribe = (fn: (e: RuntimeEvent) => void): (() => void) => {
     this.listeners.push(fn);
     return () => {
       this.listeners = this.listeners.filter((l) => l !== fn);
@@ -54,15 +56,15 @@ class FakeSession implements StallSession {
     this.aborted++;
   };
 
-  private emit(e: unknown): void {
+  private emit(e: RuntimeEvent): void {
     for (const l of this.listeners) l(e);
   }
 
-  toolStart(): void { this.emit({ type: "tool_execution_start", toolName: "bash" }); }
-  toolEnd(): void { this.emit({ type: "tool_execution_end", toolName: "bash" }); }
-  toolUpdate(): void { this.emit({ type: "tool_execution_update", toolName: "bash", partialResult: {} }); }
-  /** A generic non-tool event (turn/message/etc.). */
-  other(): void { this.emit({ type: "message_update" }); }
+  toolStart(): void { this.emit({ type: "tool_start", tool: "bash", args: { command: "npm run build" } }); }
+  toolEnd(): void { this.emit({ type: "tool_end", tool: "bash", isError: false, output: "" }); }
+  toolUpdate(): void { this.emit({ type: "activity" }); }
+  /** A generic non-tool event (message/retry/etc.). */
+  other(): void { this.emit({ type: "message_end", role: "assistant", text: "" }); }
 }
 
 const IDLE = 15_000;

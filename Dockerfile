@@ -29,11 +29,20 @@ RUN npm run build
 # The build emits to ../public (relative to /client → /public).
 
 # --- Runtime stage ---
-# alpine: ~50MB base vs ~150MB for slim. git + ca-certificates are the only
-# extras needed (clone/push + HTTPS). node_modules is copied from the builder,
-# so no toolchain is needed here.
+# alpine: ~50MB base vs ~150MB for slim. git + ca-certificates + curl are the
+# extras needed (clone/push + HTTPS + OpenCode binary install). node_modules is
+# copied from the builder, so no toolchain is needed here.
 FROM node:22-alpine
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache git ca-certificates curl
+
+# Install the OpenCode CLI binary. The SDK (@opencode-ai/sdk, already in
+# node_modules) spawns `opencode serve` as a subprocess at runtime. This step
+# is only needed for profiles that use the opencode runtime — pi-only
+# deployments can comment out this block to save ~100MB.
+# The install script puts the binary in ~/.opencode/bin/ — we symlink it to
+# /usr/local/bin so it's on PATH without shell-profile gymnastics.
+RUN curl -fsSL https://opencode.ai/install | sh && \
+    ln -sf ~/.opencode/bin/opencode /usr/local/bin/opencode
 
 # Default git identity for agent commits
 RUN git config --global user.name "noodle-agent" && \
