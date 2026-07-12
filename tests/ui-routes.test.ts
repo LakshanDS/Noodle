@@ -6,6 +6,7 @@ import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
 import { CronStore } from "../src/server/cron-store.js";
+import { CommandStore } from "../src/server/command-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
 import { ProfileStore } from "../src/server/profile-store.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
@@ -25,6 +26,7 @@ const PASSWORD = "test-password";
 let dir: string;
 let store: RunStore;
 let cronStore: CronStore;
+let commandStore: CommandStore;
 let settingsStore: SettingStore;
 let db: Database.Database;
 let sessionPath: string;
@@ -34,6 +36,7 @@ beforeEach(() => {
   db = new Database(join(dir, "runs.db"));
   store = RunStore.fromDb(db);
   cronStore = CronStore.fromDb(db);
+  commandStore = CommandStore.fromDb(db);
   settingsStore = SettingStore.fromDb(db);
   sessionPath = join(dir, "session.jsonl");
 });
@@ -55,6 +58,7 @@ function makeApp() {
     runStore: store,
     secret: PASSWORD,
     cronStore,
+    commandStore,
     settingsStore,
     profileStore: ProfileStore.fromDb(db),
     // Stubs for deps not exercised by these tests:
@@ -78,6 +82,7 @@ function makeWebhookAppWithUi() {
     runStore: store,
     secret: PASSWORD,
     cronStore,
+    commandStore,
     settingsStore,
     queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
     authProvider: {} as never,

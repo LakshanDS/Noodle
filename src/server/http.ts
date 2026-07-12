@@ -37,6 +37,13 @@ export interface WebhookHandlerDeps {
   triggers?: TriggerConfig;
   /** Configured profile names — enables `#<profile>` tag wake/routing. */
   profileNames?: string[];
+  /**
+   * Active command triggers (from the command store). A `/<trigger>` in a new
+   * comment wakes the agent. When omitted, only `/<agent-slug>` wakes — the
+   * historical behaviour. Supplied as a getter so the webhook always sees the
+   * current set after edits (no server restart needed).
+   */
+  commandTriggers?: () => string[];
 }
 
 export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): FastifyInstance {
@@ -83,6 +90,7 @@ export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): Fast
       deps.agentName,
       deps.triggers,
       deps.profileNames ?? [],
+      deps.commandTriggers?.() ?? [],
     );
     if (!intent) {
       // Acknowledge but ignore — not an event Noodle acts on.

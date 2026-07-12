@@ -1,4 +1,5 @@
 import { slugify } from "../util/slugify.js";
+import { matchesCommandTrigger } from "../commands/match.js";
 
 /**
  * How the agent wakes up on an issue, read from `config.triggers`:
@@ -103,6 +104,11 @@ export function shouldTrigger(opts: {
   agentName: string;
   triggers: TriggerConfig;
   profileNames?: string[];
+  /**
+   * Active command triggers (from the command store). Any `/<trigger>` in the
+   * thread is an always-on wake. When omitted, falls back to just `/<agent-slug>`.
+   */
+  commandTriggers?: string[];
 }): TriggerResult {
   const { body, comments, agentName, triggers } = opts;
   const profileNames = opts.profileNames ?? [];
@@ -132,12 +138,18 @@ export function shouldTrigger(opts: {
       }
     }
     if (!wake) {
-      // `/<agent>` slash command is always a wake (explicit intent), ungated
-      // by trigger_on_mention / trigger_keywords.
+      // A `/<command>` slash command for any active command is always a wake
+      // (explicit intent), ungated by trigger_on_mention / trigger_keywords.
+      // Falls back to just `/<agent-slug>` when no command triggers supplied.
       const slug = slugify(agentName);
-      if (slug) {
-        const slashRe = new RegExp(`(?:^|\\s)\\/${slug}\\b`, "i");
-        wake ||= thread.some((t) => slashRe.test(t));
+      const cmdTriggers = opts.commandTriggers && opts.commandTriggers.length > 0
+        ? opts.commandTriggers
+        : slug
+          ? [slug]
+          : [];
+      if (slug && !cmdTriggers.includes(slug)) cmdTriggers.push(slug);
+      if (cmdTriggers.length > 0) {
+        wake ||= thread.some((t) => matchesCommandTrigger(t, cmdTriggers));
       }
     }
   }
