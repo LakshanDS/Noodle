@@ -28,6 +28,10 @@ export interface RunRow {
   finished_at: string | null;
   cron_job_id: number | null;
   output_issue_url: string | null;
+  /** Command trigger that drove this run (without leading slash). Null for cron/manual. */
+  command: string | null;
+  /** Which agent runtime ran this: "pi", "opencode", or null (legacy = pi). */
+  runtime: string | null;
 }
 
 export interface CronRow {
