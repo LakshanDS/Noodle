@@ -20,7 +20,7 @@ const POLL_MS = 4000;
 const entries = ref<LogEntry[]>([]);
 const loading = ref(false);
 const loadError = ref("");
-const levelFilter = ref<"all" | "debug" | "info" | "warn" | "error">("all");
+const levelFilter = ref<"all" | "debug" | "info" | "warn" | "error">("info");
 const autoRefresh = ref(true);
 let timer: ReturnType<typeof setInterval> | null = null;
 

@@ -106,3 +106,89 @@ export function templateTitle(task: string): string {
   const head = firstLine ? (firstLine.length > 80 ? firstLine.slice(0, 77) + "…" : firstLine) : "scheduled sweep";
   return head;
 }
+
+// --- output phrasing -------------------------------------------------------
+
+/**
+ * System prompt for phrasing the agent's raw final message into a clean GitHub
+ * comment / commit body. The constraint is critical: CLEAN THE FORMATTING, DO
+ * NOT SUMMARISE. Every technical detail, finding, and decision the agent made
+ * must survive — only the presentation changes (strip tool-call residue, fix
+ * headings, tighten prose, drop meta-chatter like "I'll now examine...").
+ */
+const PHRASE_SYSTEM_PROMPT =
+  "You format an AI coding agent's raw output into a clean GitHub issue comment / " +
+  "PR body. PRESERVE EVERY TECHNICAL DETAIL — do not summarise, shorten, or drop " +
+  "any finding, code reference, file path, or decision. Only clean the presentation: " +
+  "remove tool-call residue and status chatter (e.g. 'Let me check...', 'Running grep...'), " +
+  "fix markdown headings and lists, tighten redundant prose, and ensure it reads as a " +
+  "coherent message from the agent. Output ONLY the cleaned message in markdown — no " +
+  "preamble, no 'Here is the cleaned version:', no explanation of what you changed.";
+
+/**
+ * Phrase the agent's raw final message into a clean GitHub comment / PR body via
+ * a single model call to the relay. Sibling to `generateIssueTitle` — same
+ * relay-based pattern, but a much larger token budget (the full answer, not a
+ * one-line title) and a system prompt that CLEANS WITHOUT SUMMARISING.
+ *
+ * Falls back to the raw agent message on any failure (relay down, model error,
+ * empty result) so a run is never blocked by phrasing. This is the safety net:
+ * the raw answer is always acceptable; phrasing is a polish step.
+ *
+ * Uses the run's resolved profile (the model that just ran) so there's no extra
+ * config — the same model cleans its own output.
+ *
+ * Returns the phrased message, or the original `agentMessage` unchanged on any
+ * failure. Never throws.
+ */
+export async function phraseOutput(
+  agentMessage: string,
+  config: NoodleConfig,
+  profile: Profile,
+  relayPort?: number,
+): Promise<string> {
+  const original = agentMessage.trim();
+  if (!original) return original;
+
+  const port = relayPort ?? config.relay?.port ?? 4445;
+  const url = `http://localhost:${port}/v1/chat/completions`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: profile.model,
+        messages: [
+          { role: "system", content: PHRASE_SYSTEM_PROMPT },
+          { role: "user", content: original },
+        ],
+        // Generous budget — we're cleaning a full message, not summarising it.
+        // Cap at 4x the input length (min 512) so the model has room to
+        // reformat without truncating the content.
+        max_completion_tokens: Math.max(512, Math.min(8192, original.length * 4)),
+        temperature: 0.2,
+        stream: false,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`relay ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const data = (await res.json()) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const phrased = (data.choices?.[0]?.message?.content ?? "").trim();
+    if (!phrased) throw new Error("model returned empty phrasing");
+    log.debug({ model: profile.model, origLen: original.length, phrasedLen: phrased.length }, "phrased agent output");
+    return phrased;
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "output phrasing failed; posting raw agent message");
+    return original;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
