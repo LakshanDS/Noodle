@@ -8,6 +8,8 @@
 withDefaults(
   defineProps<{
     title?: string;
+    /** Optional muted descriptor shown under the title. */
+    subtitle?: string;
     pad?: "default" | "flush";
   }>(),
   { pad: "default" },
@@ -22,6 +24,7 @@ withDefaults(
       </slot>
       <div v-if="$slots.actions" class="card-actions"><slot name="actions" /></div>
     </header>
+    <p v-if="subtitle" class="card-subtitle">{{ subtitle }}</p>
     <div class="card-body">
       <slot />
     </div>
@@ -41,11 +44,13 @@ withDefaults(
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
-  padding: var(--space-4) var(--space-5);
+  /* Horizontal padding matches .card-body so the title and header actions line
+   * up exactly with the body content's edges (no 4px right-offset on actions). */
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
 }
 .card-title {
-  font-size: var(--text-sm);
+  font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-tight);
   color: var(--text);
@@ -55,9 +60,15 @@ withDefaults(
   align-items: center;
   gap: var(--space-2);
 }
+.card-subtitle {
+  margin: 0;
+  padding: var(--space-1) var(--space-4) 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
 
 .card-body {
-  padding: var(--space-5);
+  padding: var(--space-4);
 }
 .flush .card-body {
   padding: 0;

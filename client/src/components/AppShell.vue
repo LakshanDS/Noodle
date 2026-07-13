@@ -39,12 +39,14 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { name: "runs", label: "Runs", icon: "runs", target: { name: "runs" }, activeOn: ["runs", "run-detail"] },
-  { name: "chats", label: "Chats", icon: "message", target: { name: "chats" }, activeOn: ["chats", "chat-detail", "chat-new"], create: { name: "chat-new", label: "New chat" } },
+  // Chats hidden — still mock-only (backed by in-memory array, no DB store).
+  // Uncomment when the chat backend lands.
+  // { name: "chats", label: "Chats", icon: "message", target: { name: "chats" }, activeOn: ["chats", "chat-detail", "chat-new"], create: { name: "chat-new", label: "New chat" } },
+  { name: "skills", label: "Skills", icon: "book", target: { name: "skills" }, activeOn: ["skills", "skill-detail", "skill-new"], create: { name: "skill-new", label: "New skill" } },
+  { name: "profiles", label: "Profiles", icon: "key", target: { name: "profiles" }, activeOn: ["profiles", "profile-detail", "profile-new"], create: { name: "profile-new", label: "New profile" } },
   { name: "crons", label: "Schedules", icon: "cron", target: { name: "crons" }, activeOn: ["crons", "cron-detail", "cron-new"], create: { name: "cron-new", label: "New schedule" } },
   { name: "commands", label: "Commands", icon: "bolt", target: { name: "commands" }, activeOn: ["commands", "command-detail", "command-new"], create: { name: "command-new", label: "New command" } },
-  { name: "profiles", label: "Profiles", icon: "key", target: { name: "profiles" }, activeOn: ["profiles", "profile-detail", "profile-new"], create: { name: "profile-new", label: "New profile" } },
-  { name: "skills", label: "Skills", icon: "book", target: { name: "skills" }, activeOn: ["skills", "skill-detail", "skill-new"], create: { name: "skill-new", label: "New skill" } },
-  { name: "github", label: "GitHub bot", icon: "github", target: { name: "github" }, activeOn: ["github"] },
+  // GitHub bot moved to Settings page — credentials are now a section there.
   { name: "logs", label: "System log", icon: "log", target: { name: "logs" }, activeOn: ["logs"] },
   { name: "settings", label: "Settings", icon: "settings", target: { name: "settings" }, activeOn: ["settings"] },
 ];

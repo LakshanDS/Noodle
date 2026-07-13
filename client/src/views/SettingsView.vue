@@ -4,8 +4,8 @@
  * driven from the server; secret fields mask on GET and send only when edited.
  * A top banner surfaces after a write, flagging whether a restart is needed.
  *
- * GitHub bot credentials live in their own tab (GitHubBotView); the GitHub
- * keys are filtered out here so they aren't editable in two places.
+ * GitHub credentials are now a section here (moved from the former GitHubBotView
+ * standalone page). The GITHUB_PRIVATE_KEY field renders as a textarea.
  */
 import { computed, onMounted, reactive, ref } from "vue";
 import { getJson, sendJson, ApiRequestError } from "../api/client.js";
@@ -33,17 +33,14 @@ const banner = ref<{ kind: "ok" | "warn" | "err"; text: string } | null>(null);
 
 // Group icon + copy for each section.
 const SECTIONS = [
+  { key: "github", title: "GitHub credentials", icon: "github" as IconName, desc: "Credentials the agent uses to clone, push, and open PRs. Use either a PAT or a GitHub App (App ID + private key). Real environment variables override values stored here." },
   { key: "llm", title: "LLM API keys", icon: "key" as IconName, desc: "Provider keys, read per-request. New runs pick these up immediately — no restart needed." },
   { key: "access", title: "Dashboard access", icon: "lock" as IconName, desc: "The dashboard password and the agent's GitHub login. Restart required." },
 ];
 
-/** GitHub keys are owned by the GitHub bot tab — exclude them here. */
-function isGithubKey(key: string): boolean {
-  return key.startsWith("GITHUB_") || key === "NOODLE_LOGIN";
-}
-
 function sectionOf(meta: SettingMeta): string {
-  if (meta.key.endsWith("_API_KEY") && !meta.key.startsWith("GITHUB_")) return "llm";
+  if (meta.key.startsWith("GITHUB_") || meta.key === "NOODLE_LOGIN") return "github";
+  if (meta.key.endsWith("_API_KEY")) return "llm";
   if (meta.key.startsWith("NOODLE_")) return "access";
   return "llm";
 }
@@ -51,7 +48,7 @@ function sectionOf(meta: SettingMeta): string {
 const grouped = computed(() =>
   SECTIONS.map((s) => ({
     ...s,
-    items: catalog.value.filter((m) => !isGithubKey(m.key) && sectionOf(m) === s.key),
+    items: catalog.value.filter((m) => sectionOf(m) === s.key),
   })).filter((s) => s.items.length > 0),
 );
 
@@ -64,7 +61,7 @@ async function load(): Promise<void> {
     restartKeys.value = body.restartKeys;
     // Reset fields map.
     for (const k of Object.keys(fields)) delete fields[k];
-    for (const meta of body.catalog.filter((m) => !isGithubKey(m.key))) {
+    for (const meta of body.catalog) {
       fields[meta.key] = {
         meta,
         value: body.values[meta.key] ?? "",
@@ -150,7 +147,18 @@ onMounted(load);
           :hint="meta.hint"
         >
           <div class="input-row">
+            <textarea
+              v-if="meta.key === 'GITHUB_PRIVATE_KEY'"
+              v-model="fields[meta.key]!.value"
+              :type="fields[meta.key]?.revealed ? 'text' : 'password'"
+              class="ctrl mono key-area"
+              :placeholder="meta.secret ? 'Not set' : ''"
+              autocomplete="off"
+              rows="4"
+              @input="onInput(meta.key)"
+            />
             <input
+              v-else
               v-model="fields[meta.key]!.value"
               :type="!meta.secret || fields[meta.key]?.revealed ? 'text' : 'password'"
               class="ctrl"
@@ -160,7 +168,7 @@ onMounted(load);
               @input="onInput(meta.key)"
             />
             <button
-              v-if="meta.secret && fields[meta.key]?.value"
+              v-if="meta.secret && fields[meta.key]?.value && meta.key !== 'GITHUB_PRIVATE_KEY'"
               class="reveal"
               type="button"
               @click="toggleReveal(meta.key)"
@@ -249,6 +257,10 @@ onMounted(load);
 }
 .input-row .ctrl {
   padding-right: 64px;
+}
+.input-row .key-area {
+  padding-right: var(--space-3);
+  resize: vertical;
 }
 .reveal {
   position: absolute;

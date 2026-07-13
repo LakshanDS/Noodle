@@ -26,7 +26,7 @@ const routes: RouteRecordRaw[] = [
   { path: "/profiles", name: "profiles", component: () => import("./views/ProfilesView.vue") },
   { path: "/profiles/new", name: "profile-new", component: () => import("./views/ProfileDetailView.vue"), props: { isNew: true } },
   { path: "/profiles/:name", name: "profile-detail", component: () => import("./views/ProfileDetailView.vue"), props: true },
-  { path: "/github", name: "github", component: () => import("./views/GitHubBotView.vue") },
+  { path: "/github", redirect: "/settings" },
   { path: "/logs", name: "logs", component: () => import("./views/LogsView.vue") },
   // Settings + setup land in later phases; stubbed so routes resolve.
   { path: "/settings", name: "settings", component: () => import("./views/SettingsView.vue") },
