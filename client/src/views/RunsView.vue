@@ -89,8 +89,8 @@ onMounted(load);
         </thead>
         <tbody>
           <tr v-for="r in runs" :key="r.job_id" class="row" @click="open(r.job_id)">
-            <td><StatusPill :status="r.status" /></td>
-            <td>
+            <td data-label="Status"><StatusPill :status="r.status" /></td>
+            <td data-label="Repository">
               <div class="repo-cell">
                 <span class="repo-name">{{ repoLeaf(r.repo) }}</span>
                 <span class="repo-meta">
@@ -100,16 +100,16 @@ onMounted(load);
                 </span>
               </div>
             </td>
-            <td class="col-profile">
+            <td class="col-profile" data-label="Profile">
               <code v-if="r.profile" class="tag">{{ r.profile }}</code>
               <span v-else class="subtle">—</span>
             </td>
-            <td class="col-model">
+            <td class="col-model" data-label="Model">
               <span v-if="r.model" class="muted ellipsis">{{ r.model }}</span>
               <span v-else class="subtle">—</span>
             </td>
-            <td class="col-time muted">{{ fmtTime(r.started_at) }}</td>
-            <td class="col-act">
+            <td class="col-time muted" data-label="When">{{ fmtTime(r.started_at) }}</td>
+            <td class="col-act" data-label="">
               <Button
                 v-if="r.status === 'running'"
                 variant="ghost"
@@ -250,5 +250,62 @@ tbody tr:last-child td {
 .col-act {
   width: 1%;
   text-align: right;
+}
+
+/* ---------- Mobile (≤768px) — stacked cards ---------- */
+@media (max-width: 768px) {
+  .table-wrap {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+  }
+  .table,
+  tbody,
+  tr,
+  td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tr.row {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-2) var(--space-4);
+    margin-bottom: var(--space-3);
+  }
+  tr.row:hover {
+    background: var(--surface-3);
+  }
+  tbody td {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  td::before {
+    content: attr(data-label);
+    flex: 0 0 92px;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-3);
+    font-weight: var(--weight-medium);
+  }
+  /* Cells with no label (the action column) skip the label column. */
+  td[data-label=""]::before {
+    content: none;
+  }
+  .col-act {
+    text-align: left;
+  }
+  .col-model .ellipsis {
+    white-space: normal;
+  }
 }
 </style>

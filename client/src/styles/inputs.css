@@ -45,3 +45,16 @@ select.ctrl {
   background-position: right 10px center;
   padding-right: 32px;
 }
+
+/* On touch screens the ~32px effective height is below the comfortable tap
+ * target. Grow to a 40px minimum below the mobile breakpoint. */
+@media (max-width: 768px) {
+  .ctrl {
+    min-height: 40px;
+  }
+  /* Bump the select's font-size to 16px so iOS Safari doesn't zoom-in on focus
+   * (it auto-zooms text <16px inside form fields). */
+  select.ctrl {
+    font-size: var(--text-md);
+  }
+}

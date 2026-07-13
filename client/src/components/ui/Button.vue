@@ -77,6 +77,18 @@ withDefaults(
   padding: 0 var(--space-3);
 }
 
+/* On touch screens the 30/36px heights are below the comfortable tap target.
+ * Grow to a 40px minimum below the mobile breakpoint without changing the
+ * visual proportions on desktop. */
+@media (max-width: 768px) {
+  .sm {
+    min-height: 40px;
+  }
+  .md {
+    min-height: 40px;
+  }
+}
+
 /* Variants */
 .primary {
   background: var(--accent);

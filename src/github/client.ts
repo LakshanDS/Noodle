@@ -8,10 +8,33 @@ export interface IssueData {
   body: string;
   labels: string[];
   html_url: string;
+  /** True when this issue number is actually a pull request. GitHub serves PRs
+   *  through the issues API; this flag lets runJob switch to PR mode (clone the
+   *  PR's head branch, push back to it) without a separate lookup. */
+  pull_request?: boolean;
 }
 export interface CommentData {
   body: string;
   author: string;
+}
+/**
+ * The branches of a pull request. `head_repo` differs from the target repo for
+ * fork PRs — Noodle can only push to same-repo PRs, so runJob checks it.
+ */
+export interface PullRequestData {
+  number: number;
+  title: string;
+  body: string;
+  /** The PR's source branch (e.g. "noodle/issue-7" or "feature/x"). */
+  head_branch: string;
+  /** The repo the head branch lives in ("owner/name"). Same as target for same-repo PRs. */
+  head_repo: string;
+  /** The branch the PR targets (e.g. "main"). */
+  base_branch: string;
+  /** True when the head lives in a fork (different repo) Noodle can't push to. */
+  is_fork: boolean;
+  html_url: string;
+  state: string;
 }
 
 /**
@@ -30,6 +53,10 @@ export class GitHubClient {
       body: data.body ?? "",
       labels: data.labels.map((l) => (typeof l === "string" ? l : l.name ?? "")).filter(Boolean),
       html_url: data.html_url,
+      // GitHub embeds a `pull_request` object on PR rows served via the issues
+      // API. Its mere presence marks this as a PR — runJob uses the flag to
+      // switch to PR mode (clone the PR's head branch, push back to it).
+      pull_request: !!("pull_request" in data && data.pull_request),
     };
   }
 
@@ -207,6 +234,36 @@ export class GitHubClient {
       body,
     });
     return { number: data.number, html_url: data.html_url };
+  }
+
+  /**
+   * Fetch a single pull request by number. Returns the head + base branches and
+   * whether the PR originates from a fork. Used by runJob in PR mode to clone
+   * the PR's head branch and push back to it — fork PRs (different head repo)
+   * can't be pushed to, so runJob checks `is_fork` and bails with a comment.
+   *
+   * The PR's head ref lives in `data.head.repo.full_name` (which equals the
+   * target repo for same-repo PRs and differs for forks) and `data.head.ref`
+   * (the branch name within that repo).
+   */
+  async getPullRequest(repo: string, number: number): Promise<PullRequestData> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.pulls.get({ owner, repo: name, pull_number: number });
+    const headRepo = data.head?.repo?.full_name ?? repo;
+    const headBranch = data.head?.ref ?? "";
+    const baseBranch = data.base?.ref ?? "";
+    return {
+      number: data.number,
+      title: data.title,
+      body: data.body ?? "",
+      head_branch: headBranch,
+      head_repo: headRepo,
+      base_branch: baseBranch,
+      // Fork = the head ref lives in a different repo than the target.
+      is_fork: !!headRepo && headRepo.toLowerCase() !== repo.toLowerCase(),
+      html_url: data.html_url,
+      state: data.state,
+    };
   }
 
   /** Verify the token by fetching the authenticated user's login. */

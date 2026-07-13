@@ -33,7 +33,7 @@ describe("prompt split: /noodle stays byte-identical", () => {
     expect(p).toContain("`noodle-default`");
     expect(p).toContain("`noodle-fix`");
     // The "final message IS the deliverable" line references the agent name.
-    expect(p).toContain("Noodle phrases that message into the issue comment and PR body");
+    expect(p).toContain("Noodle phrases that message into the comment and commits the changes");
     expect(p).toContain('your final message IS the deliverable.');
   });
 
@@ -48,5 +48,23 @@ describe("prompt split: /noodle stays byte-identical", () => {
     expect(p).toContain("## Issue");
     expect(p).toContain("Fix the login bug");
     expect(p).toContain("Issue URL: https://github.com/o/r/issues/7");
+  });
+});
+
+describe("prompt PR mode", () => {
+  it("framing switches to 'pull request' when isPR is true", () => {
+    const p = buildRunPrompt(defaultCommandPrompt("Noodle"), issue, [], "o/r", undefined, true);
+    expect(p).toContain("You are working on a pull request in the GitHub repository `o/r`.");
+    expect(p).toContain("## Pull Request");
+    expect(p).toContain("PR URL: https://github.com/o/r/issues/7");
+    // The issue-mode wording must NOT appear.
+    expect(p).not.toContain("You are working on an issue");
+    expect(p).not.toContain("## Issue");
+  });
+
+  it("buildPrompt forwards isPR to buildRunPrompt", () => {
+    const direct = buildRunPrompt(defaultCommandPrompt("Noodle"), issue, [], "o/r", undefined, true);
+    const viaLegacy = buildPrompt(issue, [], "o/r", "Noodle", undefined, true);
+    expect(viaLegacy).toBe(direct);
   });
 });

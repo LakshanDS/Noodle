@@ -77,15 +77,15 @@ onMounted(load);
         </thead>
         <tbody>
           <tr v-for="it in items" :key="it.name" class="row" @click="open(it.name)">
-            <td class="col-name">
+            <td class="col-name" data-label="Name">
               <span class="prof-name">{{ it.name }}</span>
               <span v-if="it.name === defaultProfile" class="default-badge">default</span>
             </td>
-            <td>
+            <td data-label="Provider / Model">
               <span class="mono sm">{{ it.profile.provider }} / {{ it.profile.model }}</span>
             </td>
-            <td class="col-tools muted">{{ it.profile.tools.length }}</td>
-            <td class="col-source">
+            <td class="col-tools muted" data-label="Tools">{{ it.profile.tools.length }}</td>
+            <td class="col-source" data-label="Source">
               <span class="tag" :class="{ yaml: it.source === 'yaml' }">
                 {{ it.source === "db" ? "Database" : "YAML" }}
               </span>
@@ -195,5 +195,55 @@ tbody tr:last-child td {
 .tag.yaml {
   background: var(--surface-1);
   color: var(--text-3);
+}
+
+/* ---------- Mobile (≤768px) — stacked cards ---------- */
+@media (max-width: 768px) {
+  .table-wrap {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+  }
+  .table,
+  tbody,
+  tr,
+  td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tr.row {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-2) var(--space-4);
+    margin-bottom: var(--space-3);
+  }
+  tr.row:hover {
+    background: var(--surface-3);
+  }
+  tbody td {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  td::before {
+    content: attr(data-label);
+    flex: 0 0 92px;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-3);
+    font-weight: var(--weight-medium);
+  }
+  .col-tools {
+    text-align: left;
+  }
 }
 </style>

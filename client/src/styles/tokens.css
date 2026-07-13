@@ -112,4 +112,10 @@
   /* --- Layout --- */
   --sidebar-w: 232px;
   --content-max: 1240px;
+
+  /* --- Breakpoints ---
+   * CSS custom properties can't be used inside @media, so these are documented
+   * here as the shared reference. The mobile breakpoint (768px) collapses the
+   * sidebar to a drawer and tables to stacked cards. Detail views additionally
+   * collapse their 2-col grids at 900px (see their scoped styles). */
 }

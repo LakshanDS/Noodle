@@ -76,14 +76,14 @@ onMounted(load);
         </thead>
         <tbody>
           <tr v-for="s in skills" :key="s.name" class="row" @click="open(s.name)">
-            <td>
+            <td data-label="Name">
               <span class="skill-name mono">{{ s.name }}</span>
             </td>
-            <td class="muted ellipsis">{{ s.description }}</td>
-            <td class="col-source">
+            <td class="muted ellipsis" data-label="Description">{{ s.description }}</td>
+            <td class="col-source" data-label="Source">
               <span class="badge" :class="s.source">{{ s.source }}</span>
             </td>
-            <td class="col-updated muted">{{ s.updated_at ? s.updated_at.replace("T", " ").slice(0, 16) : "—" }}</td>
+            <td class="col-updated muted" data-label="Updated">{{ s.updated_at ? s.updated_at.replace("T", " ").slice(0, 16) : "—" }}</td>
           </tr>
         </tbody>
       </table>
@@ -171,5 +171,56 @@ tbody tr:last-child td {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------- Mobile (≤768px) — stacked cards ---------- */
+@media (max-width: 768px) {
+  .table-wrap {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+  }
+  .table,
+  tbody,
+  tr,
+  td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tr.row {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-2) var(--space-4);
+    margin-bottom: var(--space-3);
+  }
+  tr.row:hover {
+    background: var(--surface-3);
+  }
+  tbody td {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  td::before {
+    content: attr(data-label);
+    flex: 0 0 92px;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-3);
+    font-weight: var(--weight-medium);
+  }
+  .ellipsis {
+    max-width: none;
+    white-space: normal;
+  }
 }
 </style>

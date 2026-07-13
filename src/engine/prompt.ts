@@ -21,8 +21,8 @@ export function defaultCommandPrompt(agentName = "Noodle"): string {
     "don't walk through the codebase architecture, don't pad. For bugs/fixes, follow",
     "`noodle-fix`: investigate, make the minimal change, verify, and end by posting",
     "your final answer as a normal text message — what you changed and why.",
-    `${agentName} phrases that message into the issue comment and PR body, then commits`,
-    'and opens the PR. Do not just say "done" — your final message IS the deliverable.',
+    `${agentName} phrases that message into the comment and commits the changes. Do`,
+    'not just say "done" — your final message IS the deliverable.',
   ].join("\n");
 }
 
@@ -31,14 +31,20 @@ export function defaultCommandPrompt(agentName = "Noodle"): string {
  * framing text. The structure is:
  *
  *   [sysInfo block]
- *   You are working on an issue in the GitHub repository `<repo>`.
+ *   You are working on an [issue|pull request] in the GitHub repository `<repo>`.
  *   <blank>
  *   <framing — the command's system_prompt>
  *   <blank>
- *   ## Issue / ## Discussion / Issue URL
+ *   ## Issue|Pull Request / ## Discussion / Issue|PR URL
  *
  * For the built-in `/noodle` command, `framing = defaultCommandPrompt(agentName)`
  * and the output is byte-identical to the legacy `buildPrompt()`.
+ *
+ * `isPR` switches the framing from "you are working on an issue" to "you are
+ * working on a pull request" and adjusts the section headers. The PR's body
+ * (its description) stands in for the issue body, and the comments carry the
+ * actual request (e.g. "/noodle change line 302 to …"). The agent's edits land
+ * on the PR's own branch and are force-pushed back to the same PR.
  */
 export function buildRunPrompt(
   framing: string,
@@ -46,6 +52,7 @@ export function buildRunPrompt(
   comments: CommentData[],
   repo: string,
   sysInfo?: string,
+  isPR = false,
 ): string {
   const commentBlock =
     comments.length > 0
@@ -54,16 +61,22 @@ export function buildRunPrompt(
           .join("\n\n")
       : "_(no comments)_";
 
+  // "an issue" vs "a pull request" — the article differs, so assemble the
+  // phrase directly instead of templating a single noun in.
+  const subject = isPR ? "a pull request" : "an issue";
+  const header = isPR ? "## Pull Request" : "## Issue";
+  const urlLabel = isPR ? "PR URL" : "Issue URL";
+
   const lines: string[] = [];
   if (sysInfo) {
     lines.push(sysInfo, "", "---", "");
   }
   lines.push(
-    `You are working on an issue in the GitHub repository \`${repo}\`.`,
+    `You are working on ${subject} in the GitHub repository \`${repo}\`.`,
     "",
     framing,
     "",
-    "## Issue",
+    header,
     "",
     `**${issue.title}** (#${issue.number})`,
     "",
@@ -73,7 +86,7 @@ export function buildRunPrompt(
     "",
     commentBlock,
     "",
-    `Issue URL: ${issue.html_url}`,
+    `${urlLabel}: ${issue.html_url}`,
   );
   return lines.join("\n");
 }
@@ -89,8 +102,9 @@ export function buildPrompt(
   repo: string,
   agentName = "Noodle",
   sysInfo?: string,
+  isPR = false,
 ): string {
-  return buildRunPrompt(defaultCommandPrompt(agentName), issue, comments, repo, sysInfo);
+  return buildRunPrompt(defaultCommandPrompt(agentName), issue, comments, repo, sysInfo, isPR);
 }
 
 /**

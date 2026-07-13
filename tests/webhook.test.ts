@@ -189,14 +189,62 @@ describe("parseWebhookEvent", () => {
     expect(parseWebhookEvent("issue_comment", payload)).toBeNull();
   });
 
-  it("ignores issue_comment on a pull request", () => {
+  it("wakes on issue_comment on a pull request (slash command)", () => {
+    // PR comments route through the issue_comment surface. A `/<command>` on a
+    // PR wakes the agent — runJob detects PR mode and clones the PR's branch.
+    const payload = {
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      issue: { number: 7, pull_request: {} },
+      comment: { body: "/noodle change line 302 to rename the string" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle")).toEqual({
+      kind: "comment",
+      repo: "owner/name",
+      issueNumber: 7,
+      installationId: 42,
+    });
+  });
+
+  it("wakes on issue_comment on a pull request (mention)", () => {
+    const payload = {
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      issue: { number: 7, pull_request: {} },
+      comment: { body: "@noodle can you fix the tests?" },
+    };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle")).toEqual({
+      kind: "comment",
+      repo: "owner/name",
+      issueNumber: 7,
+      installationId: 42,
+    });
+  });
+
+  it("ignores issue_comment on a pull request without a wake signal", () => {
     const payload = {
       action: "created",
       repository: { full_name: "owner/name" },
       issue: { number: 7, pull_request: {} },
-      comment: { body: "/noodle go" },
+      comment: { body: "just reviewing, looks good" },
     };
     expect(parseWebhookEvent("issue_comment", payload)).toBeNull();
+  });
+
+  it("ignores issues.* lifecycle events on a pull request", () => {
+    // issue_comment wakes on PRs, but issues.opened/reopened/labeled/assigned
+    // are issue-only — Noodle doesn't trigger on PR lifecycle events.
+    for (const action of ["opened", "reopened", "labeled", "assigned"]) {
+      const payload = {
+        action,
+        repository: { full_name: "owner/name" },
+        issue: { number: 7, pull_request: {}, body: "@noodle please", labels: [] },
+        assignee: { login: "noodle-agent" },
+      };
+      expect(parseWebhookEvent("issues", payload, "noodle-agent", "Noodle")).toBeNull();
+    }
   });
 
   it("returns null for ping and unrelated events", () => {

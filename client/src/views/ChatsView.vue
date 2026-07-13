@@ -74,14 +74,14 @@ onMounted(load);
         </thead>
         <tbody>
           <tr v-for="c in chats" :key="c.id" class="row" @click="open(c.id)">
-            <td class="col-status"><span class="dot" /></td>
-            <td>
+            <td class="col-status" data-label=""><span class="dot" /></td>
+            <td data-label="Conversation">
               <div class="chat-cell">
                 <span class="chat-title">{{ c.title }}</span>
                 <span class="chat-preview">{{ c.preview || "No messages yet" }}</span>
               </div>
             </td>
-            <td class="col-time muted">{{ fmtTime(c.updated_at) }}</td>
+            <td class="col-time muted" data-label="Last active">{{ fmtTime(c.updated_at) }}</td>
           </tr>
         </tbody>
       </table>
@@ -178,5 +178,61 @@ tbody tr:last-child td {
 }
 .col-time {
   white-space: nowrap;
+}
+
+/* ---------- Mobile (≤768px) — stacked cards ---------- */
+@media (max-width: 768px) {
+  .table-wrap {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+  }
+  .table,
+  tbody,
+  tr,
+  td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tr.row {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-3) var(--space-4);
+    margin-bottom: var(--space-3);
+  }
+  tr.row:hover {
+    background: var(--surface-3);
+  }
+  tbody td {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-1) 0;
+    border-bottom: none;
+  }
+  td::before {
+    content: attr(data-label);
+    flex: 0 0 92px;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-3);
+    font-weight: var(--weight-medium);
+  }
+  /* Status dot column — no inline label, shrink to a tight indicator. */
+  td[data-label=""]::before {
+    content: none;
+  }
+  .col-status {
+    width: auto;
+  }
+  /* Let the preview wrap instead of truncating off-screen. */
+  .chat-preview {
+    white-space: normal;
+    max-width: none;
+  }
 }
 </style>

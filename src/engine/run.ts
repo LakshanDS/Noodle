@@ -6,6 +6,7 @@ import { log, runLogger } from "../util/log.js";
 import { resolveProfile } from "../profiles/resolve.js";
 import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
+import type { PullRequestData } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildPrompt } from "./prompt.js";
 import { createCommentOnIssueTool } from "./tools.js";
@@ -168,15 +169,40 @@ export async function runJob(
   const agentName = config.agent_name;
   const agentSlug = slugify(agentName);
   const jobId = input.jobId ?? `${input.repo.replace("/", "-")}-${input.issueNumber}`;
-  // Branch name: bare `<agent>/issue-<n>` for a fresh attempt. If an OPEN PR
-  // already exists for this issue (a follow-up `/noodle` run while the previous
-  // attempt's PR is still open), reuse that PR's branch and stack this run's
-  // work on top — the force-push updates the same PR instead of opening a new
-  // one. Closed-without-merge and merged PRs are NOT reused (no open PR found),
-  // so a clean retry starts a fresh branch.
-  const existing = await gh.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
-  const reuseBranch = !!existing;
-  const branchName = existing?.branch ?? branchNameFor(input.issueNumber, agentSlug);
+  const runStore = deps?.runStore;
+
+  // 1. Fetch issue + comments FIRST. The issue row tells us whether this number
+  // is actually a pull request (GitHub serves PRs through the issues API), and
+  // that determines branch resolution — so the fetch must precede it. The
+  // cooking-label concurrency gate (1a below) also needs the labels, and it
+  // must run before any side effects (label adds, branch ops).
+  const issue = await gh.getIssue(input.repo, input.issueNumber);
+  const comments = await gh.getIssueComments(input.repo, input.issueNumber);
+
+  // PR mode: the wake target is a pull request. The agent clones the PR's own
+  // head branch, makes the requested changes, and force-pushes back to the SAME
+  // PR (no new PR is opened). This is how a "/noodle change line 302" comment
+  // on an open PR lands edits on that PR. Issue mode (the original flow) opens
+  // a fresh branch off the default branch and opens/updates a PR linked to the
+  // issue via `Fixes #N`.
+  const isPR = !!issue.pull_request;
+  let pr: PullRequestData | null = null;
+  if (isPR) {
+    pr = await gh.getPullRequest(input.repo, input.issueNumber);
+  }
+
+  // Branch resolution. PR mode reuses the PR's head branch unconditionally
+  // (force-push onto it). Issue mode: bare `<agent>/issue-<n>` for a fresh
+  // attempt, or reuse the branch of an already-OPEN PR for this issue (a
+  // follow-up `/noodle` run while the previous PR is still open) — the
+  // force-push updates the same PR instead of opening a new one. Closed/merged
+  // PRs are NOT reused (no open PR found), so a clean retry starts a fresh
+  // branch.
+  const existing = isPR ? null : await gh.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
+  const reuseBranch = isPR || !!existing;
+  const branchName = isPR
+    ? (pr?.head_branch ?? branchNameFor(input.issueNumber, agentSlug))
+    : (existing?.branch ?? branchNameFor(input.issueNumber, agentSlug));
 
   // Per-run logger: stdout only (pretty). Run context is bound to the raw JSON
   // for correlation/grep, but the pretty formatter hides it from per-event
@@ -191,19 +217,24 @@ export async function runJob(
   // Run header: a banner with all the identifying context up front.
   log.info("═══════════════════════════════════════════════════════════════");
   log.info(
-    `agent run started — issue #${input.issueNumber} | repo=${input.repo} | branch=${branchName} | jobId=${jobId} | pid=${process.pid}`,
+    `agent run started — ${isPR ? "PR" : "issue"} #${input.issueNumber} | repo=${input.repo} | branch=${branchName} | jobId=${jobId} | pid=${process.pid}`,
   );
   log.info(
-    existing
-      ? { pr: existing.html_url, branch: branchName }
-      : { branch: branchName },
-    existing ? "reusing branch from open PR (follow-up run)" : "fresh branch (no open PR)",
+    isPR
+      ? { pr: pr?.html_url, branch: branchName, base: pr?.base_branch, fork: pr?.is_fork }
+      : existing
+        ? { pr: existing.html_url, branch: branchName }
+        : { branch: branchName },
+    isPR
+      ? "PR mode — cloning PR head branch"
+      : existing
+        ? "reusing branch from open PR (follow-up run)"
+        : "fresh branch (no open PR)",
   );
 
   // Record the run in the store (serve mode only). CLI runs skip this — the
   // store is an optional dep so the CLI stays DB-free. Updated at the end with
   // profile/model/status/pr/summary/error.
-  const runStore = deps?.runStore;
   if (runStore) {
     runStore.createRun({
       job_id: jobId,
@@ -212,26 +243,45 @@ export async function runJob(
       branch: branchName,
     });
   }
+  log_.info({ title: issue.title, labels: issue.labels }, isPR ? "fetched PR" : "fetched issue");
 
-  // 1. Fetch issue + comments.
-  const issue = await gh.getIssue(input.repo, input.issueNumber);
-  const comments = await gh.getIssueComments(input.repo, input.issueNumber);
-  log_.info({ title: issue.title, labels: issue.labels }, "fetched issue");
-
-  // 1a. Concurrency gate: if the "cooking" label is already on the issue, a run
-  // is in progress — don't start a second one. Post a short no-op comment and
-  // return a clean result (NOT an error, so the worker doesn't retry). Terminal
-  // labels (cooked/failed) do NOT block: they signal a finished run and allow a
-  // follow-up. This makes the label the visible source of truth for "is the
-  // agent busy here?".
-  const labels = labelsFor(agentName);
-  const lowerLabels = new Set(issue.labels.map((l) => l.toLowerCase()));
-  if (lowerLabels.has(labels.cooking.name.toLowerCase())) {
-    log_.info("skipping — issue already has the cooking label (a run is in progress)");
+  // 1b. Fork-PR guard: a PR from a fork has its head branch in a DIFFERENT repo
+  // Noodle can't push to. Bail early with a comment explaining this — the agent
+  // can't land edits on a fork PR's branch. (Same-repo PRs, including branches
+  // owned by collaborators, work normally.)
+  if (isPR && pr?.is_fork) {
+    log_.info({ headRepo: pr.head_repo }, "PR is from a fork — cannot push back, posting notice");
     await gh.createIssueComment(
       input.repo,
       input.issueNumber,
-      `_${displayName(agentName)} is already cooking on this issue — the new request will start once the current run finishes._`,
+      `_${displayName(agentName)} can't push to this PR — its head branch lives in \`${pr.head_repo}\` (a fork). ` +
+        `If you want the agent to work on this, please create a same-repo branch PR, or ask a maintainer to apply the changes._`,
+    );
+    if (runStore) {
+      runStore.updateRun(jobId, { status: "no_changes", error: `PR from fork (${pr.head_repo}) — cannot push`, finished_at: nowIso() });
+    }
+    return {
+      profile: "",
+      model: "",
+      changedFiles: [],
+      commentUrl: "",
+    };
+  }
+
+  // 1a. Concurrency gate: if the "cooking" label is already on the issue/PR, a
+  // run is in progress — don't start a second one. Post a short no-op comment
+  // and return a clean result (NOT an error, so the worker doesn't retry).
+  // Terminal labels (cooked/failed) do NOT block: they signal a finished run
+  // and allow a follow-up. This makes the label the visible source of truth for
+  // "is the agent busy here?".
+  const labels = labelsFor(agentName);
+  const lowerLabels = new Set(issue.labels.map((l) => l.toLowerCase()));
+  if (lowerLabels.has(labels.cooking.name.toLowerCase())) {
+    log_.info("skipping — already has the cooking label (a run is in progress)");
+    await gh.createIssueComment(
+      input.repo,
+      input.issueNumber,
+      `_${displayName(agentName)} is already cooking on this ${isPR ? "PR" : "issue"} — the new request will start once the current run finishes._`,
     );
     return {
       profile: "",
@@ -242,7 +292,7 @@ export async function runJob(
   }
 
   // Ensure both status labels exist in the repo (creates them if missing), then
-  // mark the issue as being worked on. (The `labels` const is already defined
+  // mark the issue/PR as being worked on. (The `labels` const is already defined
   // above, before the concurrency gate.)
   await gh.ensureLabel(
     input.repo,
@@ -313,8 +363,9 @@ export async function runJob(
     );
   }
 
-  // 4. Clone + branch. Base = repo default branch (resolved dynamically).
-  const baseBranch = await gh.defaultBranch(input.repo);
+  // 4. Clone + branch. Base = repo default branch (issue mode) or the PR's base
+  // branch (PR mode — already known from getPullRequest, so no extra API call).
+  const baseBranch = isPR ? (pr?.base_branch ?? await gh.defaultBranch(input.repo)) : await gh.defaultBranch(input.repo);
   // Credential providers: serve mode re-mints per-op (long jobs outlive the
   // 1h token TTL); CLI/tests fall back to the start-of-run token/gh.
   const tokenProvider = deps?.tokenProvider ?? (async () => input.token ?? process.env.GITHUB_TOKEN ?? "");
@@ -347,7 +398,7 @@ export async function runJob(
     // often can't, and a "let me run the build" attempt will hang or crash.
     const sysFacts = collectSysFacts();
     log_.debug({ sysFacts }, "probed system info for agent prompt");
-    const prompt = buildPrompt(issue, comments, input.repo, agentName, buildSysInfoGuidance(sysFacts));
+    const prompt = buildPrompt(issue, comments, input.repo, agentName, buildSysInfoGuidance(sysFacts), isPR);
     // Optional per-profile rate-limit throttle (e.g. NVIDIA NIM's 40 rpm).
     const throttle = throttleForRpm(profile.api_rpm);
     // pi retry settings tuned from the profile config so 429 retries don't cascade.
@@ -560,40 +611,50 @@ export async function runJob(
       // records the run with a `failed` status.
       if (!errored) {
         await ws.removeInternals();
-        const committed = await ws.commitAll(
-          `Fix #${input.issueNumber}: ${issue.title}\n\nGenerated by ${agentName} (profile: ${profile.name}).`,
-        );
+        const commitMsg = isPR
+          ? `Update PR #${input.issueNumber}: ${issue.title}\n\nGenerated by ${agentName} (profile: ${profile.name}).`
+          : `Fix #${input.issueNumber}: ${issue.title}\n\nGenerated by ${agentName} (profile: ${profile.name}).`;
+        const committed = await ws.commitAll(commitMsg);
 
         if (committed) {
           // Re-mint credentials right before push — a long agent run can
           // exceed the token's TTL (1h for GitHub-App installation tokens).
           await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()), reuseBranch);
           const changedFiles = await ws.changedFiles();
-          const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
           // Re-resolve the gh client too — same expiry risk on the post-run
           // API calls (PR/comment/label) on long runs.
           const ghNow = await ghProvider();
-          // Re-check for an open PR on this branch right before creating one.
-          // The branch was resolved at run start, but a long agent run may have
-          // raced with a human closing/merging the PR in the meantime — re-query
-          // so we either reuse the still-open PR or open a fresh one.
-          const openNow = await ghNow.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
-          let pr: { number: number; html_url: string };
-          if (openNow) {
-            // Force-push already landed the new commits on the existing branch.
-            pr = openNow;
-            log_.info({ pr: pr.html_url, changedFiles, reused: true }, "updated existing PR (follow-up)");
+          let prUrl: string;
+          if (isPR) {
+            // PR mode: the PR already exists — the force-push just updated it.
+            // No new PR to create. Use the URL we resolved at run start.
+            prUrl = pr?.html_url ?? issue.html_url;
+            log_.info({ pr: prUrl, changedFiles }, "pushed to PR branch");
           } else {
-            pr = await ghNow.createPullRequest(
-              input.repo,
-              branchName,
-              baseBranch,
-              `Fixes #${issue.number}: ${issue.title}`,
-              prBody,
-            );
-            log_.info({ pr: pr.html_url, changedFiles }, "opened PR");
+            // Issue mode: re-check for an open PR on this branch right before
+            // creating one. The branch was resolved at run start, but a long
+            // agent run may have raced with a human closing/merging the PR in
+            // the meantime — re-query so we either reuse the still-open PR or
+            // open a fresh one.
+            const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
+            const openNow = await ghNow.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
+            let prResult: { number: number; html_url: string };
+            if (openNow) {
+              // Force-push already landed the new commits on the existing branch.
+              prResult = openNow;
+              log_.info({ pr: prResult.html_url, changedFiles, reused: true }, "updated existing PR (follow-up)");
+            } else {
+              prResult = await ghNow.createPullRequest(
+                input.repo,
+                branchName,
+                baseBranch,
+                `Fixes #${issue.number}: ${issue.title}`,
+                prBody,
+              );
+              log_.info({ pr: prResult.html_url, changedFiles }, "opened PR");
+            }
+            prUrl = prResult.html_url;
           }
-          const prUrl = pr.html_url;
 
           await swapLabel(ghNow, input.repo, input.issueNumber, labels, "cooked", log_);
 

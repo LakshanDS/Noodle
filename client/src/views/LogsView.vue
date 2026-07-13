@@ -246,4 +246,26 @@ onUnmounted(stopPolling);
   color: var(--text);
   padding: 0 var(--space-2);
 }
+
+/* ---------- Mobile (≤768px) — wrap log lines ---------- */
+@media (max-width: 768px) {
+  /* Let long messages wrap instead of being clipped off-screen. The timestamp
+   * + level stay on the first line; the message flows onto the lines below. */
+  .log-line {
+    white-space: normal;
+    align-items: flex-start;
+    padding: var(--space-2) var(--space-3);
+  }
+  .msg {
+    white-space: pre-wrap;
+    overflow: visible;
+    flex: 1 1 100%;
+  }
+  .fields {
+    flex: 1 1 100%;
+  }
+  .foot-note {
+    font-size: var(--text-xs);
+  }
+}
 </style>

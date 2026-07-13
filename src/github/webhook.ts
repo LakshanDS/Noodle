@@ -46,20 +46,25 @@ export function verifySignature(body: string, signature: string | undefined, sec
 
 /**
  * Turn a GitHub webhook payload into a normalized intent, or null if the event
- * is not one Noodle should act on (ping, unrelated actions, PR events, etc.).
+ * is not one Noodle should act on (ping, unrelated actions, PR lifecycle
+ * events, etc.).
  *
  * Recognized events:
  * - `issues` with action opened | reopened | labeled — only when the issue
  *   body PASSES the configured `triggers` wake filter (default: opt-in, so the
  *   body must @-mention the agent or carry a keyword / slash / #profile tag).
  *   Set `triggers.trigger_on_open: true` to restore "fire on every issue".
+ *   These events are issue-only: the same lifecycle on a PR is ignored.
  * - `issues` with action assigned — but only when the issue was assigned to
  *   Noodle itself (`selfLogin` matches the new assignee's login). Assignment
  *   is unconditional wake; it does NOT go through the trigger filter. Assignment
  *   to a human teammate is ignored so Noodle doesn't run on every reshuffle.
  * - `issue_comment` with action created, when the comment body explicitly
  *   wakes the agent: `/<agent>` slash command, `@<agent>` mention, or a
- *   `#<configured-profile>` tag.
+ *   `#<configured-profile>` tag. Fires for BOTH issue and PR comments — a
+ *   `/<command>` on a PR wakes the agent, which clones the PR's branch and
+ *   pushes back to the same PR (detected inside runJob via getIssue's
+ *   `pull_request` flag).
  *
  * `label`-on-`labeled` is handled by `resolveProfile` later (it reads labels
  * from the issue, not the webhook), so we don't filter by which label was added
@@ -99,8 +104,14 @@ export function parseWebhookEvent(
   };
 
   if (!p.repository?.full_name || !p.issue?.number) return null;
-  // Skip events on pull requests — Phase 2 is issue-driven.
-  if (p.issue.pull_request) return null;
+  // `issue_comment` events fire for BOTH issues and PRs (GitHub routes PR
+  // comments through the issue-comment surface). We treat them the same: a
+  // `/<command>`, `@mention`, or `#<profile>` on a PR comment wakes the agent
+  // — runJob detects PR mode from getIssue and clones the PR's branch.
+  //
+  // `issues.*` lifecycle events (opened/reopened/labeled/assigned) are still
+  // issue-only: Noodle is issue-driven, so those events on a PR are ignored.
+  const isPullRequest = !!p.issue.pull_request;
 
   // Skip events triggered by the bot itself (e.g. label swaps, comments)
   // to prevent re-entrant triggers after a run completes.
@@ -121,6 +132,10 @@ export function parseWebhookEvent(
   };
 
   if (event === "issues") {
+    // `issues.*` lifecycle events are issue-only — Noodle is issue-driven and
+    // doesn't trigger on PR opened/reopened/labeled/assigned. (PR wake-up
+    // happens via issue_comment with a slash/mention, handled below.)
+    if (isPullRequest) return null;
     if (p.action === "opened" || p.action === "reopened" || p.action === "labeled") {
       // Opt-in wake filter: the issue body must carry a wake signal (mention,
       // keyword, slash, or #profile). The webhook payload carries the body but

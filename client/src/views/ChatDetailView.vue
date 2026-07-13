@@ -153,7 +153,8 @@ onMounted(load);
 /* Fill the available viewport height so the composer pins to the bottom and
  * the thread grows to fill the space above it. The subtracted chrome is the
  * .main top padding (space-4) + action-panel row (44px + its space-4 margin)
- * + .main bottom padding (space-6). */
+ * + .main bottom padding (space-6). On mobile the action-panel wraps and the
+ * mobile top bar adds height, so the offset is larger (see the media query). */
 .chat-layout {
   display: flex;
   flex-direction: column;
@@ -233,5 +234,23 @@ onMounted(load);
 }
 .composer-bar :deep(.btn) {
   flex: 0 0 auto;
+}
+
+/* ---------- Mobile (≤768px) ----------
+ * On mobile the action panel wraps above the mobile top bar, so the height
+ * offset grows. The safe-area inset keeps the composer clear of the iPhone
+ * home indicator. */
+@media (max-width: 768px) {
+  .chat-layout {
+    /* mobile top bar (52px) + .main top/bottom padding + action panel. */
+    height: calc(100dvh - 148px);
+  }
+  .composer-bar {
+    padding-bottom: var(--space-2);
+    padding-bottom: max(var(--space-2), env(safe-area-inset-bottom));
+  }
+  .composer-input {
+    font-size: var(--text-md);
+  }
 }
 </style>

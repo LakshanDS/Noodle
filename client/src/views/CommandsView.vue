@@ -78,17 +78,17 @@ onMounted(load);
         </thead>
         <tbody>
           <tr v-for="c in commands" :key="c.id" class="row" @click="open(c.id)">
-            <td>
+            <td data-label="State">
               <StatusPill :status="c.enabled ? 'enabled' : 'disabled'" />
             </td>
-            <td class="col-trigger">
+            <td class="col-trigger" data-label="Trigger">
               <code class="tag">/{{ c.trigger }}</code>
             </td>
-            <td>
+            <td data-label="Name">
               <span class="cmd-name">{{ c.name }}</span>
             </td>
-            <td class="muted ellipsis">{{ c.description }}</td>
-            <td class="col-profile muted">{{ c.profile ?? "Default" }}</td>
+            <td class="muted ellipsis" data-label="Description">{{ c.description }}</td>
+            <td class="col-profile muted" data-label="Profile">{{ c.profile ?? "Default" }}</td>
           </tr>
         </tbody>
       </table>
@@ -172,5 +172,56 @@ tbody tr:last-child td {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------- Mobile (≤768px) — stacked cards ---------- */
+@media (max-width: 768px) {
+  .table-wrap {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+  }
+  .table,
+  tbody,
+  tr,
+  td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tr.row {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-2) var(--space-4);
+    margin-bottom: var(--space-3);
+  }
+  tr.row:hover {
+    background: var(--surface-3);
+  }
+  tbody td {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  td::before {
+    content: attr(data-label);
+    flex: 0 0 92px;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-caps);
+    color: var(--text-3);
+    font-weight: var(--weight-medium);
+  }
+  .ellipsis {
+    max-width: none;
+    white-space: normal;
+  }
 }
 </style>

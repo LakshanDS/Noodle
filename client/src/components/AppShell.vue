@@ -13,13 +13,17 @@
  * Login + Setup opt out of the shell (they're full-screen), so this component
  * is only mounted by the authed views.
  */
-import { computed } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import Icon from "./ui/Icon.vue";
 import { logout } from "../composables/useAuth.js";
 
 const route = useRoute();
 const router = useRouter();
+
+/** Mobile drawer state. On desktop (≥768px) the sidebar is always visible and
+ * this ref has no effect. Below the breakpoint it drives the slide-in drawer. */
+const sidebarOpen = ref(false);
 
 interface NavItem {
   name: string;
@@ -52,23 +56,57 @@ const activeGroup = computed(() => {
 
 function go(item: NavItem): void {
   void router.push(item.target);
+  sidebarOpen.value = false;
 }
 
 /** The hover "+" button: navigates to the item's create route. */
 function createItem(item: NavItem): void {
   if (item.create) void router.push(item.create);
+  sidebarOpen.value = false;
 }
 
 async function onLogout(): Promise<void> {
   await logout();
   await router.replace({ name: "login" });
 }
+
+/** Auto-close the drawer when the route changes (e.g. after tapping a nav item
+ *  that doesn't call go(), like back/forward). */
+watch(
+  () => route.name,
+  () => {
+    sidebarOpen.value = false;
+  },
+);
+
+/** Close the drawer on Escape — standard dismiss affordance. */
+function onKeydown(e: KeyboardEvent): void {
+  if (e.key === "Escape" && sidebarOpen.value) sidebarOpen.value = false;
+}
+onMounted(() => window.addEventListener("keydown", onKeydown));
+onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 </script>
 
 <template>
   <div class="shell">
+    <!-- Mobile top bar — hidden on desktop, shows hamburger + brand. Only the
+         hamburger toggles; the brand label is mirrored here because the sidebar
+         brand is off-canvas when the drawer is closed. -->
+    <header class="mobile-bar">
+      <button class="hamburger" :aria-expanded="sidebarOpen" aria-label="Menu" @click="sidebarOpen = !sidebarOpen">
+        <Icon name="menu" :size="20" />
+      </button>
+      <span class="mobile-brand">
+        <Icon name="logo" :size="18" />
+        <span>Noodle</span>
+      </span>
+    </header>
+
+    <!-- Backdrop — dims the page behind the open drawer, click closes it. -->
+    <div v-if="sidebarOpen" class="backdrop" @click="sidebarOpen = false" />
+
     <!-- Sidebar -->
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ open: sidebarOpen }">
       <div class="brand">
         <span class="brand-mark"><Icon name="logo" :size="20" /></span>
         <span class="brand-name">Noodle</span>
@@ -289,5 +327,112 @@ async function onLogout(): Promise<void> {
   box-shadow: var(--shadow-md);
   backdrop-filter: blur(8px);
   white-space: nowrap;
+}
+
+/* ---------- Mobile (≤768px) ----------
+ * The sidebar becomes a slide-in drawer, a compact top bar holds the hamburger,
+ * and content padding shrinks to reclaim horizontal space on phones. */
+.mobile-bar {
+  display: none;
+}
+.backdrop {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .shell {
+    grid-template-columns: 1fr;
+    /* mobile-bar (auto) + main fills the rest. */
+    grid-template-rows: auto 1fr;
+  }
+
+  /* Top bar with hamburger — sits above the content column. */
+  .mobile-bar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    height: 52px;
+    padding: 0 var(--space-3);
+    background: color-mix(in srgb, var(--surface-1) 95%, transparent);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+    /* Stretch across the grid's single column. */
+    grid-column: 1;
+  }
+  .hamburger {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-md);
+    color: var(--text-2);
+  }
+  .hamburger:hover {
+    background: var(--surface-3);
+    color: var(--text);
+  }
+  .mobile-brand {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-md);
+    font-weight: var(--weight-semibold);
+    letter-spacing: var(--tracking-tight);
+    color: var(--text);
+  }
+  .mobile-brand :deep(svg) {
+    color: var(--accent);
+  }
+
+  /* Sidebar — off-canvas drawer, slides in via .open. */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(280px, 85vw);
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform var(--dur) var(--ease);
+    box-shadow: var(--shadow-lg);
+  }
+  .sidebar.open {
+    transform: translateX(0);
+  }
+  .nav-item {
+    min-height: 44px;
+  }
+
+  /* Backdrop dims + dismisses. */
+  .backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(2px);
+  }
+
+  /* Content reclaims horizontal space. */
+  .main {
+    /* Fill the remaining grid row below the mobile bar instead of forcing
+     * 100dvh (which would overflow by the bar's height). */
+    height: 100%;
+    min-height: 0;
+    /* Disable the desktop scrollbar gutter — it wastes width on mobile. */
+    scrollbar-gutter: auto;
+    padding: var(--space-3) var(--space-3) var(--space-6);
+  }
+  .action-panel {
+    white-space: normal;
+    flex-wrap: wrap;
+    width: auto;
+    margin-left: 0;
+    justify-content: flex-end;
+  }
 }
 </style>
