@@ -1,5 +1,0 @@
-{
-  "BASE_URL": "https://generativelanguage.googleapis.com/v1beta",
-  "API_KEY": "GEMINI_API",
-  "MODEL_ID": "gemini-3-pro"
-}
