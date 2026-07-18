@@ -19,6 +19,8 @@ const GH_API_VERSION = "2022-11-28";
  */
 export interface AuthProvider {
   forRepo(repo: string, installationId?: number): Promise<{ gh: GitHubClient; token: string }>;
+  /** List repos accessible to the configured credentials (PAT or App installation). */
+  listRepos(): Promise<import("./client.js").RepoData[]>;
 }
 
 /** PAT mode: a single constant token from GITHUB_TOKEN. */
@@ -27,6 +29,11 @@ export class PatAuthProvider implements AuthProvider {
 
   async forRepo(): Promise<{ gh: GitHubClient; token: string }> {
     return { gh: new GitHubClient(new Octokit({ auth: this.token, request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } })), token: this.token };
+  }
+
+  async listRepos(): Promise<import("./client.js").RepoData[]> {
+    const { gh } = await this.forRepo();
+    return gh.listRepos();
   }
 }
 
@@ -55,6 +62,21 @@ export class GithubAppAuthProvider implements AuthProvider {
     }
     const token = await this.appAuth.getInstallationToken(instId);
     return { gh: new GitHubClient(new Octokit({ auth: token, request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } })), token };
+  }
+
+  /**
+   * List repos accessible to any installation of this App. Finds the first
+   * installation and uses its token to call the correct endpoint:
+   * `GET /installation/repositories` (not `GET /user/repos`, which returns 403
+   * for App tokens — "Resource not accessible by integration").
+   */
+  async listRepos(): Promise<import("./client.js").RepoData[]> {
+    const installations = await this.appAuth.listInstallations();
+    if (installations.length === 0) return [];
+    const token = await this.appAuth.getInstallationToken(installations[0].id);
+    const octokit = new Octokit({ auth: token, request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } });
+    const { data } = await octokit.rest.apps.listReposAccessibleToInstallation({ per_page: 100 });
+    return data.repositories.map((r) => ({ full_name: r.full_name, default_branch: r.default_branch }));
   }
 }
 
@@ -99,6 +121,25 @@ class LazyAuthProvider implements AuthProvider {
     }
     return new NoopAuthProvider().forRepo();
   }
+
+  async listRepos(): Promise<import("./client.js").RepoData[]> {
+    const appId = this.store.get("GITHUB_APP_ID");
+    const privateKey = this.store.get("GITHUB_PRIVATE_KEY");
+    if (appId && (privateKey || process.env.GITHUB_PRIVATE_KEY_FILE)) {
+      const fingerprint = `${appId}|${privateKey ?? ""}`;
+      if (!this.appCache || this.appCache.fingerprint !== fingerprint) {
+        const appAuth = new GithubAppAuth({ appId, privateKey: privateKey ?? undefined });
+        this.appCache = { fingerprint, provider: new GithubAppAuthProvider(appAuth) };
+      }
+      return this.appCache.provider.listRepos();
+    }
+    this.appCache = null;
+    const token = this.store.get("GITHUB_TOKEN");
+    if (token) {
+      return new PatAuthProvider(token).listRepos();
+    }
+    return new NoopAuthProvider().listRepos();
+  }
 }
 
 /**
@@ -122,6 +163,10 @@ class NoopAuthProvider implements AuthProvider {
     throw new Error(
       "No GitHub auth configured. Run the setup wizard at /#/setup or set GITHUB_TOKEN / GITHUB_APP_ID in the Settings page.",
     );
+  }
+
+  async listRepos(): Promise<import("./client.js").RepoData[]> {
+    return [];
   }
 }
 

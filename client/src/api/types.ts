@@ -307,35 +307,6 @@ export interface SettingsPutResponse {
   restartKeys: string[];
 }
 
-/* ----- Setup wizard (first-run) ----- */
-
-export interface SetupStatus {
-  configured: boolean;
-  steps: { github: boolean; llm: boolean; ui: boolean };
-  hasProfiles: boolean;
-}
-
-export interface SetupPayload {
-  github: {
-    token?: string;
-    appId?: string;
-    privateKey?: string;
-    webhookSecret?: string;
-  };
-  llm: {
-    model: string;
-    apiKey?: string;
-    baseUrl: string;
-    api: string;
-  };
-  uiPassword: string;
-}
-
-export interface SetupResponse {
-  ok: boolean;
-  needsRestart: boolean;
-}
-
 /* ----- Profiles (DB-managed agent profiles) ----- */
 
 /** The 7 built-in tool names the agent can use. */

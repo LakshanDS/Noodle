@@ -161,97 +161,6 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     return reply.send({ ok: true });
   });
 
-  // --- Setup wizard (first-run). Unauthenticated, but only admitted when the
-  // instance is not yet configured (no UI password + no GitHub auth). Once a
-  // UI password is set these routes 403, so they can't be used to re-open the
-  // wizard or reset creds on a live instance. ---
-  // `configured` here means "has a UI password" — that's the gate that turns the
-  // UI from open-setup into auth-gated. GitHub auth is also reported so the
-  // wizard can show which steps are still needed.
-  const isConfigured = (): boolean => settingsStore.has("NOODLE_UI_PASSWORD");
-
-  app.get("/api/setup/status", async () => {
-    return {
-      configured: isConfigured(),
-      steps: {
-        github: settingsStore.has("GITHUB_TOKEN") || settingsStore.has("GITHUB_APP_ID"),
-        llm: profileStore.list().length > 0,
-        ui: settingsStore.has("NOODLE_UI_PASSWORD"),
-      },
-      // Existing profile names from config (so the wizard can warn if a profile
-      // already exists, meaning the seed step is optional).
-      hasProfiles: Object.keys(config.profiles).length > 0,
-    };
-  });
-
-  app.post("/api/setup", async (req, reply) => {
-    // Fail closed once configured — never let the wizard re-run on a live box.
-    if (isConfigured()) {
-      return reply.code(403).send({ error: "already configured" });
-    }
-    const body = readJsonBody(req.body);
-    if (!body) return reply.code(400).send({ error: "missing body" });
-    const parsed = parseSetupPayload(body);
-    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
-
-    // Persist all in one transaction.
-    const values: Record<string, string> = {};
-    if (parsed.github.token) values.GITHUB_TOKEN = parsed.github.token;
-    if (parsed.github.appId) values.GITHUB_APP_ID = parsed.github.appId;
-    if (parsed.github.privateKey) values.GITHUB_PRIVATE_KEY = parsed.github.privateKey;
-    if (parsed.github.webhookSecret) values.GITHUB_WEBHOOK_SECRET = parsed.github.webhookSecret;
-    if (parsed.uiPassword) values.NOODLE_UI_PASSWORD = parsed.uiPassword;
-    // Seed a minimal global system prompt on first run. It states the agent's
-    // role and defers approach + capability decisions to the live system info
-    // (expanded from {system} at run time). The operator can edit/empty it later.
-    if (!settingsStore.has("system_prompt")) {
-      values.system_prompt = [
-        "You are an autonomous software engineer working on a GitHub repository.",
-        "Work from the issue or task you're given, and the system info below.",
-        "Decide your own approach and which tools to use based on what this",
-        "machine can actually do. Make the minimal change, verify it, and report",
-        "what you did as your final message.",
-        "",
-        "{system}",
-      ].join("\n");
-    }
-    // Seed sensible defaults for run timeouts, triggers, routing, and queue so a
-    // fresh install is usable + self-documenting. The operator can edit any of
-    // these from the Settings page later.
-    if (!settingsStore.has("run_stall_timeout_minutes")) values.run_stall_timeout_minutes = "30";
-    if (!settingsStore.has("run_tool_stall_minutes")) values.run_tool_stall_minutes = "60";
-    if (!settingsStore.has("queue_concurrency")) values.queue_concurrency = "3";
-    if (!settingsStore.has("queue_max_attempts")) values.queue_max_attempts = "5";
-    if (!settingsStore.has("queue_retry_backoff_seconds")) values.queue_retry_backoff_seconds = "3";
-    // Seed the default GitHub status labels so the Settings UI has values to
-    // show/edit on a fresh install. Commands without custom labels inherit these.
-    if (!settingsStore.has("labels")) values.labels = serializeLabelSet(defaultLabelSet());
-
-    settingsStore.setMany(values);
-
-    // Write the profile directly to the DB and set it as the default — no more
-    // seed/next-boot indirection. The profile is immediately runnable.
-    const profile = validateProfileInput({
-      model: parsed.llm.model,
-      base_url: parsed.llm.baseUrl,
-      api: parsed.llm.api,
-      api_key: parsed.llm.apiKey ?? "",
-    });
-    if ("error" in profile) {
-      return reply.code(400).send({ error: profile.error });
-    }
-    if (!profileStore.has("default")) {
-      profileStore.create("default", profile);
-      config.profiles["default"] = profile;
-      if (!settingsStore.has("default_profile")) {
-        settingsStore.set("default_profile", "default");
-        config.default_profile = "default";
-      }
-    }
-
-    return { ok: true, needsRestart: true };
-  });
-
   // --- Read-only API (all auth-guarded). ---
   app.get("/api/runs", { preHandler: auth }, async () => {
     return { runs: runStore.listRuns(50) };
@@ -455,6 +364,8 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     const apiKey = typeof body.api_key === "string" ? body.api_key.trim() : "";
     const model = typeof body.model === "string" ? body.model.trim() : "";
 
+    // The base_url should include any path prefix (e.g. /v1) — we just append
+    // /models to list available models.
     const url = `${baseUrl.replace(/\/+$/, "")}/models`;
     const headers: Record<string, string> = { Accept: "application/json" };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
@@ -759,14 +670,24 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
   // Both return { repos: [] } / { branches: [] } on any error so the form
   // always degrades gracefully to free-text input. ---
 
+  /**
+   * Return the GitHub App install URL. The user clicks this to install the App
+   * on their repos after creating it via the manifest flow.
+   */
+  app.get("/api/github/install-url", { preHandler: auth }, async (_req, reply) => {
+    const slug = settingsStore.get("GITHUB_APP_SLUG");
+    if (!slug) {
+      return reply.code(404).send({ error: "GitHub App not created yet. Create it first via Settings." });
+    }
+    return { url: `https://github.com/apps/${slug}/installations/new` };
+  });
+
   app.get("/api/github/repos", { preHandler: auth }, async (_req, reply) => {
     try {
-      // PAT mode ignores the repo arg; App mode needs an installation on a real
-      // repo to resolve — if it fails, we catch and return an empty list.
-      const { gh } = await authProvider.forRepo("a/a");
-      const repos = await gh.listRepos();
+      const repos = await authProvider.listRepos();
       return { repos };
-    } catch {
+    } catch (e) {
+      log.error({ err: e }, "listRepos failed");
       return reply.code(200).send({ repos: [] });
     }
   });
@@ -844,7 +765,7 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       redirect_url: callbackUrl,
       callback_urls: [callbackUrl],
       public: false,
-      setup_url: `${base}/setup`,
+      setup_url: `${base}/#/settings`,
       default_permissions: {
         issues: "write",
         pull_requests: "write",
@@ -933,6 +854,7 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       // (e.g. "my-repo-bot"), which becomes the agent login.
       settingsStore.setMany({
         GITHUB_APP_ID: String(data.id),
+        GITHUB_APP_SLUG: data.slug,
         GITHUB_PRIVATE_KEY: data.pem,
         GITHUB_WEBHOOK_SECRET: data.webhook_secret,
         NOODLE_LOGIN: `${data.slug}[bot]`,
@@ -941,26 +863,32 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       });
 
       log.info({ appId: data.id, slug: data.slug }, "GitHub App created via manifest flow");
-      // Show a self-contained success page (opened in a new tab by the Settings UI).
+      // Redirect to the GitHub App install page so the user can install it on
+      // their repos immediately. The success page shows a brief message first,
+      // then auto-redirects after 3 seconds (with a manual link as fallback).
+      const installUrl = `https://github.com/apps/${data.slug}/installations/new`;
       reply.type("text/html");
       return reply.send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>GitHub App Connected</title>
+<html><head><meta charset="utf-8"><title>GitHub App Created</title>
+<meta http-equiv="refresh" content="3;url=${installUrl}">
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0d1117; color: #e6edf3; }
   .card { text-align: center; padding: 2.5rem 3rem; background: #161b22; border: 1px solid #30363d; border-radius: 12px; max-width: 400px; }
   .check { font-size: 3rem; margin-bottom: 1rem; }
   h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
-  p { color: #8b949e; font-size: 0.875rem; line-height: 1.5; margin: 0 0 1.5rem; }
-  .hint { font-size: 0.75rem; color: #484f58; }
+  p { color: #8b949e; font-size: 0.875rem; line-height: 1.5; margin: 0 0 1rem; }
+  a { color: #58a6ff; text-decoration: none; font-size: 0.875rem; }
+  a:hover { text-decoration: underline; }
+  .hint { font-size: 0.75rem; color: #484f58; margin-top: 0.5rem; }
 </style></head><body>
 <div class="card">
   <div class="check">✅</div>
-  <h1>GitHub App Connected</h1>
-  <p><strong>${data.name}</strong> (ID: ${data.id}) has been created and configured.</p>
-  <p>You can close this tab and restart Noodle to apply.</p>
-  <p class="hint">This tab will close automatically in 5 seconds.</p>
+  <h1>GitHub App Created</h1>
+  <p><strong>${data.name}</strong> has been created.</p>
+  <p>Redirecting to install it on your repos&hellip;</p>
+  <a href="${installUrl}">Install now</a>
+  <p class="hint">If nothing happens, click the link above.</p>
 </div>
-<script>setTimeout(() => window.close(), 5000)</script>
 </body></html>`);
     } catch (e) {
       log.error({ err: e }, "Failed to exchange GitHub App manifest code");
@@ -1284,10 +1212,13 @@ interface TestRequest {
  * OpenAI-compatible shape, which is the most common.
  */
 function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: string): TestRequest {
+  // The base_url should include any path prefix (e.g. /v1) — we just append
+  // the endpoint path. The user enters e.g. "https://api.openai.com/v1" and
+  // we hit "https://api.openai.com/v1/chat/completions".
   const root = baseUrl.replace(/\/+$/, "");
+
   switch (api as WireApi) {
     case "openai-responses":
-      // OpenAI's Responses API: POST /responses, body uses `input` not `messages`.
       return {
         url: `${root}/responses`,
         headers: {
@@ -1298,7 +1229,7 @@ function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: s
       };
     case "anthropic-messages":
       return {
-        url: `${root}/v1/messages`,
+        url: `${root}/messages`,
         headers: {
           "Content-Type": "application/json",
           "x-api-key": apiKey,
@@ -1307,7 +1238,6 @@ function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: s
         body: { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] },
       };
     case "google-generative-ai":
-      // Key travels as a query param for Google's Generative AI endpoint.
       return {
         url: `${root}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
         headers: { "Content-Type": "application/json" },
@@ -1316,10 +1246,8 @@ function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: s
     case "mistral-conversations":
     case "openai-completions":
     default:
-      // OpenAI-compatible (Ollama, vLLM, DeepSeek, NVIDIA NIM, Mistral, …):
-      // Bearer key, /chat/completions. Mistral uses the same shape.
       return {
-        url: `${root}/v1/chat/completions`,
+        url: `${root}/chat/completions`,
         headers: {
           "Content-Type": "application/json",
           ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -1582,65 +1510,4 @@ function readPassword(body: unknown): string | undefined {
     return typeof p === "string" ? p : undefined;
   }
   return undefined;
-}
-
-/**
- * The shape of a setup wizard submission. GitHub is either PAT (token) or App
- * (appId + privateKey); the LLM step needs a provider, model, and key; the UI
- * password gates the dashboard after setup.
- */
-interface SetupPayload {
-  github: {
-    token?: string;
-    appId?: string;
-    privateKey?: string;
-    webhookSecret?: string;
-  };
-  llm: {
-    model: string;
-    apiKey?: string;
-    baseUrl: string;
-    api: string;
-  };
-  uiPassword: string;
-}
-
-/** Validate a setup payload. Returns the typed payload or { error }. */
-function parseSetupPayload(body: Record<string, unknown>): SetupPayload | { error: string } {
-  const githubRaw = body.github;
-  const llmRaw = body.llm;
-  const uiPassword = strField(body, "uiPassword");
-  if (!uiPassword) return { error: "uiPassword is required" };
-  if (!llmRaw || typeof llmRaw !== "object") return { error: "llm is required" };
-  const llm = llmRaw as Record<string, unknown>;
-  const model = strField(llm, "model");
-  if (!model) return { error: "llm.model is required" };
-  const baseUrl = strField(llm, "baseUrl");
-  const api = strField(llm, "api");
-  if (!baseUrl) return { error: "llm.baseUrl is required" };
-  if (!api) return { error: "llm.api is required" };
-
-  const github: SetupPayload["github"] = {};
-  if (githubRaw && typeof githubRaw === "object") {
-    const g = githubRaw as Record<string, unknown>;
-    github.token = strField(g, "token");
-    github.appId = strField(g, "appId");
-    github.privateKey = typeof g.privateKey === "string" ? g.privateKey : undefined;
-    github.webhookSecret = strField(g, "webhookSecret");
-  }
-  // Must have some GitHub auth (PAT or App).
-  if (!github.token && !(github.appId && github.privateKey)) {
-    return { error: "GitHub auth required: set a token, or appId + privateKey" };
-  }
-
-  return {
-    github,
-    llm: {
-      model,
-      apiKey: strField(llm, "apiKey"),
-      baseUrl,
-      api,
-    },
-    uiPassword,
-  };
 }

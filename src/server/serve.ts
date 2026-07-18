@@ -285,9 +285,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
 
   // Web UI: the dashboard password is read from the settings DB per-request, so
   // password changes take effect without a restart. On a blank instance (no
-  // password set), seed a default so the dashboard is reachable out of the box
-  // instead of leaving it in setup mode. Idempotent — only seeds when the row
-  // is missing, so an operator who changes the password never gets clobbered.
+  // password set), seed a default so the dashboard is reachable out of the box.
+  // Idempotent — only seeds when the row is missing, so an operator who changes
+  // the password never gets clobbered.
   //
   // ⚠ KNOWN DEFAULT: the seeded value below is a fixed, public default. Any
   // fresh instance is reachable by anyone who knows it until the operator
@@ -300,7 +300,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   }
   // Seed the editable instance defaults (system prompt, run timeouts, triggers,
   // routing, queue, labels) on a fresh DB so the Settings page has real values
-  // the moment the UI comes up — independent of the setup wizard. Idempotent.
+  // the moment the UI comes up. Idempotent.
   seedDefaultSettings(settingsStore);
   const fallbackSecret = cryptoRandomSecret();
   const getUiPassword = (): string => settingsStore.get("NOODLE_UI_PASSWORD") ?? fallbackSecret;
@@ -311,7 +311,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   if (settingsStore.has("NOODLE_UI_PASSWORD")) {
     log.info("web UI enabled (password-protected)");
   } else {
-    log.warn("NOODLE_UI_PASSWORD not set — web UI in setup mode (wizard reachable at /#/setup, login disabled until configured)");
+    log.warn("NOODLE_UI_PASSWORD not set — login disabled until configured via Settings");
   }
 
   // Cron scheduler: always runs (cron jobs are DB-defined, not config-gated).
@@ -368,12 +368,12 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
 
 /**
  * ⚠ KNOWN DEFAULT password seeded into a fresh DB (one with no
- * NOODLE_UI_PASSWORD row). Seeding it skips the setup wizard and enables
- * login immediately so the dashboard is usable out of the box. Because this
- * value is public in the source tree, ANY fresh instance is reachable by
- * anyone who knows it until the operator changes it in Settings. Acceptable
- * for local/trusted networks; unacceptable for anything exposed — change it
- * immediately on deployment. Idempotent: an existing row is never overwritten.
+ * NOODLE_UI_PASSWORD row). Seeding it enables login immediately so the
+ * dashboard is usable out of the box. Because this value is public in the
+ * source tree, ANY fresh instance is reachable by anyone who knows it until
+ * the operator changes it in Settings. Acceptable for local/trusted networks;
+ * unacceptable for anything exposed — change it immediately on deployment.
+ * Idempotent: an existing row is never overwritten.
  */
 const DEFAULT_UI_PASSWORD = "Noodle69";
 
@@ -381,8 +381,8 @@ const DEFAULT_UI_PASSWORD = "Noodle69";
  * A random cookie-signing secret for a blank instance (no UI password set yet).
  * Used only so the cookie auth machinery has *a* secret to sign with; no one
  * can log in with it because verifyPassword compares against the real password
- * (empty in this state), so every login attempt fails until the wizard sets
- * NOODLE_UI_PASSWORD. The wizard routes themselves are unauthenticated.
+ * (empty in this state), so every login attempt fails until the password is
+ * set via Settings.
  */
 function cryptoRandomSecret(): string {
   return randomBytes(32).toString("hex");
@@ -395,14 +395,14 @@ function cryptoRandomSecret(): string {
  *
  * If the YAML is missing entirely, fall back to a minimal config with sensible
  * defaults. The server starts, and the operator creates profiles via the
- * dashboard or setup wizard.
+ * dashboard Settings page.
  */
 function resolveConfig(configPath: string | undefined): NoodleConfig {
   try {
     return loadConfig(configPath);
   } catch (e) {
     // YAML missing (not found or unreadable) → produce minimal defaults so the
-    // server can boot and the wizard can run. A validation error means the YAML
+    // server can boot and the Settings page is usable. A validation error means the YAML
     // exists but is malformed — surface that.
     if (e instanceof ConfigError && /No config file found|Failed to read config/.test(e.message)) {
       return NoodleConfigSchema.parse({});

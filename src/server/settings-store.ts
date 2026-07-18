@@ -50,6 +50,7 @@ export const SETTING_CATALOG: readonly SettingMeta[] = [
   { key: "NOODLE_PUBLIC_URL", label: "Public URL", restartRequired: false, secret: false, hint: "The public http(s) address GitHub can reach Noodle at (for webhook delivery). Required for the GitHub App flow when you browse via localhost — set this to a tunnel (e.g. https://abc.ngrok.io) or your public host. A raw public IP works too (e.g. http://203.0.113.50:3000). If unset, the browser's current address is used." },
   // --- GitHub (App mode) ---
   { key: "GITHUB_APP_ID", label: "GitHub App ID", restartRequired: false, secret: false, hint: "The numeric App ID." },
+  { key: "GITHUB_APP_SLUG", label: "GitHub App slug", restartRequired: false, secret: false, hint: "The App's URL slug (e.g. 'my-repo-bot'). Used to build the install URL." },
   { key: "GITHUB_PRIVATE_KEY", label: "GitHub App private key (PEM)", restartRequired: false, secret: true, hint: "The full PEM text, including BEGIN/END lines." },
   // --- GitHub (PAT mode) ---
   { key: "GITHUB_TOKEN", label: "GitHub token (PAT)", restartRequired: false, secret: true, hint: "A PAT with repo (or fine-grained contents/pull-requests/issues) scope." },

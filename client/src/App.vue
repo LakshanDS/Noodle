@@ -24,7 +24,7 @@ watch(
   () => state.loggedIn,
   (loggedIn) => {
     const name = router.currentRoute.value.name;
-    if (!loggedIn && name !== "login" && name !== "setup") {
+    if (!loggedIn && name !== "login") {
       void router.replace({ name: "login" });
     }
   },

@@ -77,6 +77,7 @@ export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDe
   app.post("/webhook", async (req, reply) => {
     const raw = req.body as string;
     const event = req.headers["x-github-event"] as string | undefined;
+    log.info({ event, ip: req.ip }, "webhook received");
 
     // ping events are GitHub's webhook handshake — always ack them.
     if (event === "ping") {
@@ -144,6 +145,14 @@ export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDe
 
     if (!intent && !triggerMatched) {
       return reply.code(202).send({ ok: true, ignored: true });
+    }
+
+    // Block enqueueing when no profiles exist — the job would fail immediately
+    // with "No routing rule matched and no default_profile".
+    const profiles = deps.profileNames?.() ?? [];
+    if (profiles.length === 0) {
+      log.warn({ event }, "webhook ignored — no profiles configured");
+      return reply.code(202).send({ ok: true, ignored: true, reason: "no profiles" });
     }
 
     try {

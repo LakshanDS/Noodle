@@ -148,6 +148,28 @@ export class GithubAppAuth {
     this.repoInstallations.clear();
   }
 
+  /**
+   * List all installations for this App. Returns an array of { id, account }
+   * objects. Used by the repos endpoint to get a valid installation token
+   * without needing to know a specific repo name.
+   */
+  async listInstallations(): Promise<Array<{ id: number; account: string }>> {
+    const jwt = buildAppJwt(this.appId, this.privateKey);
+    const res = await this.fetchImpl(`${GITHUB_API}/app/installations`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${jwt}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Failed to list App installations (${res.status}): ${body.slice(0, 200)}`);
+    }
+    const data = (await res.json()) as Array<{ id: number; account: { login: string } }>;
+    return data.map((i) => ({ id: i.id, account: i.account.login }));
+  }
+
   private async exchangeToken(installationId: number): Promise<InstallationToken> {
     const jwt = buildAppJwt(this.appId, this.privateKey);
     const res = await this.fetchImpl(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {

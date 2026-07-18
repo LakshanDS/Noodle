@@ -234,7 +234,7 @@ const hasGitHubApp = computed(() => {
 });
 
 /** Fields to hide from the normal catalog rendering (handled by the GitHub App section). */
-const GITHUB_APP_KEYS = new Set(["GITHUB_APP_ID", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "GITHUB_APP_SETUP_STATE", "NOODLE_LOGIN"]);
+const GITHUB_APP_KEYS = new Set(["GITHUB_APP_ID", "GITHUB_APP_SLUG", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "GITHUB_APP_SETUP_STATE", "NOODLE_LOGIN"]);
 
 async function createApp(): Promise<void> {
   if (!botName.value.trim()) {
@@ -328,9 +328,11 @@ onMounted(load);
                 <Icon name="check" :size="14" />
                 <span>GitHub App connected (ID: {{ fields['GITHUB_APP_ID']?.value }})</span>
               </div>
-              <Button variant="ghost" size="sm" @click="showAppForm = !showAppForm">
-                {{ showAppForm ? 'Cancel' : 'Reconfigure' }}
-              </Button>
+              <div class="app-status-actions">
+                <Button variant="ghost" size="sm" @click="showAppForm = !showAppForm">
+                  {{ showAppForm ? 'Cancel' : 'Reconfigure' }}
+                </Button>
+              </div>
             </div>
 
             <div v-if="!hasGitHubApp || showAppForm" class="app-form">
@@ -689,6 +691,10 @@ onMounted(load);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   color: var(--success);
+}
+.app-status-actions {
+  display: flex;
+  gap: var(--space-2);
 }
 .app-form {
   padding: var(--space-4);

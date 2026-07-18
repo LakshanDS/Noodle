@@ -32,7 +32,6 @@ const routes: RouteRecordRaw[] = [
   { path: "/github", redirect: "/settings" },
   { path: "/logs", name: "logs", component: () => import("./views/LogsView.vue") },
   { path: "/settings", name: "settings", component: () => import("./views/SettingsView.vue") },
-  { path: "/setup", name: "setup", component: () => import("./views/SetupView.vue") },
   { path: "/:pathMatch(.*)*", redirect: "/runs" },
 ];
 
@@ -45,7 +44,7 @@ export const router = createRouter({
 });
 
 /**
- * Navigation guard: require login for everything except /login and /setup.
+ * Navigation guard: require login for everything except /login.
  * Registered here (not in App.vue) so it's active BEFORE the initial
  * navigation resolves — otherwise the first page load bypasses the guard
  * and lands on /runs without a redirect to /login.
@@ -53,7 +52,7 @@ export const router = createRouter({
  * The guard reads from the shared auth singleton, which probeAuth()
  * (called before mount in main.ts) has already populated.
  */
-const PUBLIC_ROUTES = new Set(["login", "setup"]);
+const PUBLIC_ROUTES = new Set(["login"]);
 
 router.beforeEach((to) => {
   const { state } = useAuth();

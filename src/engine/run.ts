@@ -325,18 +325,30 @@ export async function runJob(
   // 2. Route to a profile. A `#<profile>` tag in body or a comment is the
   // highest-priority selector — it wins over label/keyword/default routing.
   // Otherwise fall back to resolveProfile (slash/label/keyword/default).
+  // Wrapped in try/catch so the cooking→failed label swap happens even when
+  // profile resolution fails (e.g. no profiles configured).
   const profileNames = Object.keys(config.profiles);
-  const tagProfile = extractProfileTag(issue.body ?? "", profileNames)
-    ?? comments.map((c) => extractProfileTag(c.body ?? "", profileNames)).find((p) => p !== null)
-    ?? null;
-  profile = tagProfile && config.profiles[tagProfile]
-    ? { name: tagProfile, ...config.profiles[tagProfile] }
-    : resolveProfile(config, {
-        title: issue.title,
-        body: issue.body,
-        labels: issue.labels,
-        comments: comments.map((c) => c.body),
-      });
+  let tagProfile: string | null = null;
+  try {
+    tagProfile = extractProfileTag(issue.body ?? "", profileNames)
+      ?? comments.map((c) => extractProfileTag(c.body ?? "", profileNames)).find((p) => p !== null)
+      ?? null;
+    profile = tagProfile && config.profiles[tagProfile]
+      ? { name: tagProfile, ...config.profiles[tagProfile] }
+      : resolveProfile(config, {
+          title: issue.title,
+          body: issue.body,
+          labels: issue.labels,
+          comments: comments.map((c) => c.body),
+        });
+  } catch (resolveErr) {
+    try {
+      await swapLabel(gh, input.repo, input.issueNumber, labels, "failed", log_);
+    } catch (cleanupErr) {
+      log_.warn({ err: cleanupErr }, "could not swap cooking→failed label after profile resolve error");
+    }
+    throw resolveErr;
+  }
   log_.info({ profile: profile.name, model: profile.model, via: tagProfile ? "#tag" : "routing" }, "routed profile");
   if (runStore) {
     runStore.updateRun(jobId, { profile: profile.name, model: profile.model });
