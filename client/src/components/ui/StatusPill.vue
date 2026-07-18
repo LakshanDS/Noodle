@@ -32,7 +32,7 @@ const info = computed(() => MAP[props.status] ?? { label: props.status, color: "
 <template>
   <span class="pill" :class="size" :style="{ color: info.color, background: info.bg }">
     <span class="dot" :class="{ pulse: info.pulse }" :style="{ background: info.color }" />
-    {{ info.label }}
+    <span class="label">{{ info.label }}</span>
   </span>
 </template>
 
@@ -73,6 +73,24 @@ const info = computed(() => MAP[props.status] ?? { label: props.status, color: "
   50% {
     opacity: 0.5;
     transform: scale(0.85);
+  }
+}
+
+/* ---------- Mobile (≤768px) — dot only ----------
+ * Drops the status label so dense lists fit on one line; the colored dot alone
+ * carries success(red? no—green) / fail(red) / no-changes(gray) / running(amber).
+ * The dot is enlarged so it still reads as a status indicator. */
+@media (max-width: 768px) {
+  .label {
+    display: none;
+  }
+  .pill {
+    padding: 0;
+    background: transparent;
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
   }
 }
 </style>

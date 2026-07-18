@@ -27,19 +27,19 @@ export interface InstallationToken {
 }
 
 /**
- * Read the PEM private key from GITHUB_PRIVATE_KEY (string) or
- * GITHUB_PRIVATE_KEY_FILE (path). Throws if neither is set.
+ * Normalize a PEM private key. Allows pasted PEMs with literal "\n" (common when
+ * stored as a string in the DB or pasted in the UI). Also falls back to reading
+ * from a file path (GITHUB_PRIVATE_KEY_FILE env) when the inline value looks
+ * like a file path — a deployment convenience for Kubernetes/Docker secrets.
  */
-export function loadPrivateKey(): string {
-  const inline = process.env.GITHUB_PRIVATE_KEY;
+export function loadPrivateKey(inline?: string): string {
   if (inline && inline.trim()) {
-    // Allow pasted PEMs with literal "\n" (common in env vars / CI secrets).
     return inline.includes("\\n") ? inline.replace(/\\n/g, "\n") : inline;
   }
   const file = process.env.GITHUB_PRIVATE_KEY_FILE;
   if (file) return readFileSync(file, "utf8");
   throw new Error(
-    "GitHub App private key not found. Set GITHUB_PRIVATE_KEY (PEM text) or GITHUB_PRIVATE_KEY_FILE (path).",
+    "GitHub App private key not found. Set GITHUB_PRIVATE_KEY in the settings.",
   );
 }
 
@@ -85,8 +85,8 @@ export class GithubAppAuth {
     privateKey?: string;
     fetchImpl?: typeof fetch;
   }) {
-    const appId = opts?.appId ?? process.env.GITHUB_APP_ID;
-    const privateKey = opts?.privateKey ?? loadPrivateKey();
+    const appId = opts?.appId;
+    const privateKey = opts?.privateKey !== undefined ? loadPrivateKey(opts.privateKey) : loadPrivateKey();
     if (!appId) throw new Error("GITHUB_APP_ID is not set.");
     this.appId = String(appId);
     this.privateKey = privateKey;

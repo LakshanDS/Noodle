@@ -1,7 +1,7 @@
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai/compat";
 import { join, resolve } from "node:path";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, rmSync } from "node:fs";
 import { log, runLogger } from "../util/log.js";
 import { resolveProfile } from "../profiles/resolve.js";
 import { registerCustomProviders } from "../profiles/custom-providers.js";
@@ -171,6 +171,13 @@ export async function runJob(
   const jobId = input.jobId ?? `${input.repo.replace("/", "-")}-${input.issueNumber}`;
   const runStore = deps?.runStore;
 
+  // Declare labels/profile upfront with safe defaults so the outer catch block
+  // (which swaps cooking→failed and posts an error comment) can reference them
+  // even when the error occurs before they are fully resolved.
+  let labels = labelsFor(agentName);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let profile: any = null;
+
   // 1. Fetch issue + comments FIRST. The issue row tells us whether this number
   // is actually a pull request (GitHub serves PRs through the issues API), and
   // that determines branch resolution — so the fetch must precede it. The
@@ -191,18 +198,22 @@ export async function runJob(
     pr = await gh.getPullRequest(input.repo, input.issueNumber);
   }
 
-  // Branch resolution. PR mode reuses the PR's head branch unconditionally
-  // (force-push onto it). Issue mode: bare `<agent>/issue-<n>` for a fresh
-  // attempt, or reuse the branch of an already-OPEN PR for this issue (a
-  // follow-up `/noodle` run while the previous PR is still open) — the
-  // force-push updates the same PR instead of opening a new one. Closed/merged
-  // PRs are NOT reused (no open PR found), so a clean retry starts a fresh
-  // branch.
+  // Branch resolution. In all cases where a PR exists (PR comment mode or
+  // issue-with-PR), the agent works on a NEW branch derived from the PR's
+  // branch. A stacked PR is then opened targeting the existing PR's branch.
+  // Fresh issues (no open PR) branch off the default branch.
   const existing = isPR ? null : await gh.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
-  const reuseBranch = isPR || !!existing;
-  const branchName = isPR
-    ? (pr?.head_branch ?? branchNameFor(input.issueNumber, agentSlug))
-    : (existing?.branch ?? branchNameFor(input.issueNumber, agentSlug));
+  // prBranch tracks the existing PR's branch name — used as the base for the
+  // new stacked PR. Set for both PR comment mode and issue-with-PR.
+  let prBranch: string | null = null;
+  if (isPR && pr?.head_branch) {
+    prBranch = pr.head_branch;
+  } else if (!isPR && existing) {
+    prBranch = existing.branch;
+  }
+  // Agent always gets a fresh branch name. For PR comment / issue-with-PR it
+  // is derived from the existing PR's branch; for fresh issues it's off default.
+  const branchName = branchNameFor(input.issueNumber, agentSlug);
 
   // Per-run logger: stdout only (pretty). Run context is bound to the raw JSON
   // for correlation/grep, but the pretty formatter hides it from per-event
@@ -220,16 +231,12 @@ export async function runJob(
     `agent run started — ${isPR ? "PR" : "issue"} #${input.issueNumber} | repo=${input.repo} | branch=${branchName} | jobId=${jobId} | pid=${process.pid}`,
   );
   log.info(
-    isPR
-      ? { pr: pr?.html_url, branch: branchName, base: pr?.base_branch, fork: pr?.is_fork }
-      : existing
-        ? { pr: existing.html_url, branch: branchName }
-        : { branch: branchName },
-    isPR
-      ? "PR mode — cloning PR head branch"
-      : existing
-        ? "reusing branch from open PR (follow-up run)"
-        : "fresh branch (no open PR)",
+    prBranch
+      ? { existingPr: isPR ? pr?.html_url : existing?.html_url, branch: branchName, prBranch }
+      : { branch: branchName },
+    prBranch
+      ? `${isPR ? "PR comment" : "issue with open PR"} — new branch from PR branch, stacked PR`
+      : "fresh branch (no open PR)",
   );
 
   // Record the run in the store (serve mode only). CLI runs skip this — the
@@ -274,7 +281,7 @@ export async function runJob(
   // Terminal labels (cooked/failed) do NOT block: they signal a finished run
   // and allow a follow-up. This makes the label the visible source of truth for
   // "is the agent busy here?".
-  const labels = labelsFor(agentName);
+  labels = labelsFor(agentName);
   const lowerLabels = new Set(issue.labels.map((l) => l.toLowerCase()));
   if (lowerLabels.has(labels.cooking.name.toLowerCase())) {
     log_.info("skipping — already has the cooking label (a run is in progress)");
@@ -322,7 +329,7 @@ export async function runJob(
   const tagProfile = extractProfileTag(issue.body ?? "", profileNames)
     ?? comments.map((c) => extractProfileTag(c.body ?? "", profileNames)).find((p) => p !== null)
     ?? null;
-  const profile = tagProfile && config.profiles[tagProfile]
+  profile = tagProfile && config.profiles[tagProfile]
     ? { name: tagProfile, ...config.profiles[tagProfile] }
     : resolveProfile(config, {
         title: issue.title,
@@ -379,15 +386,31 @@ export async function runJob(
     }
     return t;
   };
-  const ws = await Workspace.clone(cloneUrlFor(input.repo, await freshToken()), jobId);
+
+  // Wrap clone + everything after in a try so the cooking label is cleaned up
+  // if any step fails — these all happen after the cooking label is applied.
+  let ws: Workspace;
+  try {
+    ws = await Workspace.clone(cloneUrlFor(input.repo, await freshToken()), jobId);
+  } catch (setupErr) {
+    try {
+      await swapLabel(gh, input.repo, input.issueNumber, labels, "failed", log_);
+    } catch (cleanupErr) {
+      log_.warn({ err: cleanupErr }, "could not swap cooking→failed label after setup error");
+    }
+    if (runStore) {
+      runStore.updateRun(jobId, { status: "failed", error: (setupErr as Error).message ?? String(setupErr), finished_at: nowIso() });
+    }
+    throw setupErr;
+  }
   let agentAnswer: string | undefined;
   try {
-    // Reuse the existing branch when there's an open PR (follow-up run): fetch
-    // it and reset onto its tip so the agent's work stacks on top. Otherwise
-    // create a fresh branch off the cloned base.
-    if (reuseBranch) {
-      await ws.checkoutOrReuse(branchName, cloneUrlFor(input.repo, await freshToken()));
+    if (prBranch) {
+      // PR comment mode or issue-with-PR: create a fresh branch from the
+      // existing PR's branch. A stacked PR will be opened targeting it.
+      await ws.branchFrom(branchName, prBranch, cloneUrlFor(input.repo, await freshToken()));
     } else {
+      // Fresh issue: branch off the cloned default branch.
       await ws.branch(branchName);
     }
     await installSkills(ws.path);
@@ -619,42 +642,23 @@ export async function runJob(
         if (committed) {
           // Re-mint credentials right before push — a long agent run can
           // exceed the token's TTL (1h for GitHub-App installation tokens).
-          await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()), reuseBranch);
+          await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()), false);
           const changedFiles = await ws.changedFiles();
           // Re-resolve the gh client too — same expiry risk on the post-run
           // API calls (PR/comment/label) on long runs.
           const ghNow = await ghProvider();
-          let prUrl: string;
-          if (isPR) {
-            // PR mode: the PR already exists — the force-push just updated it.
-            // No new PR to create. Use the URL we resolved at run start.
-            prUrl = pr?.html_url ?? issue.html_url;
-            log_.info({ pr: prUrl, changedFiles }, "pushed to PR branch");
-          } else {
-            // Issue mode: re-check for an open PR on this branch right before
-            // creating one. The branch was resolved at run start, but a long
-            // agent run may have raced with a human closing/merging the PR in
-            // the meantime — re-query so we either reuse the still-open PR or
-            // open a fresh one.
-            const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
-            const openNow = await ghNow.findOpenPRForIssue(input.repo, input.issueNumber, agentSlug);
-            let prResult: { number: number; html_url: string };
-            if (openNow) {
-              // Force-push already landed the new commits on the existing branch.
-              prResult = openNow;
-              log_.info({ pr: prResult.html_url, changedFiles, reused: true }, "updated existing PR (follow-up)");
-            } else {
-              prResult = await ghNow.createPullRequest(
-                input.repo,
-                branchName,
-                baseBranch,
-                `Fixes #${issue.number}: ${issue.title}`,
-                prBody,
-              );
-              log_.info({ pr: prResult.html_url, changedFiles }, "opened PR");
-            }
-            prUrl = prResult.html_url;
-          }
+          // Open a new PR. Base = existing PR's branch (stacked) or default branch.
+          const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
+          const prBase = prBranch ?? baseBranch;
+          const prResult = await ghNow.createPullRequest(
+            input.repo,
+            branchName,
+            prBase,
+            isPR ? `Update PR #${input.issueNumber}: ${issue.title}` : `Fixes #${issue.number}: ${issue.title}`,
+            prBody,
+          );
+          log_.info({ pr: prResult.html_url, changedFiles, base: prBase }, "opened PR");
+          const prUrl = prResult.html_url;
 
           await swapLabel(ghNow, input.repo, input.issueNumber, labels, "cooked", log_);
 
@@ -734,7 +738,8 @@ export async function runJob(
     // Post an error comment so the reporter knows the run failed and why.
     // Best-effort — a failure here must not mask the original error.
     try {
-      const commentBody = buildErrorComment(profile, (e as Error).message ?? String(e), agentName);
+      const fallbackProfile = profile ?? { name: "unknown", model: "unknown" };
+      const commentBody = buildErrorComment(fallbackProfile, (e as Error).message ?? String(e), agentName);
       await gh.createIssueComment(input.repo, input.issueNumber, commentBody);
     } catch (commentErr) {
       log_.warn({ err: commentErr }, "could not post error comment after failure");
@@ -807,6 +812,51 @@ function sessionsDirFor(jobId: string): string {
   const dir = join(base, jobId);
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Max age (ms) for session directories before they are pruned. Default 7 days. */
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Max number of session directories to keep. Oldest (by mtime) are removed first. */
+const SESSION_MAX_COUNT = 200;
+
+/**
+ * Prune old session directories to prevent disk exhaustion. Called once at
+ * startup (best-effort — failures are logged and swallowed).
+ */
+export function pruneSessionDirs(maxAgeMs = SESSION_MAX_AGE_MS, maxCount = SESSION_MAX_COUNT): void {
+  try {
+    const base = resolve(process.env.NOODLE_SESSIONS_DIR ?? "./sessions");
+    if (!existsSync(base)) return;
+    const entries = readdirSync(base, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => {
+        const dirPath = join(base, e.name);
+        const stat = statSync(dirPath);
+        return { dirPath, mtime: stat.mtimeMs };
+      });
+    const now = Date.now();
+    // Remove entries older than maxAgeMs
+    for (const entry of entries) {
+      if (now - entry.mtime > maxAgeMs) {
+        rmSync(entry.dirPath, { recursive: true, force: true });
+      }
+    }
+    // If still over maxCount, remove oldest
+    const remaining = readdirSync(base, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => {
+        const dirPath = join(base, e.name);
+        const stat = statSync(dirPath);
+        return { dirPath, mtime: stat.mtimeMs };
+      })
+      .sort((a, b) => a.mtime - b.mtime);
+    while (remaining.length > maxCount) {
+      const oldest = remaining.shift()!;
+      rmSync(oldest.dirPath, { recursive: true, force: true });
+    }
+  } catch (err) {
+    // Best-effort — don't crash the server over session cleanup.
+  }
 }
 
 /**

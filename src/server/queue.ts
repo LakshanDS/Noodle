@@ -7,10 +7,10 @@ import { log } from "../util/log.js";
  * Dedupe: a (repo, issue) pair can only have one *active* job (queued or
  * running) at a time — re-enqueuing while one is active is a no-op.
  *
- * Each worker is a single-consumer loop that pulls the oldest claimable queued
- * job and hands it to an injected `runJobFn`. Multiple workers may share one
- * queue (`claimNext` is transactional so two never grab the same job); the pool
- * size is configured via `queue.concurrency`. Injection mirrors the existing
+ * A single `Dispatcher` pulls claimable jobs and fires each off
+ * (fire-and-forget). Per-profile concurrency is enforced inside `claimNext`,
+ * which skips a job whose profile is already at its cap — so the dispatcher has
+ * no "pool size"; the caps are the only limit. Injection mirrors the existing
  * `createAgentSessionFn` override pattern in `engine/run.ts`, so tests exercise
  * the queue without touching pi or the network.
  */
@@ -41,13 +41,19 @@ export interface QueuedJob {
    */
   profile: string | null;
   /**
-   * The cron_jobs row that enqueued this job, or 0 for a normal issue-driven
+   * The scheduler_jobs row that enqueued this job, or 0 for a normal issue-driven
    * job. Cron jobs carry no `issue_number` (they CREATE issues), so the dedupe
    * key was widened to `(repo, issue_number, cron_job_id)` to tell them apart
    * — different crons on the same repo can run concurrently, while a repeat
    * fire of the SAME cron (before its previous run finishes) is still deduped.
    */
   cron_job_id: number;
+  /**
+   * The triggers row that enqueued this job, or 0 for non-trigger jobs.
+   * Trigger jobs work like cron jobs (no issue_number, they CREATE issues)
+   * but are driven by GitHub events instead of timers.
+   */
+  trigger_id: number;
 }
 
 /** What the worker calls to actually run a job. */
@@ -66,6 +72,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   not_before TEXT,
   profile TEXT,
   cron_job_id INTEGER NOT NULL DEFAULT 0,
+  trigger_id INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
   finished_at TEXT
@@ -83,7 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
  */
 const IDX_ACTIVE_DEDUP =
   "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedup" +
-  " ON jobs(repo, issue_number, cron_job_id) WHERE status IN ('queued', 'running')";
+  " ON jobs(repo, issue_number, cron_job_id, trigger_id) WHERE status IN ('queued', 'running')";
 
 /**
  * Created AFTER migrations so the `profile` column exists on migrated DBs.
@@ -129,25 +136,27 @@ function migrateAddCronJobId(db: Db): void {
 }
 
 /**
- * Ensure the dedupe index exists with the `cron_job_id` column in its key.
- *
- * The original index (pre-cron) was on `(repo, issue_number)`. Cron jobs have
- * no issue_number (they create one), so the key was widened to
- * `(repo, issue_number, cron_job_id)` — each cron dedupes against itself while
- * normal jobs keep deduping on `(repo, issue, 0)`.
- *
- * Runs AFTER the `cron_job_id` migration so the column is guaranteed present.
- * Idempotent: introspects the existing index's SQL; only drops + recreates when
- * it's still the old 2-column shape. On fresh DBs (no index yet) and on
- * already-migrated DBs, it's a plain CREATE IF NOT EXISTS.
+ * Idempotent migration: add `trigger_id` so trigger-originated jobs can be
+ * distinguished from issue-driven and cron ones. Same PRAGMA-introspection pattern.
+ */
+function migrateAddTriggerId(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "trigger_id")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN trigger_id INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/**
+ * Ensure the dedupe index exists with the `cron_job_id` and `trigger_id` columns
+ * in its key. Same idempotent introspection pattern as before.
  */
 function ensureDedupeIndex(db: Db): void {
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_active_dedup'")
     .get() as { sql: string } | undefined;
   const sql = row?.sql ?? "";
-  if (sql && !sql.includes("cron_job_id")) {
-    // Old 2-column index — drop it so the new 3-column one can replace it.
+  if (sql && (!sql.includes("cron_job_id") || !sql.includes("trigger_id"))) {
+    // Old index shape — drop it so the new one can replace it.
     db.exec("DROP INDEX IF EXISTS idx_jobs_active_dedup");
   }
   db.exec(IDX_ACTIVE_DEDUP);
@@ -173,6 +182,7 @@ export class JobQueue {
     migrateAddNotBefore(this.db);
     migrateAddProfile(this.db);
     migrateAddCronJobId(this.db);
+    migrateAddTriggerId(this.db);
     ensureDedupeIndex(this.db);
     ensureRunningProfileIndex(this.db);
   }
@@ -185,6 +195,7 @@ export class JobQueue {
     migrateAddNotBefore(db);
     migrateAddProfile(db);
     migrateAddCronJobId(db);
+    migrateAddTriggerId(db);
     ensureDedupeIndex(db);
     ensureRunningProfileIndex(db);
     return q;
@@ -249,6 +260,37 @@ export class JobQueue {
       )
       .get(repo, cronJobId) as QueuedJob | undefined;
     if (!row) throw new Error("enqueueCron: insert returned no row");
+    return row;
+  }
+
+  /**
+   * Enqueue a trigger-originated job. Trigger runs have no issue_number (the
+   * agent CREATES issues during the run), so `issue_number = 0` and dedupe is
+   * keyed on `(repo, 0, 0, trigger_id)` — each trigger dedupes against itself,
+   * so a repeat fire before the prior run finishes is a no-op, while different
+   * triggers on the same repo run concurrently.
+   */
+  enqueueTrigger(opts: {
+    repo: string;
+    triggerId: number;
+    installationId?: number;
+    profile?: string | null;
+    source?: string;
+  }): QueuedJob {
+    const { repo, triggerId, installationId = null, profile = null, source = "trigger" } = opts;
+    const ins = this.db.prepare(
+      `INSERT OR IGNORE INTO jobs (repo, issue_number, trigger_id, installation_id, source, profile)
+       VALUES (@repo, 0, @triggerId, @installationId, @source, @profile)`,
+    );
+    ins.run({ repo, triggerId, installationId, source, profile });
+    const row = this.db
+      .prepare(
+        `SELECT * FROM jobs
+         WHERE repo = ? AND trigger_id = ? AND status IN ('queued','running')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(repo, triggerId) as QueuedJob | undefined;
+    if (!row) throw new Error("enqueueTrigger: insert returned no row");
     return row;
   }
 
@@ -382,22 +424,6 @@ export class JobQueue {
 /** Backoff cap. A single retry never waits longer than this. */
 const BACKOFF_CAP_MS = 10 * 60_000;
 
-/** Worker behavior knobs. Defaults match the queue config defaults. */
-export interface WorkerOptions {
-  /** Poll interval when idle, ms. */
-  pollIntervalMs?: number;
-  /** Total attempts per job (1 = no retry). */
-  maxAttempts?: number;
-  /** Base backoff seconds; doubles each attempt, capped at 10 min. */
-  retryBackoffSec?: number;
-  /**
-   * Max concurrent jobs for a profile. When set, `claimNext` skips a queued job
-   * whose profile is already at capacity. Injected from config so the queue
-   * stays config-agnostic.
-   */
-  capacityFor?: (profile: string) => number;
-}
-
 /**
  * Decide whether a failed job is worth retrying. Uses a denylist of permanent
  * errors — anything auth/config/not-found is a waste of retries. Everything
@@ -421,80 +447,132 @@ export function backoffMs(attempt: number, baseSec: number): number {
 }
 
 /**
- * Worker loop. Polls the queue, claims jobs, and runs them via `runJobFn`.
- * Between polls it sleeps `pollIntervalMs`. `stop()` causes the loop to exit
- * after the current job finishes (graceful shutdown). Multiple workers may
- * share one queue — `claimNext` is transactional so two never grab the same job.
+ * Knobs passed to the `Dispatcher`. All three are GETTERS (resolved fresh per
+ * failure / per claim) so that editing the queue retry knobs or a profile's
+ * `max_concurrent` in the Settings/Profiles pages takes effect without a
+ * restart — there's no pool to resize, just the caps the dispatcher reads live.
  */
-export class QueueWorker {
+export interface DispatcherOptions {
+  /** Max concurrent runs for a profile. `claimNext` skips jobs past this. */
+  capacityFor: (profile: string) => number;
+  /** Total attempts per job (1 = no retry). */
+  maxAttempts: () => number;
+  /** Base backoff seconds; doubles each attempt, capped at 10 min. */
+  retryBackoffSec: () => number;
+  /** Safety-net timer interval in ms (default 5000). The timer re-dispatches to
+   * catch triggers the event-driven path might miss (retry backoff elapsing, a
+   * profile cap being raised). Lowered in tests for speed. */
+  tickMs?: number;
+}
+
+/**
+ * Single-threaded job dispatcher.
+ *
+ * One process pulls claimable jobs from the queue and fires each off
+ * (fire-and-forget — NOT awaited). Per-profile concurrency is enforced entirely
+ * by `claimNext`, which skips a job whose profile is already at its cap. So
+ * with a "default" profile cap=5 and a "glm" profile cap=2, up to 7 jobs run at
+ * once (5 default + 2 glm), each gated to its own profile — no worker pool, no
+ * sizing math.
+ *
+ * Dispatch triggers:
+ *   - on `enqueue` (caller invokes `dispatch()` after pushing a job)
+ *   - on job completion (the `finally` below re-dispatches to pull the next)
+ *   - a 5s safety-net timer catches any missed trigger (e.g. a retry backoff
+ *     elapsing, or a profile cap being raised)
+ *
+ * `stop()` drains gracefully: clears the timer and waits for in-flight jobs to
+ * finish. Matches the old pool's shutdown contract.
+ */
+export class Dispatcher {
+  private inflight = 0;
   private running = false;
-  private currentJob: QueuedJob | null = null;
-  private readonly timer: NodeJS.Timeout;
-  private readonly pollIntervalMs: number;
-  private readonly maxAttempts: number;
-  private readonly retryBackoffSec: number;
+  private timer: NodeJS.Timeout | null = null;
+  private readonly tickMs: number;
 
   constructor(
     private readonly queue: JobQueue,
     private readonly runJobFn: RunJobFn,
-    opts: WorkerOptions = {},
+    private readonly opts: DispatcherOptions,
   ) {
-    this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
-    this.maxAttempts = opts.maxAttempts ?? 3;
-    this.retryBackoffSec = opts.retryBackoffSec ?? 60;
-    this.capacityFor = opts.capacityFor;
-    // Keep the event loop alive while waiting; cleared on stop.
-    this.timer = setInterval(() => {}, 1 << 30);
+    this.tickMs = opts.tickMs ?? 5000;
   }
-  private readonly capacityFor?: (profile: string) => number;
 
-  /** Start the loop. Returns when `stop()` is called. */
-  async run(): Promise<void> {
-    this.running = true;
-    log.info("queue worker started");
-    while (this.running) {
-      const job = this.queue.claimNext(this.capacityFor);
-      if (!job) {
-        await sleep(this.pollIntervalMs);
-        continue;
-      }
-      this.currentJob = job;
-      const log_ = log.child({ jobId: job.id, repo: job.repo, issue: job.issue_number });
-      log_.info({ source: job.source, attempt: job.attempts }, "running job");
-      try {
-        await this.runJobFn(job);
-        this.queue.markDone(job.id);
-        log_.info("job done");
-      } catch (e) {
-        const errMsg = (e as Error).message ?? String(e);
-        const canRetry = job.attempts < this.maxAttempts && isRetryableError(e);
-        if (canRetry) {
-          const waitMs = backoffMs(job.attempts, this.retryBackoffSec);
-          this.queue.requeue(job.id, waitMs);
-          log_.warn(
-            { err: errMsg, attempt: job.attempts, maxAttempts: this.maxAttempts, backoffMs: waitMs },
-            "job failed — requeueing after backoff",
-          );
-        } else {
-          this.queue.markFailed(job.id, errMsg);
-          log_.error({ err: e, attempt: job.attempts, maxAttempts: this.maxAttempts }, "job failed — giving up");
-        }
-      } finally {
-        this.currentJob = null;
-      }
+  /**
+   * Pull claimable jobs and fire them off until the queue yields nothing
+   * (empty, or every profile at its cap). Idempotent — safe to call on every
+   * enqueue, every completion, and every timer tick.
+   */
+  dispatch(): void {
+    if (!this.running) return;
+    for (;;) {
+      const job = this.queue.claimNext(this.opts.capacityFor);
+      if (!job) break; // nothing claimable right now
+      this.inflight++;
+      // Fire-and-forget: do NOT await — the whole point is concurrency.
+      this.runOne(job).catch((e) => log.error({ err: e, jobId: job.id }, "dispatcher: runOne threw unexpectedly"));
     }
-    clearInterval(this.timer);
-    log.info("queue worker stopped");
   }
 
-  /** Request graceful stop. The current job (if any) finishes first. */
-  stop(): void {
+  /** Run a single job to completion, then re-dispatch to pull the next. */
+  private async runOne(job: QueuedJob): Promise<void> {
+    const log_ = log.child({ jobId: job.id, repo: job.repo, issue: job.issue_number });
+    log_.info({ source: job.source, attempt: job.attempts }, "running job");
+    try {
+      await this.runJobFn(job);
+      this.queue.markDone(job.id);
+      log_.info("job done");
+    } catch (e) {
+      // Resolved live so a Settings edit to the retry knobs applies to the next
+      // failure without a restart.
+      const maxAttempts = this.opts.maxAttempts();
+      const errMsg = (e as Error).message ?? String(e);
+      if (job.attempts < maxAttempts && isRetryableError(e)) {
+        const waitMs = backoffMs(job.attempts, this.opts.retryBackoffSec());
+        this.queue.requeue(job.id, waitMs);
+        log_.warn(
+          { err: errMsg, attempt: job.attempts, maxAttempts, backoffMs: waitMs },
+          "job failed — requeueing after backoff",
+        );
+      } else {
+        this.queue.markFailed(job.id, errMsg);
+        log_.error({ err: e, attempt: job.attempts, maxAttempts }, "job failed — giving up");
+      }
+    } finally {
+      this.inflight--;
+      // A slot freed → try to pull the next claimable job.
+      this.dispatch();
+    }
+  }
+
+  /** Start dispatching: drain the backlog immediately, then arm the safety net. */
+  start(): void {
+    this.running = true;
+    log.info("dispatcher started");
+    this.dispatch();
+    this.timer = setInterval(() => this.dispatch(), this.tickMs);
+  }
+
+  /**
+   * Graceful stop: clear the safety-net timer and wait for in-flight jobs to
+   * finish. The timer's `dispatch()` no-ops once `running` is false.
+   * Times out after 30s to prevent hanging on stuck jobs (the process would
+   * otherwise be force-killed by the OS, risking WAL corruption).
+   */
+  async stop(): Promise<void> {
     this.running = false;
+    if (this.timer) clearInterval(this.timer);
+    const deadline = Date.now() + 30_000;
+    while (this.inflight > 0 && Date.now() < deadline) await sleep(200);
+    if (this.inflight > 0) {
+      log.warn({ inflight: this.inflight }, "dispatcher stop timed out — proceeding with in-flight jobs");
+    }
+    log.info("dispatcher stopped");
   }
 
-  /** True if a job is currently executing. */
-  get isBusy(): boolean {
-    return this.currentJob !== null;
+  /** Number of jobs currently executing. */
+  get inflightCount(): number {
+    return this.inflight;
   }
 }
 

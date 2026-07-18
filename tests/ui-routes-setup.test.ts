@@ -5,12 +5,11 @@ import { join } from "node:path";
 import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
-import { CronStore } from "../src/server/cron-store.js";
+import { SchedulerStore } from "../src/server/scheduler-store.js";
 import { CommandStore } from "../src/server/command-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
 import { ProfileStore } from "../src/server/profile-store.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
-import { SETUP_PROFILE_KEY } from "../src/config/setup-fallback.js";
 
 /**
  * Setup wizard routes: GET /api/setup/status (unauth) + POST /api/setup (unauth
@@ -24,13 +23,15 @@ const PASSWORD = "test-password";
 let dir: string;
 let db: Database.Database;
 let settingsStore: SettingStore;
+let profileStore: ProfileStore;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "noodle-ui-setup-"));
   db = new Database(join(dir, "runs.db"));
   settingsStore = SettingStore.fromDb(db);
+  profileStore = ProfileStore.fromDb(db);
   RunStore.fromDb(db);
-  CronStore.fromDb(db);
+  SchedulerStore.fromDb(db);
   CommandStore.fromDb(db);
 });
 
@@ -43,15 +44,15 @@ function makeApp() {
   const app = Fastify({ logger: false });
   registerUiRoutes(app, {
     runStore: RunStore.fromDb(db),
-    secret: PASSWORD,
-    cronStore: CronStore.fromDb(db),
+    getSecret: () => PASSWORD,
+    cronStore: SchedulerStore.fromDb(db),
     commandStore: CommandStore.fromDb(db),
     settingsStore,
-    profileStore: ProfileStore.fromDb(db),
+    profileStore,
     queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
     authProvider: {} as never,
     agentName: "TestBot",
-    config: { profiles: {}, default_profile: "x" } as never,
+    config: { profiles: {}, default_profile: undefined } as never,
   });
   return app;
 }
@@ -85,9 +86,24 @@ describe("UI setup routes — GET /api/setup/status", () => {
     }
   });
 
-  it("reports steps as true when the corresponding settings exist", async () => {
+  it("reports steps as true when the corresponding settings/profiles exist", async () => {
     settingsStore.set("GITHUB_TOKEN", "ghp_xxx");
-    settingsStore.set("ANTHROPIC_API_KEY", "sk-ant-xxx");
+    profileStore.create("default", {
+      model: "claude-3",
+      base_url: "https://api.anthropic.com",
+      api: "anthropic-messages",
+      api_key: "sk-ant-xxx",
+      input_token_price: 0,
+      output_token_price: 0,
+      cache_read_price: 0,
+      cache_write_price: 0,
+      reasoning: false,
+      thinking_level: "medium",
+      tools: ["read"],
+      api_rpm: 30,
+      retry_max_attempts: 5,
+      retry_base_delay_ms: 3000,
+    });
     settingsStore.set("NOODLE_UI_PASSWORD", "secret");
     const app = makeApp();
     try {
@@ -104,7 +120,7 @@ describe("UI setup routes — GET /api/setup/status", () => {
 });
 
 describe("UI setup routes — POST /api/setup", () => {
-  it("writes all wizard values + a profile seed on a blank instance", async () => {
+  it("writes settings + creates a default profile in the DB", async () => {
     const app = makeApp();
     try {
       const res = await app.inject({
@@ -113,7 +129,12 @@ describe("UI setup routes — POST /api/setup", () => {
         headers: { "content-type": "application/json" },
         payload: JSON.stringify({
           github: { token: "ghp_wizard" },
-          llm: { provider: "anthropic", model: "claude-3", apiKey: "sk-ant-wizard", apiKeyEnv: "ANTHROPIC_API_KEY" },
+          llm: {
+            model: "claude-3",
+            apiKey: "sk-ant-wizard",
+            baseUrl: "https://api.anthropic.com",
+            api: "anthropic-messages",
+          },
           uiPassword: "newpass",
         }),
       });
@@ -121,15 +142,15 @@ describe("UI setup routes — POST /api/setup", () => {
       const body = res.json();
       expect(body.ok).toBe(true);
       expect(body.needsRestart).toBe(true);
-      // Persisted.
+      // Settings persisted.
       expect(settingsStore.get("GITHUB_TOKEN")).toBe("ghp_wizard");
-      expect(settingsStore.get("ANTHROPIC_API_KEY")).toBe("sk-ant-wizard");
       expect(settingsStore.get("NOODLE_UI_PASSWORD")).toBe("newpass");
-      // Profile seed stored.
-      const seed = JSON.parse(settingsStore.get(SETUP_PROFILE_KEY)!);
-      expect(seed.provider).toBe("anthropic");
-      expect(seed.model).toBe("claude-3");
-      expect(seed.api_key_env).toBe("ANTHROPIC_API_KEY");
+      // Profile created directly in the DB.
+      const profile = profileStore.get("default");
+      expect(profile.profile.model).toBe("claude-3");
+      expect(profile.profile.api_key).toBe("sk-ant-wizard");
+      // Default profile set in settings.
+      expect(settingsStore.get("default_profile")).toBe("default");
     } finally {
       await app.close();
     }
@@ -144,7 +165,12 @@ describe("UI setup routes — POST /api/setup", () => {
         headers: { "content-type": "application/json" },
         payload: JSON.stringify({
           github: { appId: "123", privateKey: "-----BEGIN PEM-----\n…\n-----END-----", webhookSecret: "wh" },
-          llm: { provider: "openai", model: "gpt-4o", apiKey: "sk-x", apiKeyEnv: "OPENAI_API_KEY" },
+          llm: {
+            model: "gpt-4o",
+            apiKey: "sk-x",
+            baseUrl: "https://api.openai.com/v1",
+            api: "openai-completions",
+          },
           uiPassword: "pw",
         }),
       });
@@ -167,7 +193,7 @@ describe("UI setup routes — POST /api/setup", () => {
         headers: { "content-type": "application/json" },
         payload: JSON.stringify({
           github: { token: "ghp_x" },
-          llm: { provider: "anthropic", model: "claude-3" },
+          llm: { provider: "anthropic", model: "claude-3", baseUrl: "https://api.anthropic.com", api: "anthropic-messages" },
           uiPassword: "newpass",
         }),
       });
@@ -187,7 +213,7 @@ describe("UI setup routes — POST /api/setup", () => {
         headers: { "content-type": "application/json" },
         payload: JSON.stringify({
           github: {},
-          llm: { provider: "anthropic", model: "claude-3" },
+          llm: { provider: "anthropic", model: "claude-3", baseUrl: "https://api.anthropic.com", api: "anthropic-messages" },
           uiPassword: "pw",
         }),
       });
@@ -207,7 +233,7 @@ describe("UI setup routes — POST /api/setup", () => {
         headers: { "content-type": "application/json" },
         payload: JSON.stringify({
           github: { token: "ghp_x" },
-          llm: { provider: "anthropic", model: "claude-3" },
+          llm: { provider: "anthropic", model: "claude-3", baseUrl: "https://api.anthropic.com", api: "anthropic-messages" },
         }),
       });
       expect(res.statusCode).toBe(400);

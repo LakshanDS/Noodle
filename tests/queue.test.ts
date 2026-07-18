@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobQueue, QueueWorker, isRetryableError, backoffMs } from "../src/server/queue.js";
+import { JobQueue, Dispatcher, isRetryableError, backoffMs } from "../src/server/queue.js";
 
 let dir: string;
 let queue: JobQueue;
@@ -159,47 +159,6 @@ describe("JobQueue", () => {
   });
 });
 
-describe("QueueWorker", () => {
-  it("runs enqueued jobs through the injected runJobFn and marks them done", async () => {
-    const seen: number[] = [];
-    const worker = new QueueWorker(
-      queue,
-      async (job) => {
-        seen.push(job.issue_number);
-      },
-      { pollIntervalMs: 5 },
-    );
-    queue.enqueue({ repo: "o/r", issueNumber: 10 });
-    queue.enqueue({ repo: "o/r", issueNumber: 11 });
-
-    // Give the worker time to drain both, then stop.
-    const stop = setTimeout(() => worker.stop(), 30);
-    await worker.run();
-    clearTimeout(stop);
-
-    expect(seen).toEqual([10, 11]);
-    expect(queue.countByStatus("done")).toBe(2);
-  });
-
-  it("marks a job failed when runJobFn throws", async () => {
-    const worker = new QueueWorker(
-      queue,
-      async () => {
-        throw new Error("agent exploded");
-      },
-      { pollIntervalMs: 5, maxAttempts: 1 },
-    );
-    const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
-
-    const stop = setTimeout(() => worker.stop(), 30);
-    await worker.run();
-    clearTimeout(stop);
-
-    expect(queue.getById(job.id).status).toBe("failed");
-    expect(queue.getById(job.id).error).toMatch(/agent exploded/);
-  });
-});
-
 describe("requeue + not_before", () => {
   it("requeue flips status to queued and sets not_before", () => {
     const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
@@ -229,77 +188,155 @@ describe("requeue + not_before", () => {
   });
 });
 
-describe("QueueWorker retry", () => {
+describe("Dispatcher", () => {
+  it("runs enqueued jobs through the injected runJobFn and marks them done", async () => {
+    const seen: number[] = [];
+    const d = new Dispatcher(
+      queue,
+      async (job) => { seen.push(job.issue_number); },
+      { capacityFor: () => 5, maxAttempts: () => 1, retryBackoffSec: () => 60 },
+    );
+    d.start();
+    queue.enqueue({ repo: "o/r", issueNumber: 10 });
+    queue.enqueue({ repo: "o/r", issueNumber: 11 });
+    d.dispatch();
+
+    await new Promise((r) => setTimeout(r, 50));
+    await d.stop();
+
+    expect(seen).toEqual([10, 11]);
+    expect(queue.countByStatus("done")).toBe(2);
+  });
+
+  it("marks a job failed when runJobFn throws", async () => {
+    const d = new Dispatcher(
+      queue,
+      async () => { throw new Error("agent exploded"); },
+      { capacityFor: () => 5, maxAttempts: () => 1, retryBackoffSec: () => 60 },
+    );
+    d.start();
+    const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    d.dispatch();
+
+    await new Promise((r) => setTimeout(r, 50));
+    await d.stop();
+
+    expect(queue.getById(job.id).status).toBe("failed");
+    expect(queue.getById(job.id).error).toMatch(/agent exploded/);
+  });
+
   it("requeues a retryable failure with a future not_before (backoff applied)", async () => {
     let attempts = 0;
-    const worker = new QueueWorker(
+    const d = new Dispatcher(
       queue,
-      async () => {
-        attempts++;
-        throw new Error("transient network blip"); // retryable
-      },
-      { pollIntervalMs: 5, maxAttempts: 3, retryBackoffSec: 60 },
+      async () => { attempts++; throw new Error("transient network blip"); },
+      { capacityFor: () => 5, maxAttempts: () => 3, retryBackoffSec: () => 60 },
     );
+    d.start();
     const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    d.dispatch();
 
-    // Stop quickly — after the first attempt fails and is requeued, but before
-    // the 60s backoff elapses, so no second attempt happens.
-    const stop = setTimeout(() => worker.stop(), 50);
-    await worker.run();
-    clearTimeout(stop);
+    // After the first attempt fails and is requeued, the 60s backoff blocks a
+    // second attempt. Wait long enough for the failure to process.
+    await new Promise((r) => setTimeout(r, 50));
+    await d.stop();
 
     expect(attempts).toBe(1);
     const after = queue.getById(job.id);
     expect(after.status).toBe("queued");
     expect(after.attempts).toBe(1);
-    // not_before is set (SQLite native format) and ~60s in the future. Compare
-    // by re-parsing through SQLite so the format difference doesn't matter.
     const remaining = queue.getDb().prepare(
       "SELECT (julianday(not_before) - julianday('now')) * 86400 AS secs FROM jobs WHERE id = ?",
     ).get(after.id) as { secs: number };
     expect(remaining.secs).toBeGreaterThan(50); // ~60s backoff still pending
   });
 
-  it("eventually succeeds after a retryable failure once runJobFn stops failing", async () => {
-    let attempts = 0;
-    const worker = new QueueWorker(
-      queue,
-      async () => {
-        attempts++;
-        if (attempts < 2) throw new Error("transient network blip");
-        // attempt 2 succeeds
-      },
-      // Smallest valid backoff (1s) so the second attempt is claimable quickly.
-      { pollIntervalMs: 5, maxAttempts: 3, retryBackoffSec: 1 },
-    );
-    const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
-
-    const stop = setTimeout(() => worker.stop(), 2000);
-    await worker.run();
-    clearTimeout(stop);
-
-    expect(attempts).toBe(2);
-    expect(queue.getById(job.id).status).toBe("done");
-  });
-
   it("does not retry a permanent (non-retryable) error", async () => {
     const calls: number[] = [];
-    const worker = new QueueWorker(
+    const d = new Dispatcher(
       queue,
-      async (job) => {
-        calls.push(job.attempts);
-        throw new Error("401 Unauthorized: bad token");
-      },
-      { pollIntervalMs: 5, maxAttempts: 3, retryBackoffSec: 1 },
+      async (job) => { calls.push(job.attempts); throw new Error("401 Unauthorized: bad token"); },
+      { capacityFor: () => 5, maxAttempts: () => 3, retryBackoffSec: () => 1 },
     );
+    d.start();
     const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    d.dispatch();
 
-    const stop = setTimeout(() => worker.stop(), 50);
-    await worker.run();
-    clearTimeout(stop);
+    await new Promise((r) => setTimeout(r, 50));
+    await d.stop();
 
     expect(calls).toEqual([1]); // single attempt, no retry
     expect(queue.getById(job.id).status).toBe("failed");
+  });
+
+  it("reads max_attempts from a getter live (Settings edit applies without a restart)", async () => {
+    // The dispatcher resolves the getter at each failure, so a lowered cap is
+    // honored on the very next failure rather than a construction-time value.
+    let liveMaxAttempts = 3;
+    const d = new Dispatcher(
+      queue,
+      async (job) => {
+        if (job.attempts === 2) liveMaxAttempts = 1;
+        throw new Error("transient network blip");
+      },
+      // Fast tick so the requeued job (1s backoff) is picked up quickly in-test.
+      { capacityFor: () => 5, maxAttempts: () => liveMaxAttempts, retryBackoffSec: () => 1, tickMs: 50 },
+    );
+    d.start();
+    const job = queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    d.dispatch();
+
+    // 1s backoff on attempt 1, then attempt 2 fails + gives up (cap just
+    // lowered to 1). 2.5s is enough for the backoff + a 50ms tick + processing.
+    await new Promise((r) => setTimeout(r, 2500));
+    await d.stop();
+
+    expect(queue.getById(job.id).attempts).toBe(2);
+    expect(queue.getById(job.id).status).toBe("failed");
+  });
+
+  it("respects per-profile caps: queues jobs past the cap, runs them as slots free", async () => {
+    // capacityFor caps "default" to 2 simultaneous. Enqueue 4 jobs; only 2 run
+    // at once, the other 2 wait. As each finishes, the next starts.
+    let active = 0;
+    let maxActive = 0;
+    let done = 0;
+    const d = new Dispatcher(
+      queue,
+      async () => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((r) => setTimeout(r, 30)); // simulate work
+        active--;
+        done++;
+      },
+      { capacityFor: () => 2, maxAttempts: () => 1, retryBackoffSec: () => 60 },
+    );
+    d.start();
+    for (let i = 1; i <= 4; i++) queue.enqueue({ repo: "o/r", issueNumber: i, profile: "default" });
+    d.dispatch();
+
+    await new Promise((r) => setTimeout(r, 200));
+    await d.stop();
+
+    expect(done).toBe(4);
+    expect(maxActive).toBe(2); // never exceeded the cap
+  });
+
+  it("stop() waits for in-flight jobs to finish", async () => {
+    let finished = false;
+    const d = new Dispatcher(
+      queue,
+      async () => { await new Promise((r) => setTimeout(r, 50)); finished = true; },
+      { capacityFor: () => 5, maxAttempts: () => 1, retryBackoffSec: () => 60 },
+    );
+    d.start();
+    queue.enqueue({ repo: "o/r", issueNumber: 1 });
+    d.dispatch();
+
+    await new Promise((r) => setTimeout(r, 10)); // let the job start
+    await d.stop(); // should not resolve until the job finishes
+    expect(finished).toBe(true);
   });
 });
 

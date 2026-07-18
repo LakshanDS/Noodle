@@ -42,13 +42,7 @@ export function loadConfig(path?: string): NoodleConfig {
     throw new ConfigError(`Failed to read config ${file}: ${(e as Error).message}`);
   }
 
-  // Env var fallback: NOODLE_AGENT_NAME wins only when the config file doesn't
-  // set `agent_name` explicitly. The env var is useful for Docker/CI where
-  // editing the YAML is awkward.
   const rawObj = (raw ?? {}) as Record<string, unknown>;
-  if (!("agent_name" in rawObj) && process.env.NOODLE_AGENT_NAME) {
-    rawObj.agent_name = process.env.NOODLE_AGENT_NAME;
-  }
 
   const parsed = NoodleConfigSchema.safeParse(rawObj);
   if (!parsed.success) {

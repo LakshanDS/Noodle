@@ -1,13 +1,34 @@
 /**
  * Shared API types — mirror the server shapes so the front end is typed against
  * the real contract. Source of truth: src/server/run-store.ts (RunRow),
- * src/server/cron-store.ts (CronRow), src/server/session-reader.ts (Parsed*).
+ * src/server/scheduler-store.ts (SchedulerRow), src/server/session-reader.ts (Parsed*).
  *
  * Kept hand-written (not imported from the server) because the client compiles
  * standalone in its own tsconfig with DOM libs.
  */
 
 export type RunStatus = "running" | "succeeded" | "failed" | "no_changes";
+
+/* ----- GitHub App creation (manifest flow) ----- */
+export interface CreateAppResponse {
+  manifest: Record<string, unknown>;
+  state: string;
+}
+
+/* ----- GitHub repo/branch listing (for the cron form's autocomplete) ----- */
+export interface RepoData {
+  full_name: string;
+  default_branch: string;
+}
+export interface BranchData {
+  name: string;
+}
+export interface ReposResponse {
+  repos: RepoData[];
+}
+export interface BranchesResponse {
+  branches: BranchData[];
+}
 
 export interface RunRow {
   job_id: string;
@@ -34,7 +55,7 @@ export interface RunRow {
   runtime: string | null;
 }
 
-export interface CronRow {
+export interface SchedulerRow {
   id: number;
   name: string;
   repo: string;
@@ -42,9 +63,29 @@ export interface CronRow {
   branch_name: string;
   cron_expression: string;
   profile: string | null;
+  /** Custom label-set JSON, or null to use the global defaults. */
+  labels: string | null;
   enabled: number; // 0 | 1
   last_run_at: string | null;
   next_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TriggerRow {
+  id: number;
+  name: string;
+  repo: string;
+  event_type: string;
+  event_action: string | null;
+  branch_pattern: string | null;
+  prompt: string;
+  profile: string | null;
+  branch_name: string;
+  label: string | null;
+  enabled: number; // 0 | 1
+  last_triggered_at: string | null;
+  last_run_status: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -81,15 +122,25 @@ export interface RunDetailResponse {
   run: RunRow;
   messages: ParsedMessage[];
 }
-export interface CronsResponse {
-  crons: CronRow[];
+export interface SchedulersResponse {
+  schedulers: SchedulerRow[];
 }
-export interface CronDetailResponse {
-  cron: CronRow;
+export interface SchedulerDetailResponse {
+  scheduler: SchedulerRow;
   runs: RunRow[];
 }
-export interface CronMutationResponse {
-  cron: CronRow;
+export interface SchedulerMutationResponse {
+  scheduler: SchedulerRow;
+}
+export interface TriggersResponse {
+  triggers: TriggerRow[];
+}
+export interface TriggerDetailResponse {
+  trigger: TriggerRow;
+  runs: RunRow[];
+}
+export interface TriggerMutationResponse {
+  trigger: TriggerRow;
 }
 export interface ProfilesResponse {
   /** Flat name list (cron dropdown contract). */
@@ -102,33 +153,56 @@ export interface ApiError {
   error: string;
 }
 
-/** Payload for creating a cron. Mirrors parseCronInput in ui-routes.ts. */
-export interface CronInput {
+/** Payload for creating a scheduler job. Mirrors parseSchedulerInput in ui-routes.ts. */
+export interface SchedulerInput {
   name: string;
   repo: string;
   prompt: string;
   branch_name: string;
   cron_expression: string;
   profile: string | null;
+  /** JSON label-set string, or null to use the global defaults. */
+  labels?: string | null;
 }
 
-/* ----- Slash commands (mock until the backend store lands) ----- */
+/** Payload for creating a trigger. Mirrors parseTriggerInput in ui-routes.ts. */
+export interface TriggerInput {
+  name: string;
+  repo: string;
+  event_type: string;
+  event_action: string | null;
+  branch_pattern: string | null;
+  prompt: string;
+  profile: string | null;
+  branch_name: string;
+  label: string | null;
+}
+
+/* ----- Slash commands (DB-backed: /api/commands) ----- */
 
 /**
  * A user-defined slash command. When someone types `/<trigger>` in a GitHub
  * issue/comment, the agent wakes with `system_prompt` as its custom
- * instructions. Mirrors what a future command-store row will look like.
+ * instructions. Supports {system}, {pr}, {issue} template tags.
  */
 export interface CommandRow {
   id: number;
   /** Trigger word without the leading slash, e.g. "question". */
   trigger: string;
-  name: string;
   description: string;
   /** The custom instructions the agent wakes up with. */
   system_prompt: string;
   profile: string | null;
+  /** Runtime override ("pi" | "opencode" | null = inherit). */
+  runtime: string | null;
   enabled: number; // 0 | 1
+  /** 1 for the seeded default /<agent> command (not deletable). */
+  is_builtin: number; // 0 | 1
+  /**
+   * Custom label set as a JSON string ({cooking,cooked,failed} each {name,color}),
+   * or null = use the global default labels. See Settings → GitHub labels.
+   */
+  labels: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -146,13 +220,15 @@ export interface CommandMutationResponse {
 /** Payload for creating/updating a command. */
 export interface CommandInput {
   trigger: string;
-  name: string;
   description: string;
   system_prompt: string;
   profile: string | null;
+  runtime?: string | null;
+  /** JSON label-set string, or null to use the global defaults. */
+  labels?: string | null;
 }
 
-/* ----- Skills (mock until the SKILL.md read/write layer lands) ----- */
+/* ----- Skills (filesystem-backed: /api/skills) ----- */
 
 /**
  * A skill — mirrors the frontmatter + body of a bundled SKILL.md file. Keyed by
@@ -247,12 +323,10 @@ export interface SetupPayload {
     webhookSecret?: string;
   };
   llm: {
-    provider: string;
     model: string;
     apiKey?: string;
-    apiKeyEnv?: string;
-    baseUrl?: string;
-    api?: string;
+    baseUrl: string;
+    api: string;
   };
   uiPassword: string;
 }
@@ -269,20 +343,23 @@ export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
-export type Api = | "openai-completions" | "openai-responses" | "azure-openai-responses"
-  | "anthropic-messages" | "google-generative-ai" | "google-vertex"
-  | "mistral-conversations" | "bedrock-converse-stream";
+export type Api =
+  | "openai-completions"
+  | "openai-responses"
+  | "anthropic-messages"
+  | "google-generative-ai"
+  | "mistral-conversations";
 
 /**
  * The full per-profile field set — mirrors ProfileSchema in
  * src/config/schema.ts. Every field the engine applies to a run lives here.
  */
 export interface ProfileData {
-  provider: string;
   model: string;
-  base_url?: string;
-  api?: Api;
-  api_key_env?: string;
+  base_url: string;
+  api: Api;
+  /** The API key for this endpoint. Empty string = no-auth (e.g. local Ollama). */
+  api_key: string;
   context_window?: number;
   max_tokens?: number;
   input_token_price: number;
@@ -292,15 +369,15 @@ export interface ProfileData {
   reasoning: boolean;
   thinking_level: ThinkingLevel;
   tools: string[];
-  system_prompt_file?: string;
   api_rpm: number;
   retry_max_attempts: number;
   retry_base_delay_ms: number;
   max_concurrent?: number;
+  use_relay: boolean;
 }
 
-/** Where a profile comes from — DB rows are editable/deletable; YAML are read-only. */
-export type ProfileSource = "db" | "yaml";
+/** Where a profile comes from — always "db" now (profiles are DB-only). */
+export type ProfileSource = "db";
 
 /** One entry in the profiles list. */
 export interface ProfileListItem {
@@ -323,4 +400,42 @@ export interface ProfileMutationResponse {
 export interface ProfileInput {
   name: string;
   profile: ProfileData;
+}
+
+/**
+ * Body for POST /api/profiles/fetch-models — asks the server to query an
+ * endpoint's OpenAI-compatible `/models` route. `api_key` is optional (local
+ * no-auth endpoints). `model` is the id currently typed in the form, sent so
+ * the server can report whether it's in the returned list.
+ */
+export interface FetchModelsInput {
+  base_url: string;
+  api_key?: string;
+  model?: string;
+}
+
+/** Response from POST /api/profiles/fetch-models. */
+export interface FetchModelsResponse {
+  /** Sorted unique model ids the endpoint serves. */
+  models: string[];
+  /** True only when the optional `model` from the request is in `models`. */
+  verified: boolean;
+  /** False when the endpoint returned no models. */
+  found: boolean;
+}
+
+/** Body for POST /api/profiles/test-model — sends a minimal completion request
+ *  to verify the endpoint + key + model actually work end-to-end. */
+export interface TestModelInput {
+  base_url: string;
+  api_key?: string;
+  model: string;
+  api?: Api;
+}
+
+/** Response from POST /api/profiles/test-model. */
+export interface TestModelResponse {
+  ok: boolean;
+  status?: number;
+  error?: string;
 }

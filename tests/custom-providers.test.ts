@@ -1,11 +1,21 @@
 import { describe, it, expect } from "vitest";
 import { NoodleConfigSchema, crossValidate } from "../src/config/schema.js";
-import { registerCustomProviders, isCustomEndpoint } from "../src/profiles/custom-providers.js";
+import { registerCustomProviders } from "../src/profiles/custom-providers.js";
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+
+/** A minimal valid profile — base_url + api are required (every profile is a custom endpoint). */
+function profile(model = "llama") {
+  return {
+    model,
+    base_url: "http://localhost:8000/v1",
+    api: "openai-completions" as const,
+    api_key: "sk-test",
+  };
+}
 
 const base = {
   default_profile: "p",
-  profiles: { p: { provider: "openai", model: "gpt-4o-mini" } },
+  profiles: { p: profile() },
   routing: [],
 };
 
@@ -15,11 +25,10 @@ describe("custom endpoint config validation", () => {
       ...base,
       profiles: {
         vllm: {
-          provider: "vllm",
           api: "openai-completions",
           base_url: "http://localhost:8000/v1",
           model: "llama",
-          api_key_env: "VLLM_KEY",
+          api_key: "sk-test",
           context_window: 131072,
         },
       },
@@ -31,25 +40,27 @@ describe("custom endpoint config validation", () => {
   });
 
   it("rejects base_url without api", () => {
-    const c = NoodleConfigSchema.parse({
+    // base_url is a URL, api is required — Zod rejects missing api.
+    const r = NoodleConfigSchema.safeParse({
       ...base,
       profiles: { x: { provider: "x", model: "m", base_url: "http://y/v1" } },
     });
-    expect(crossValidate(c).join("\n")).toMatch(/api.*required when.*base_url/);
+    expect(r.success).toBe(false);
   });
 
   it("rejects api without base_url", () => {
-    const c = NoodleConfigSchema.parse({
+    // base_url is required — Zod rejects it.
+    const r = NoodleConfigSchema.safeParse({
       ...base,
       profiles: { x: { provider: "x", model: "m", api: "openai-completions" } },
     });
-    expect(crossValidate(c).join("\n")).toMatch(/base_url.*required when.*api/);
+    expect(r.success).toBe(false);
   });
 
   it("rejects an unknown api protocol", () => {
     const r = NoodleConfigSchema.safeParse({
       ...base,
-      profiles: { x: { provider: "x", model: "m", api: "made-up-protocol" } },
+      profiles: { x: { provider: "x", model: "m", base_url: "http://y", api: "made-up-protocol" } },
     });
     expect(r.success).toBe(false);
   });
@@ -65,11 +76,11 @@ describe("registerCustomProviders", () => {
       ...base,
       profiles: {
         vllm: {
-          provider: "vllm",
           api: "openai-completions",
           base_url: "http://localhost:8000/v1",
           model: "llama-3.1",
           context_window: 131072,
+          api_key: "sk-test",
         },
       },
     });
@@ -86,80 +97,38 @@ describe("registerCustomProviders", () => {
       ...base,
       profiles: {
         proxy: {
-          provider: "acme",
           api: "anthropic-messages",
           base_url: "https://llm.acme.corp",
           model: "claude-proxy",
-          api_key_env: "ACME_KEY",
+          api_key: "sk-test",
         },
       },
     });
-    process.env.ACME_KEY = "sk-test";
     const reg = freshRegistry();
     registerCustomProviders(config, reg);
-    const m = reg.find("acme", "claude-proxy");
+    const m = reg.find("proxy", "claude-proxy");
     expect(m.api).toBe("anthropic-messages");
-    delete process.env.ACME_KEY;
-  });
-
-  it("skips built-in providers (only registers custom ones)", () => {
-    const config = NoodleConfigSchema.parse({
-      ...base,
-      profiles: {
-        builtin: { provider: "openai", model: "gpt-4o-mini" }, // no base_url/api
-        custom: {
-          provider: "vllm",
-          api: "openai-completions",
-          base_url: "http://x/v1",
-          model: "m",
-        },
-      },
-    });
-    const reg = freshRegistry();
-    // should not throw for the built-in profile, and should register the custom one
-    expect(() => registerCustomProviders(config, reg)).not.toThrow();
-    expect(() => reg.find("vllm", "m")).not.toThrow();
-  });
-
-  it("isCustomEndpoint detects custom profiles", () => {
-    const c = NoodleConfigSchema.parse({
-      ...base,
-      profiles: {
-        custom: { provider: "x", api: "openai-completions", base_url: "http://y", model: "m" },
-        builtin: { provider: "openai", model: "gpt-4o" },
-      },
-    });
-    expect(isCustomEndpoint(c.profiles.custom)).toBe(true);
-    expect(isCustomEndpoint(c.profiles.builtin)).toBe(false);
   });
 
   it("registers a custom provider with pricing from the profile config", () => {
-    // input_token_price / output_token_price flow into pi's model cost object
-    // so the run footer reports real cost for OpenAI-compatible endpoints.
-    process.env.DEEPSEEK_KEY = "sk-test";
-    try {
-      const config = NoodleConfigSchema.parse({
-        ...base,
-        profiles: {
-          deepseek: {
-            provider: "deepseek",
-            api: "openai-completions",
-            base_url: "https://api.deepseek.com/v1",
-            model: "deepseek-chat",
-            api_key_env: "DEEPSEEK_KEY",
-            input_token_price: 0.14,
-            output_token_price: 0.28,
-          },
+    const config = NoodleConfigSchema.parse({
+      ...base,
+      profiles: {
+        deepseek: {
+          api: "openai-completions",
+          base_url: "https://api.deepseek.com/v1",
+          model: "deepseek-chat",
+          api_key: "sk-test",
+          input_token_price: 0.14,
+          output_token_price: 0.28,
         },
-      });
-      const reg = freshRegistry();
-      registerCustomProviders(config, reg);
-      const m = reg.find("deepseek", "deepseek-chat");
-      expect(m.cost.input).toBe(0.14);
-      expect(m.cost.output).toBe(0.28);
-    } finally {
-      delete process.env.DEEPSEEK_KEY;
-    }
+      },
+    });
+    const reg = freshRegistry();
+    registerCustomProviders(config, reg);
+    const m = reg.find("deepseek", "deepseek-chat");
+    expect(m.cost.input).toBe(0.14);
+    expect(m.cost.output).toBe(0.28);
   });
 
   it("defaults pricing to 0 when not set (local models)", () => {
@@ -167,10 +136,10 @@ describe("registerCustomProviders", () => {
       ...base,
       profiles: {
         ollama: {
-          provider: "ollama",
           api: "openai-completions",
           base_url: "http://localhost:11434/v1",
           model: "llama3",
+          api_key: "",
         },
       },
     });
@@ -184,17 +153,14 @@ describe("registerCustomProviders", () => {
   });
 
   it("registers custom endpoints with reasoning disabled by default", () => {
-    // pi-ai gates all thinking-format handling on model.reasoning === true.
-    // Custom endpoints default to false so thinking_level is a safe no-op
-    // unless the profile explicitly opts in.
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
         vllm: {
-          provider: "vllm",
           api: "openai-completions",
           base_url: "http://x/v1",
           model: "llama3",
+          api_key: "sk-test",
         },
       },
     });
@@ -204,63 +170,46 @@ describe("registerCustomProviders", () => {
   });
 
   it("registers custom endpoints with reasoning enabled when set in config", () => {
-    // A reasoning-capable model behind an OpenAI-compatible endpoint (e.g.
-    // DeepSeek-R1, Qwen3-Thinking) opts in via `reasoning: true` so the
-    // thinking_level is forwarded to the API.
-    process.env.R_KEY = "sk-test";
-    try {
-      const config = NoodleConfigSchema.parse({
-        ...base,
-        profiles: {
-          deepseek: {
-            provider: "deepseek",
-            api: "openai-completions",
-            base_url: "https://api.deepseek.com/v1",
-            model: "deepseek-reasoner",
-            api_key_env: "R_KEY",
-            reasoning: true,
-          },
+    const config = NoodleConfigSchema.parse({
+      ...base,
+      profiles: {
+        deepseek: {
+          api: "openai-completions",
+          base_url: "https://api.deepseek.com/v1",
+          model: "deepseek-reasoner",
+          api_key: "sk-test",
+          reasoning: true,
         },
-      });
-      const reg = freshRegistry();
-      registerCustomProviders(config, reg);
-      expect(reg.find("deepseek", "deepseek-reasoner").reasoning).toBe(true);
-    } finally {
-      delete process.env.R_KEY;
-    }
+      },
+    });
+    const reg = freshRegistry();
+    registerCustomProviders(config, reg);
+    expect(reg.find("deepseek", "deepseek-reasoner").reasoning).toBe(true);
   });
 
   it("registers cache pricing for an Anthropic-protocol proxy", () => {
-    // A self-hosted Anthropic-format gateway that supports prompt caching:
-    // all four price fields flow through to pi's model cost object.
-    process.env.ACME2_KEY = "sk-test";
-    try {
-      const config = NoodleConfigSchema.parse({
-        ...base,
-        profiles: {
-          proxy: {
-            provider: "acme2",
-            api: "anthropic-messages",
-            base_url: "https://llm.internal.acme.corp",
-            model: "our-finetune-v2",
-            api_key_env: "ACME2_KEY",
-            input_token_price: 3.0,
-            output_token_price: 15.0,
-            cache_read_price: 0.3,
-            cache_write_price: 3.75,
-          },
+    const config = NoodleConfigSchema.parse({
+      ...base,
+      profiles: {
+        proxy: {
+          api: "anthropic-messages",
+          base_url: "https://llm.internal.acme.corp",
+          model: "our-finetune-v2",
+          api_key: "sk-test",
+          input_token_price: 3.0,
+          output_token_price: 15.0,
+          cache_read_price: 0.3,
+          cache_write_price: 3.75,
         },
-      });
-      const reg = freshRegistry();
-      registerCustomProviders(config, reg);
-      const m = reg.find("acme2", "our-finetune-v2");
-      expect(m.cost.input).toBe(3.0);
-      expect(m.cost.output).toBe(15.0);
-      expect(m.cost.cacheRead).toBe(0.3);
-      expect(m.cost.cacheWrite).toBe(3.75);
-    } finally {
-      delete process.env.ACME2_KEY;
-    }
+      },
+    });
+    const reg = freshRegistry();
+    registerCustomProviders(config, reg);
+    const m = reg.find("proxy", "our-finetune-v2");
+    expect(m.cost.input).toBe(3.0);
+    expect(m.cost.output).toBe(15.0);
+    expect(m.cost.cacheRead).toBe(0.3);
+    expect(m.cost.cacheWrite).toBe(3.75);
   });
 });
 
@@ -270,10 +219,10 @@ describe("profile pricing config", () => {
       ...base,
       profiles: {
         p: {
-          provider: "vllm",
           api: "openai-completions",
           base_url: "http://x/v1",
           model: "m",
+          api_key: "sk-test",
           input_token_price: 1.0,
           output_token_price: 10.0,
         },
@@ -288,10 +237,10 @@ describe("profile pricing config", () => {
       ...base,
       profiles: {
         p: {
-          provider: "acme",
           api: "anthropic-messages",
           base_url: "https://llm.acme.corp",
           model: "m",
+          api_key: "sk-test",
           input_token_price: 3.0,
           output_token_price: 15.0,
           cache_read_price: 0.3,
@@ -306,7 +255,7 @@ describe("profile pricing config", () => {
   it("defaults all prices to 0 when omitted", () => {
     const c = NoodleConfigSchema.parse({
       ...base,
-      profiles: { p: { provider: "vllm", api: "openai-completions", base_url: "http://x/v1", model: "m" } },
+      profiles: { p: profile() },
     });
     expect(c.profiles.p.input_token_price).toBe(0);
     expect(c.profiles.p.output_token_price).toBe(0);
@@ -317,7 +266,7 @@ describe("profile pricing config", () => {
   it("rejects negative prices", () => {
     const r = NoodleConfigSchema.safeParse({
       ...base,
-      profiles: { p: { provider: "vllm", api: "openai-completions", base_url: "http://x/v1", model: "m", input_token_price: -1 } },
+      profiles: { p: { ...profile(), input_token_price: -1 } },
     });
     expect(r.success).toBe(false);
   });

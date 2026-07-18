@@ -4,24 +4,21 @@
  * on the right (so the user sees exactly the file format that gets written
  * later). Skills are keyed by name (the folder identifier), like profiles.
  *
- * MOCK ONLY: backed by src/lib/mock.ts. Swap the mockXxx calls to getJson /
- * sendJson against /api/skills to migrate.
+ * Reads/writes skills/<name>/SKILL.md on disk via /api/skills.
  */
 import { computed, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import {
-  mockGetSkill,
-  mockCreateSkill,
-  mockUpdateSkill,
-  mockDeleteSkill,
-} from "../lib/mock.js";
+import { getJson, sendJson } from "../api/client.js";
+import { isAuthError } from "../api/client.js";
 import type {
+  SkillDetailResponse,
   SkillMutationResponse,
   SkillInput,
 } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import Card from "../components/ui/Card.vue";
+import ConfirmDialog from "../components/ui/ConfirmDialog.vue";
 import Field from "../components/ui/Field.vue";
 
 const props = defineProps<{ name?: string; isNew?: boolean }>();
@@ -36,18 +33,11 @@ const source = ref<"bundled" | "custom">("custom");
 const saving = ref(false);
 const errorMsg = ref("");
 const loading = ref(false);
+const showDeleteConfirm = ref(false);
+const deleting = ref(false);
 
 const editing = computed(() => !props.isNew && props.name != null);
 const isBundled = computed(() => source.value === "bundled");
-/** Rendered SKILL.md: YAML frontmatter + the body the user typed. */
-const skillMd = computed(
-  () =>
-    "---\n" +
-    `name: ${form.value.name || "skill-name"}\n` +
-    `description: ${form.value.description || "…"}\n` +
-    "---\n\n" +
-    (form.value.body || "# Your instructions"),
-);
 
 function emptyForm() {
   return { name: "", description: "", body: "" };
@@ -61,7 +51,7 @@ async function loadSkill(): Promise<void> {
   }
   loading.value = true;
   try {
-    const body = await mockGetSkill(props.name);
+    const body = await getJson<SkillDetailResponse>(`/api/skills/${encodeURIComponent(props.name)}`);
     const s = body.skill;
     form.value = {
       name: s.name,
@@ -70,6 +60,7 @@ async function loadSkill(): Promise<void> {
     };
     source.value = s.source;
   } catch (e) {
+    if (isAuthError(e)) return;
     errorMsg.value = e instanceof Error ? e.message : "Could not load skill.";
   } finally {
     loading.value = false;
@@ -97,27 +88,36 @@ async function save(): Promise<void> {
       const patch = isBundled.value
         ? { description: form.value.description.trim(), body: form.value.body }
         : payload();
-      await mockUpdateSkill(props.name, patch);
+      await sendJson<SkillMutationResponse>(`/api/skills/${encodeURIComponent(props.name)}`, "PATCH", patch);
       await loadSkill();
     } else {
-      const body: SkillMutationResponse = await mockCreateSkill(payload());
+      const body: SkillMutationResponse = await sendJson<SkillMutationResponse>("/api/skills", "POST", payload());
       await router.replace({ name: "skill-detail", params: { name: body.skill.name } });
     }
   } catch (e) {
+    if (isAuthError(e)) return;
     errorMsg.value = e instanceof Error ? e.message : "Could not reach server";
   } finally {
     saving.value = false;
   }
 }
 
-async function deleteSkill(): Promise<void> {
+function deleteSkill(): void {
   if (!editing.value || props.name == null) return;
-  if (!confirm("Delete this skill?")) return;
+  showDeleteConfirm.value = true;
+}
+
+async function confirmDeleteSkill(): Promise<void> {
+  if (props.name == null) return;
+  deleting.value = true;
   try {
-    await mockDeleteSkill(props.name);
+    await sendJson(`/api/skills/${encodeURIComponent(props.name)}`, "DELETE");
+    showDeleteConfirm.value = false;
     await router.replace({ name: "skills" });
   } catch {
-    /* ignore */
+    /* ignore — keep the dialog open so the user can retry or cancel */
+  } finally {
+    deleting.value = false;
   }
 }
 
@@ -140,7 +140,7 @@ onMounted(loadSkill);
         :loading="loading"
         @click="loadSkill"
       >
-        Refresh
+        <span class="btn-label">Refresh</span>
       </Button>
     </template>
 
@@ -173,28 +173,73 @@ onMounted(loadSkill);
             />
           </Field>
 
-          <div class="actions">
-            <Button variant="primary" icon="check" :loading="saving" @click="save">
-              {{ editing ? "Save changes" : "Create skill" }}
-            </Button>
-            <template v-if="editing">
-              <Button variant="danger" icon="trash" @click="deleteSkill">Delete</Button>
-            </template>
-          </div>
         </Card>
+
+        <div class="actions">
+          <Button variant="primary" icon="check" :loading="saving" @click="save">
+            {{ editing ? "Save changes" : "Create skill" }}
+          </Button>
+          <template v-if="editing">
+            <Button variant="danger" icon="trash" @click="deleteSkill">Delete</Button>
+          </template>
+        </div>
       </div>
 
-      <!-- Sidebar: SKILL.md preview -->
+      <!-- Sidebar: guidance on the fields + how the skill system works -->
       <aside class="side-col">
-        <Card title="SKILL.md preview">
+        <Card title="Instructions">
           <p class="hint-text">
-            This is the file that gets written to <code class="inline mono">skills/&lt;name&gt;/SKILL.md</code>
-            and loaded by the agent.
+            <strong>Name</strong> is the skill folder identifier (e.g. <code class="inline mono">noodle-fix</code>).
+            Lowercase letters, digits, and hyphens only — it becomes a folder under <code class="inline mono">skills/</code>.
           </p>
-          <pre class="md-preview mono">{{ skillMd }}</pre>
+          <p class="hint-text">
+            <strong>Description</strong> tells the agent <em>when</em> to load this skill. Keep it short and
+            about the trigger condition ("Use when asked to review code"), not the contents.
+          </p>
+          <p class="hint-text">
+            <strong>Instructions</strong> is the markdown the agent reads once the skill is loaded — the
+            steps, rules, or mindset it should apply. This is the body of the <code class="inline mono">SKILL.md</code>.
+          </p>
+        </Card>
+
+        <Card title="How it works">
+          <p class="hint-text">
+            Every skill lives at <code class="inline mono">skills/&lt;name&gt;/SKILL.md</code> as a single file with
+            YAML frontmatter (name + description) and a markdown body.
+          </p>
+          <p class="hint-text">
+            The agent picks up skills automatically: before each run, Noodle copies the
+            <code class="inline mono">skills/</code> folder into the workspace, and the agent discovers them by
+            scanning the directory. Edits you make here take effect on the next run — no restart needed.
+          </p>
+          <p class="hint-text">
+            The agent decides which skill to load from the <strong>description</strong> field against the current
+            task. Multiple skills can be active at once (e.g. <code class="inline mono">noodle-default</code> pairs
+            with every task skill).
+          </p>
         </Card>
       </aside>
+
+      <!-- Mobile-only duplicate action row -->
+      <div class="actions actions-mobile">
+        <Button variant="primary" icon="check" :loading="saving" @click="save">
+          {{ editing ? "Save changes" : "Create skill" }}
+        </Button>
+        <template v-if="editing">
+          <Button variant="danger" icon="trash" @click="deleteSkill">Delete</Button>
+        </template>
+      </div>
     </div>
+
+    <ConfirmDialog
+      v-model:open="showDeleteConfirm"
+      title="Delete this skill?"
+      message="The skill folder and its SKILL.md will be removed. This can't be undone."
+      confirm-label="Delete"
+      danger
+      :loading="deleting"
+      @confirm="confirmDeleteSkill"
+    />
   </AppShell>
 </template>
 
@@ -216,7 +261,7 @@ onMounted(loadSkill);
   flex-direction: column;
   gap: var(--space-4);
   position: sticky;
-  top: var(--space-6);
+  top: 60px;
 }
 .banner {
   padding: var(--space-3) var(--space-4);
@@ -231,6 +276,11 @@ onMounted(loadSkill);
   gap: var(--space-2);
   flex-wrap: wrap;
   margin-top: var(--space-4);
+}
+/* Mobile-only duplicate action row — hidden on desktop, shown via the 640px
+ * media query below. */
+.actions-mobile {
+  display: none;
 }
 
 .hint-text {
@@ -247,19 +297,6 @@ onMounted(loadSkill);
   border-radius: var(--radius-sm);
   font-size: var(--text-xs);
 }
-.md-preview {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-2);
-  background: var(--surface-1);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: var(--space-3);
-  overflow-x: auto;
-  white-space: pre-wrap;
-  line-height: 1.55;
-  margin: 0;
-}
 
 @media (max-width: 900px) {
   .skill-layout {
@@ -267,6 +304,18 @@ onMounted(loadSkill);
   }
   .side-col {
     position: static;
+  }
+}
+@media (max-width: 640px) {
+  /* Hide the in-form actions on mobile; a duplicate centered block renders
+   * after the sidebar so buttons are always the last thing on the page. */
+  .form-col > .actions {
+    display: none;
+  }
+  .actions-mobile {
+    display: flex;
+    justify-content: center;
+    margin-top: var(--space-2);
   }
 }
 </style>

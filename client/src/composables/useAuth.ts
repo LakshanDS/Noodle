@@ -6,7 +6,7 @@
  * else means we need the login screen. This mirrors the original UI's init().
  */
 import { reactive } from "vue";
-import { getJson, sendJson, UnauthorizedError } from "../api/client.js";
+import { getJson, sendJson, setUnauthorizedHandler } from "../api/client.js";
 
 interface AuthState {
   /** null = not yet probed; true = logged in; false = needs login. */
@@ -18,6 +18,11 @@ interface AuthState {
 
 const state = reactive<AuthState>({ known: null, loggedIn: false, loggingIn: false });
 
+/** Whether the global 401 handler is active. Suppressed during probeAuth so
+ *  the initial 401 doesn't fire markLoggedOut twice (probeAuth sets the state
+ *  directly; the handler is for mid-session expiry only). */
+let handlerActive = false;
+
 /** Probe the cookie; sets known + loggedIn. Call once at app start. */
 export async function probeAuth(): Promise<void> {
   try {
@@ -26,8 +31,11 @@ export async function probeAuth(): Promise<void> {
     state.loggedIn = true;
   } catch (e) {
     state.known = true;
-    state.loggedIn = e instanceof UnauthorizedError ? false : false;
+    state.loggedIn = false;
   }
+  // Activate the global 401 handler after the probe — subsequent 401s are
+  // mid-session expirations that need the redirect.
+  handlerActive = true;
 }
 
 /** Submit the password; resolves true on success. */
@@ -56,6 +64,14 @@ export async function logout(): Promise<void> {
 export function markLoggedOut(): void {
   state.loggedIn = false;
 }
+
+// Register the global 401 handler: any API call that receives a 401 triggers
+// the handler, which flips state.loggedIn → false → the watcher in App.vue
+// redirects to /login. Suppressed during probeAuth (the initial probe handles
+// the not-logged-in state directly; the handler is for mid-session expiry).
+setUnauthorizedHandler(() => {
+  if (handlerActive) markLoggedOut();
+});
 
 export function useAuth() {
   return { state };

@@ -1,31 +1,32 @@
 import { createWebhookApp } from "./http.js";
-import { JobQueue, QueueWorker, type RunJobFn } from "./queue.js";
-import Database from "better-sqlite3";
-import type { Database as Db } from "better-sqlite3";
+import { JobQueue, Dispatcher, type RunJobFn } from "./queue.js";
 import { randomBytes } from "node:crypto";
+import { resolve, dirname, join } from "node:path";
 import { RunStore } from "./run-store.js";
-import { Scheduler, SqliteScanState, runScanOnce, type SchedulerDeps } from "./scheduler.js";
-import { CronStore } from "./cron-store.js";
-import { CronScheduler, buildCronSchedulerDeps } from "./cron-scheduler.js";
+import { SchedulerStore } from "./scheduler-store.js";
+import { SchedulerRunner, buildSchedulerRunnerDeps } from "./scheduler-runner.js";
+import { TriggerStore } from "./trigger-store.js";
 import { SettingStore } from "./settings-store.js";
 import { ProfileStore } from "./profile-store.js";
-import { hydrateEnvFromDb } from "./hydrate-env.js";
+import { SkillStore } from "./skill-store.js";
+import { CommandStore, seedBuiltinCommand } from "./command-store.js";
 import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/auth-provider.js";
-import { runJob } from "../engine/run.js";
-import { runCronJob } from "../engine/cron-run.js";
-import { loadConfig } from "../config/load.js";
-import { readSetupProfile, synthesizeConfig, hasUsableProfiles } from "../config/setup-fallback.js";
+import { runJob, pruneSessionDirs } from "../engine/run.js";
+import { runSchedulerJob } from "../engine/scheduler-run.js";
+import { runTriggerJob } from "../engine/trigger-run.js";
+import { loadConfig, ConfigError } from "../config/load.js";
+import { NoodleConfigSchema } from "../config/schema.js";
 import { createRelayServer } from "../relay/server.js";
-import { log } from "../util/log.js";
+import { log, initLogFile, closeLogFile } from "../util/log.js";
 import { slugify } from "../util/slugify.js";
 import type { NoodleConfig } from "../config/schema.js";
 
 /**
- * `noodle serve` — boot the webhook server + worker + (optional) scheduler as
- * one long-running process, with graceful shutdown on SIGINT/SIGTERM.
+ * `noodle serve` — boot the webhook server + worker + cron scheduler as one
+ * long-running process, with graceful shutdown on SIGINT/SIGTERM.
  *
- * Wiring: webhook → queue → worker → (auth → runJob). The scheduler, when
- * enabled, feeds the same queue via periodic scans. All share one SQLite DB.
+ * Wiring: webhook → queue → worker → (auth → runJob). The cron scheduler feeds
+ * the same queue on DB-defined schedules. All share one SQLite DB.
  */
 
 export interface ServeOptions {
@@ -34,43 +35,78 @@ export interface ServeOptions {
 }
 
 export async function serve(configPath: string | undefined, opts: ServeOptions = {}): Promise<void> {
-  // Resolve config. The normal path: loadConfig() reads the YAML. But for a
-  // first-run instance set up via the wizard, the YAML may be missing or empty
-  // — in that case we open the DB (default path) and synthesize a minimal
-  // config from the wizard's setup_initial_profile seed (see setup-fallback.ts).
+  // Resolve config. The YAML file (optional) carries only boot-critical
+  // settings: the DB path and server host/port. Everything else — profiles,
+  // GitHub creds, UI password, triggers, routing, queue — is loaded from the
+  // settings DB after it opens. If no YAML exists, defaults are used.
+  // Env vars (NOODLE_DB_PATH, NOODLE_HOST, NOODLE_PORT) override the YAML — this
+  // lets Docker deployments set everything in docker-compose with no YAML file.
   const config = resolveConfig(configPath);
-  const host = opts.host ?? config.server.host;
-  const port = opts.port ?? config.server.port;
+  if (process.env.NOODLE_DB_PATH) config.storage.sqlite_path = process.env.NOODLE_DB_PATH;
+  const host = opts.host ?? process.env.NOODLE_HOST ?? config.server.host;
+  const port = opts.port ?? (process.env.NOODLE_PORT ? parseInt(process.env.NOODLE_PORT, 10) : undefined) ?? config.server.port;
 
-  // Open the SQLite DB first so we can hydrate process.env from the settings
-  // table BEFORE resolving GitHub auth + reading the UI password — those read
-  // env once at boot, so DB-stored secrets (set via the web UI / setup wizard)
-  // must be in process.env by this point. Real env vars still win (see
-  // hydrate-env.ts), so this never clobbers a per-deploy override.
+  // Start persistent log files alongside the DB (e.g. /data/logs/noodle.log).
+  // Rotates at 10MB × 5 files. Non-fatal: if the dir can't be created, stdout
+  // + the ring buffer still work.
+  const dbDir = dirname(resolve(config.storage.sqlite_path));
+  const logDir = join(dbDir, "logs");
+  initLogFile(logDir);
+
+  // Open the SQLite DB — all configuration lives here now. Secrets (GitHub
+  // creds, UI password, webhook secret) and behavioral settings (agent name,
+  // triggers, routing, queue) are read from the settings table directly, not
+  // via env vars. Only the DB path, server host/port, and log
+  // level remain env/CLI flags (they're needed before the DB opens or the
+  // server starts listening).
   const queue = new JobQueue(config.storage.sqlite_path);
-  const hydrated = hydrateEnvFromDb(queue.getDb());
-  if (hydrated.length) {
-    log.info({ keys: hydrated }, "hydrated env from settings DB");
-  }
-  const authProvider = resolveAuthProvider();
-  const scanState = new SqliteScanState(queue.getDb());
   const runStore = new RunStore(queue.getDb());
-  const cronStore = new CronStore(queue.getDb());
+  const schedulerStore = new SchedulerStore(queue.getDb());
+  const triggerStore = new TriggerStore(queue.getDb());
   const settingsStore = new SettingStore(queue.getDb());
   const profileStore = new ProfileStore(queue.getDb());
+  const skillStore = new SkillStore();
+  const commandStore = new CommandStore(queue.getDb());
+  // Seed (or refresh) the built-in /<agent> command — the default framing every
+  // agent run falls back to when no other command matched. Idempotent: updates
+  // the existing row's trigger + prompt on boot so an agent_name change renames
+  // the trigger; never creates a duplicate.
+  seedBuiltinCommand(commandStore, config.agent_name);
+  const authProvider = resolveAuthProvider(settingsStore);
 
-  // Merge DB-managed profiles into the in-memory config so they're runnable
-  // immediately. DB profiles override same-named YAML profiles on a name clash
-  // (the DB is the live, editable source). This happens BEFORE the worker pool,
-  // webhook handler, and relay read `config.profiles`, so all of them see the
-  // merged set. The UI routes mutate `config.profiles` in lockstep on every
-  // create/update/rename/delete so edits take effect without a restart.
+  // Load profiles from the DB — the only source of profiles now. The YAML
+  // config carries behavioral settings only (routing, triggers, server, etc.).
+  // This happens BEFORE the dispatcher, webhook handler, and relay read
+  // `config.profiles`, so all of them see the full set. The UI routes mutate
+  // `config.profiles` in lockstep on every create/update/rename/delete so
+  // edits take effect without a restart.
   for (const { name, profile } of profileStore.list()) {
     config.profiles[name] = profile;
   }
 
+  // Resolve the default profile from the settings DB. If unset, fall back to
+  // the first profile (alphabetically) so the system always has a default.
+  const storedDefault = settingsStore.get("default_profile");
+  if (storedDefault && config.profiles[storedDefault]) {
+    config.default_profile = storedDefault;
+  } else if (!config.default_profile && Object.keys(config.profiles).length > 0) {
+    const first = Object.keys(config.profiles)[0];
+    config.default_profile = first;
+    log.warn({ default_profile: first }, "no default_profile in settings — using first profile");
+  }
+
+  if (Object.keys(config.profiles).length === 0) {
+    log.warn("no profiles configured — create one via the dashboard");
+  }
+
+  // Overlay behavioral settings from the DB onto the config object. These
+  // override the YAML defaults. Boot-critical settings (queue) take effect at
+  // boot; per-run settings (stall timeouts) are read from config at run time.
+  // Changes to boot-critical settings require a restart.
+  loadSettingsIntoConfig(config, settingsStore);
+
   // The worker's runJobFn: resolve auth for the job's repo, build a GitHubClient,
-  // and dispatch to either runJob (issue→PR) or runCronJob (scheduled → issues)
+  // and dispatch to either runJob (issue→PR) or runSchedulerJob (scheduled → issues)
   // based on whether the job carries a cron_job_id. Both share the runStore +
   // auth provider. Providers re-call forRepo() at each git+HTTP op so a
   // long-running job (2h+) re-mints its token after the GitHub-App installation
@@ -80,27 +116,61 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     const instId = job.installation_id ?? undefined;
     const initial = await authProvider.forRepo(job.repo, instId);
 
-    // Cron-originated job: look up its definition and dispatch to runCronJob.
+    // Cron-originated job: look up its definition and dispatch to runSchedulerJob.
     // A cron job row may have been deleted between enqueue and execution —
     // surface that as a clean failure rather than a crash.
     if (job.cron_job_id && job.cron_job_id > 0) {
-      let cron;
+      let scheduler;
       try {
-        cron = cronStore.getCron(job.cron_job_id);
+        scheduler = schedulerStore.getScheduler(job.cron_job_id);
       } catch {
         log.warn({ jobId: job.id, cronJobId: job.cron_job_id }, "cron job no longer exists; skipping");
         return;
       }
-      await runCronJob(config, initial.gh, {
+      await runSchedulerJob(config, initial.gh, {
         repo: job.repo,
-        prompt: cron.prompt,
-        branchName: cron.branch_name,
-        profile: cron.profile,
+        prompt: scheduler.prompt,
+        branchName: scheduler.branch_name,
+        profile: scheduler.profile,
         jobId: `job-${job.id}`,
         token: initial.token,
       }, {
         runStore,
         tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
+        systemPrompt: settingsStore.get("system_prompt") || undefined,
+        // Apply this cron's custom labels to its output issue; falls back to the
+        // global defaults when the cron has no override (labels === null).
+        labelOverrides: scheduler.labels,
+      });
+      return;
+    }
+
+    // Trigger-originated job: look up its definition and dispatch to runTriggerJob.
+    // A trigger row may have been deleted between enqueue and execution —
+    // surface that as a clean failure rather than a crash.
+    if (job.trigger_id && job.trigger_id > 0) {
+      let trigger;
+      try {
+        trigger = triggerStore.getTrigger(job.trigger_id);
+      } catch {
+        log.warn({ jobId: job.id, triggerId: job.trigger_id }, "trigger no longer exists; skipping");
+        return;
+      }
+      await runTriggerJob(config, initial.gh, {
+        repo: job.repo,
+        prompt: trigger.prompt,
+        branchName: trigger.branch_name,
+        profile: trigger.profile,
+        jobId: `job-${job.id}`,
+        token: initial.token,
+        eventType: trigger.event_type,
+        eventAction: trigger.event_action,
+      }, {
+        runStore,
+        tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
+        systemPrompt: settingsStore.get("system_prompt") || undefined,
+        triggerStore,
+        triggerId: trigger.id,
       });
       return;
     }
@@ -120,55 +190,72 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     });
   };
 
-  // Worker pool: N workers pulling from the shared queue. `claimNext` is
-  // transactional so two workers never grab the same job. Default concurrency is
-  // 1 (safe for a small VPS — each agent run holds a workspace + pi session in
-  // memory); raise via `queue.concurrency` only with headroom.
-  const concurrency = config.queue.concurrency;
-  // Per-profile concurrency cap: profiles with `max_concurrent` set are limited
-  // to that many simultaneous runs (so profiles on separate API keys can run in
-  // parallel without a single key being split). Profiles without it fall back to
-  // the global ceiling. The global pool size is still the hard total cap.
+  // Dispatcher: a single process pulls claimable jobs from the queue and fires
+  // each off. Per-profile concurrency is enforced inside claimNext, which skips
+  // a job whose profile is already at its `max_concurrent` cap (default 1) — so
+  // there's no pool to size: a "default" cap=5 + "glm" cap=2 lets 7 jobs run at
+  // once, each gated to its own profile. All three knobs are getters so Settings
+  // / Profiles edits apply live (caps on the next claim, retry knobs on the next
+  // failure) without a restart.
   const capacityFor = (profile: string): number =>
-    config.profiles[profile]?.max_concurrent ?? concurrency;
-  const workerOpts = {
-    maxAttempts: config.queue.max_attempts,
-    retryBackoffSec: config.queue.retry_backoff_seconds,
+    config.profiles[profile]?.max_concurrent ?? 1;
+  const dispatcher = new Dispatcher(queue, runJobFn, {
     capacityFor,
-  };
-  const workers = Array.from({ length: concurrency }, () => new QueueWorker(queue, runJobFn, workerOpts));
+    maxAttempts: () => config.queue.max_attempts,
+    retryBackoffSec: () => config.queue.retry_backoff_seconds,
+  });
   log.info(
-    { concurrency, maxAttempts: workerOpts.maxAttempts, perProfile: Object.fromEntries(Object.entries(config.profiles).filter(([, p]) => p.max_concurrent).map(([k, p]) => [k, p.max_concurrent])) },
-    "worker pool configured",
+    { maxAttempts: config.queue.max_attempts, perProfile: Object.fromEntries(Object.entries(config.profiles).map(([k, p]) => [k, p.max_concurrent ?? 1])) },
+    "dispatcher configured",
   );
 
-  // Webhook handler → enqueue into the queue.
-  const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET ?? "";
-  if (!webhookSecret) {
-    log.warn("GITHUB_WEBHOOK_SECRET not set — webhook signatures cannot be verified. Set it before exposing the server.");
+  // Webhook handler → enqueue into the queue. The secret is read from the
+  // settings DB per-request so changes take effect without a restart.
+  const getWebhookSecret = (): string => settingsStore.get("GITHUB_WEBHOOK_SECRET") ?? "";
+  if (!getWebhookSecret()) {
+    log.warn("GITHUB_WEBHOOK_SECRET not set — webhook signatures cannot be verified. Set it in the Settings page.");
   }
 
   // The agent's own login — used to scope `assigned` events to assignments that
   // target the agent. Derived from agent_name (e.g. "Noodle" → "noodle-agent")
   // unless NOODLE_LOGIN is set explicitly.
-  const selfLogin = await resolveSelfLogin(authProvider, config.agent_name).catch((e) => {
+  const selfLogin = await resolveSelfLogin(authProvider, config.agent_name, settingsStore).catch((e) => {
     log.warn({ err: e }, "could not resolve agent login; `assigned` events will be ignored");
     return undefined;
   });
   if (selfLogin) {
     log.info({ selfLogin }, "assignment trigger scoped to this login");
   } else {
-    log.warn("set NOODLE_LOGIN to enable the assignment trigger (`assigned` events will be ignored until then)");
+    log.warn("set NOODLE_LOGIN in the Settings page to enable the assignment trigger (`assigned` events will be ignored until then)");
   }
 
-  const app = createWebhookApp(webhookSecret, {
-    selfLogin,
-    agentName: config.agent_name,
+  const app = createWebhookApp(getWebhookSecret, {
+    // These are getters (not captured values) so edits in the Settings page take
+    // effect without a restart: NOODLE_LOGIN / agent_name / triggers / profiles
+    // are re-read on each webhook. `selfLogin` prefers an explicit NOODLE_LOGIN,
+    // then derives `<agent-slug>-agent` from the current agent_name.
+    selfLogin: () => settingsStore.get("NOODLE_LOGIN")?.trim() || (isAppMode(settingsStore) ? `${slugify(config.agent_name)}-agent` : selfLogin),
+    agentName: () => config.agent_name,
     // Opt-in wake filter for `issues.*` events — see src/triggers/check.ts.
     // Slash commands (`/<agent>`), assignment, and `#<profile>` tags are always
     // honored and don't go through this filter.
-    triggers: config.triggers,
-    profileNames: Object.keys(config.profiles),
+    triggers: () => config.triggers,
+    profileNames: () => Object.keys(config.profiles),
+    // Active command triggers (read live from the store) so any enabled
+    // /<trigger> in a comment wakes the agent — not just the built-in /<agent>.
+    commandTriggers: () => commandStore.activeTriggers(),
+    // Event-driven triggers: match incoming webhook events against stored triggers.
+    triggerStore,
+    enqueueTrigger: async (opts) => {
+      queue.enqueueTrigger({
+        repo: opts.repo,
+        triggerId: opts.triggerId,
+        installationId: opts.installationId,
+        profile: opts.profile,
+      });
+      dispatcher.dispatch();
+    },
+    defaultProfile: () => config.default_profile,
     enqueue: async (intent) => {
       queue.enqueue({
         repo: intent.repo,
@@ -177,72 +264,61 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         source: "webhook",
         profile: intent.profileHint ?? config.default_profile,
       });
+      // Trigger the dispatcher so the new job starts immediately rather than
+      // waiting up to 5s for the safety-net timer.
+      dispatcher.dispatch();
     },
   });
 
-  // Web UI: registered whenever there's a way to reach it. The dashboard
-  // password can come from the env (NOODLE_UI_PASSWORD) or the settings DB
-  // (set via the wizard / settings page). On a truly blank instance neither is
-  // set — but we still register the routes so the first-run setup wizard at
-  // /api/setup/* is reachable. In that state, the cookie secret is a random
-  // throwaway (no one can log in until the wizard sets a password), and the
-  // setup routes are the only useful unauthenticated surface.
-  const uiPassword = process.env.NOODLE_UI_PASSWORD ?? settingsStore.get("NOODLE_UI_PASSWORD") ?? "";
-  const { registerUiRoutes } = await import("./ui-routes.js");
-  // When a real password exists, it's the cookie secret. When none exists
-  // (blank instance), use a random per-boot secret — login is impossible until
-  // the wizard runs, but the wizard itself is unauthenticated and admitted
-  // while isConfigured() is false.
-  const cookieSecret = uiPassword || cryptoRandomSecret();
-  registerUiRoutes(app, { runStore, secret: cookieSecret, queue, authProvider, agentName: config.agent_name, cronStore, settingsStore, profileStore, config });
-  if (uiPassword) {
+  // Web UI: the dashboard password is read from the settings DB per-request, so
+  // password changes take effect without a restart. On a blank instance (no
+  // password set), seed a default so the dashboard is reachable out of the box
+  // instead of leaving it in setup mode. Idempotent — only seeds when the row
+  // is missing, so an operator who changes the password never gets clobbered.
+  //
+  // ⚠ KNOWN DEFAULT: the seeded value below is a fixed, public default. Any
+  // fresh instance is reachable by anyone who knows it until the operator
+  // changes it via the Settings page. Only acceptable for local / trusted
+  // networks — change it immediately on anything exposed.
+  const { registerUiRoutes, seedDefaultSettings } = await import("./ui-routes.js");
+  if (!settingsStore.has("NOODLE_UI_PASSWORD")) {
+    settingsStore.set("NOODLE_UI_PASSWORD", DEFAULT_UI_PASSWORD);
+    log.warn(`NOODLE_UI_PASSWORD not set — seeded default "${DEFAULT_UI_PASSWORD}". Change it in Settings on any exposed instance.`);
+  }
+  // Seed the editable instance defaults (system prompt, run timeouts, triggers,
+  // routing, queue, labels) on a fresh DB so the Settings page has real values
+  // the moment the UI comes up — independent of the setup wizard. Idempotent.
+  seedDefaultSettings(settingsStore);
+  const fallbackSecret = cryptoRandomSecret();
+  const getUiPassword = (): string => settingsStore.get("NOODLE_UI_PASSWORD") ?? fallbackSecret;
+  // Expose dispatch so UI routes can trigger it after enqueueing (manual cron
+  // run) — new jobs start immediately instead of waiting for the 5s safety net.
+  const dispatch = (): void => dispatcher.dispatch();
+  registerUiRoutes(app, { runStore, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, skillStore, config, logDir, dispatch });
+  if (settingsStore.has("NOODLE_UI_PASSWORD")) {
     log.info("web UI enabled (password-protected)");
   } else {
     log.warn("NOODLE_UI_PASSWORD not set — web UI in setup mode (wizard reachable at /#/setup, login disabled until configured)");
   }
 
-  // Scheduler (optional). Shares the queue + scan state.
-  let scheduler: Scheduler | null = null;
-  if (config.scheduler.enabled && config.scheduler.repos.length > 0) {
-    const schedulerDeps: SchedulerDeps = {
-      listOpenIssues: async (repo, since) => {
-        // App mode: resolve installation id per repo. PAT mode: no installation id.
-        const instId = await (async () => {
-          try {
-            const { gh } = await authProvider.forRepo(repo);
-            return await gh.repoInstallationId(repo);
-          } catch {
-            return undefined;
-          }
-        })();
-        const { gh } = await authProvider.forRepo(repo, instId ?? undefined);
-        return gh.listOpenIssues(repo, since);
-      },
-      enqueue: async (repo, issueNumber, profile) => {
-        queue.enqueue({ repo, issueNumber, source: "scheduler", profile });
-      },
-      state: scanState,
-    };
-    scheduler = new Scheduler(config, schedulerDeps);
-  }
-
   // Cron scheduler: always runs (cron jobs are DB-defined, not config-gated).
   // Fires an immediate tick on boot so due crons run without waiting for the
   // first interval, then every 60s.
-  const cronScheduler = new CronScheduler(buildCronSchedulerDeps(cronStore, queue, authProvider, config));
+  const schedulerRunner = new SchedulerRunner(buildSchedulerRunnerDeps(schedulerStore, queue, authProvider, config));
 
-  // API relay (optional). Provides centralized rate limiting for multiple agents
-  // sharing the same API keys. When enabled, all API calls from this process
-  // route through the relay transparently — no config changes needed.
+  // API relay (per-profile). Profiles with `use_relay: true` route their API
+  // requests through a local rate-limiting proxy. The relay only starts if at
+  // least one profile needs it.
   let relayApp: ReturnType<typeof createRelayServer> | null = null;
-  if (config.relay?.enabled) {
-    const relayPort = config.relay.port ?? 4445;
-    const relayHost = config.relay.host ?? "0.0.0.0";
+  const hasRelayProfiles = Object.values(config.profiles).some((p) => p.use_relay);
+  if (hasRelayProfiles) {
+    const relayPort = 4445;
+    const relayHost = "0.0.0.0";
 
-    // Save original base URLs before modifying profiles for relay routing.
+    // Save original base URLs for relay-enabled profiles only.
     const originalUrls = new Map<string, string>();
     for (const [, profile] of Object.entries(config.profiles)) {
-      if (profile.base_url) {
+      if (profile.use_relay && profile.base_url) {
         originalUrls.set(profile.model, profile.base_url);
       }
     }
@@ -252,24 +328,24 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     await relayApp.listen({ port: relayPort, host: relayHost });
     log.info({ port: relayPort, host: relayHost }, "API relay listening");
 
-    // Rewrite each profile's base_url to route through the relay.
+    // Rewrite only relay-enabled profiles to route through the relay.
     const relayBase = `http://localhost:${relayPort}/v1`;
     for (const profile of Object.values(config.profiles)) {
-      if (profile.base_url) {
+      if (profile.use_relay && profile.base_url) {
         profile.base_url = relayBase;
       }
     }
-    log.info({ relayBase }, "rewrote profile base_urls to route through relay");
+    log.info({ relayBase, profiles: Object.entries(config.profiles).filter(([, p]) => p.use_relay).map(([n]) => n) }, "rewrote relay-enabled profile base_urls");
   }
 
-  // --- Boot order: workers first (drain backlog), then http, then schedulers. ---
-  const workerPromises = Promise.all(workers.map((w) => w.run()));
-
+  // --- Boot order: prune stale session dirs, start the dispatcher (drains
+  // backlog immediately + arms the 5s safety net), then http, then cron scheduler. ---
+  pruneSessionDirs();
+  dispatcher.start();
   await app.listen({ host, port });
   log.info({ host, port }, "webhook server listening");
 
-  scheduler?.start();
-  cronScheduler.start();
+  schedulerRunner.start();
 
   // --- Graceful shutdown ---
   let shuttingDown = false;
@@ -277,13 +353,12 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     if (shuttingDown) return;
     shuttingDown = true;
     log.info({ signal }, "shutting down");
-    scheduler?.stop();
-    cronScheduler.stop();
-    for (const w of workers) w.stop();
+    schedulerRunner.stop();
     await relayApp?.close().catch((e) => log.error({ err: e }, "relay close error"));
     await app.close().catch((e) => log.error({ err: e }, "http close error"));
-    await workerPromises.catch(() => {}); // all workers exit their loops
+    await dispatcher.stop(); // graceful: in-flight jobs finish before exit
     queue.close();
+    closeLogFile();
     log.info("shutdown complete");
     process.exit(0);
   };
@@ -291,8 +366,19 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   // Keep this function alive until shutdown exits the process.
-  await workerPromises;
+  await new Promise<void>(() => {});
 }
+
+/**
+ * ⚠ KNOWN DEFAULT password seeded into a fresh DB (one with no
+ * NOODLE_UI_PASSWORD row). Seeding it skips the setup wizard and enables
+ * login immediately so the dashboard is usable out of the box. Because this
+ * value is public in the source tree, ANY fresh instance is reachable by
+ * anyone who knows it until the operator changes it in Settings. Acceptable
+ * for local/trusted networks; unacceptable for anything exposed — change it
+ * immediately on deployment. Idempotent: an existing row is never overwritten.
+ */
+const DEFAULT_UI_PASSWORD = "Noodle69";
 
 /**
  * A random cookie-signing secret for a blank instance (no UI password set yet).
@@ -306,80 +392,80 @@ function cryptoRandomSecret(): string {
 }
 
 /**
- * Resolve the boot config, with a first-run fallback for wizard-set-up
- * instances.
+ * Resolve the boot config. The YAML file carries behavioral config only
+ * (agent_name, routing, triggers, server, storage, etc.) — profiles and
+ * default_profile are loaded from the DB at boot.
  *
- * Normal: loadConfig() reads the YAML. If that succeeds and the config has at
- * least one usable profile, use it as-is.
- *
- * Fallback (first run via the setup wizard): if loadConfig throws (no YAML) OR
- * the YAML has zero profiles, open the DB at the default path and look for a
- * `setup_initial_profile` seed. If found, synthesize a minimal config from it.
- * If neither YAML nor a seed exists, rethrow the original loadConfig error —
- * the operator must either create noodle.config.yaml or run the wizard.
- *
- * The DB is opened at the default storage path (./noodle.db or $NOODLE_DB_PATH)
- * for the fallback probe; the real queue opens afterward at the resolved
- * config's storage.sqlite_path (same file). This is a read-only probe that
- * closes its handle so the JobQueue reopens cleanly.
+ * If the YAML is missing entirely, fall back to a minimal config with sensible
+ * defaults. The server starts, and the operator creates profiles via the
+ * dashboard or setup wizard.
  */
 function resolveConfig(configPath: string | undefined): NoodleConfig {
-  // Try the normal YAML path first.
   try {
-    const config = loadConfig(configPath);
-    if (hasUsableProfiles(config)) return config;
-    // YAML loaded but has no usable profiles → fall through to the seed check.
-    return trySeedFallback(config) ?? config;
+    return loadConfig(configPath);
   } catch (e) {
-    // YAML missing/unloadable. Try the wizard seed before giving up.
-    const fromSeed = trySeedFallback();
-    if (fromSeed) return fromSeed;
+    // YAML missing (not found or unreadable) → produce minimal defaults so the
+    // server can boot and the wizard can run. A validation error means the YAML
+    // exists but is malformed — surface that.
+    if (e instanceof ConfigError && /No config file found|Failed to read config/.test(e.message)) {
+      return NoodleConfigSchema.parse({});
+    }
     throw e;
   }
 }
 
 /**
- * Open the default DB and synthesize a config from the wizard seed, or null if
- * no seed is stored. `existing` (when the YAML loaded but had no profiles) is
- * returned unchanged if no seed exists, so the caller keeps the YAML config.
+ * Read behavioral settings from the DB and overlay them on the config object.
+ * Each setting overrides the YAML default. Values are stored as strings in the
+ * settings table — booleans are "true"/"false", numbers are stringified, arrays
+ * are JSON strings. Only non-empty values override (an unset DB key keeps the
+ * YAML/schema default).
  */
-function trySeedFallback(existing?: NoodleConfig): NoodleConfig | null {
-  const dbPath = process.env.NOODLE_DB_PATH ?? "./noodle.db";
-  let db: Db;
-  try {
-    // Throwaway read-only handle on the default DB path; the JobQueue opens its
-    // own long-lived handle afterward on the same file.
-    db = new Database(dbPath, { readonly: true });
-  } catch {
-    return existing ?? null;
+function loadSettingsIntoConfig(config: NoodleConfig, store: SettingStore): void {
+  const triggerOnMention = store.get("trigger_on_mention");
+  if (triggerOnMention != null) config.triggers.trigger_on_mention = triggerOnMention === "true";
+
+  const triggerOnOpen = store.get("trigger_on_open");
+  if (triggerOnOpen != null) config.triggers.trigger_on_open = triggerOnOpen === "true";
+
+  const triggerKeywords = store.get("trigger_keywords");
+  if (triggerKeywords) {
+    try { config.triggers.trigger_keywords = JSON.parse(triggerKeywords); } catch { /* leave default */ }
   }
-  try {
-    const seed = readSetupProfile(db);
-    if (!seed) return existing ?? null;
-    return synthesizeConfig(seed);
-  } catch {
-    return existing ?? null;
-  } finally {
-    db.close();
+
+  const routing = store.get("routing");
+  if (routing) {
+    try { config.routing = JSON.parse(routing); } catch { /* leave default */ }
   }
+
+  const qMaxAttempts = store.get("queue_max_attempts");
+  if (qMaxAttempts) config.queue.max_attempts = parseInt(qMaxAttempts, 10) || config.queue.max_attempts;
+  const qBackoff = store.get("queue_retry_backoff_seconds");
+  if (qBackoff) config.queue.retry_backoff_seconds = parseInt(qBackoff, 10) || config.queue.retry_backoff_seconds;
+
+  const stall = store.get("run_stall_timeout_minutes");
+  if (stall) config.run.stall_timeout_minutes = parseInt(stall, 10) || config.run.stall_timeout_minutes;
+  const toolStall = store.get("run_tool_stall_minutes");
+  if (toolStall) config.run.tool_stall_minutes = parseInt(toolStall, 10) || config.run.tool_stall_minutes;
 }
 
 /**
  * Resolve the agent's own login so the `assigned` webhook trigger can be scoped
  * to assignments that target the agent (not human-to-human reshuffles).
  *
- * - Explicit: `NOODLE_LOGIN` always wins (also the only source in App mode,
- *   where fetching "our own login" would need an extra round-trip per event).
+ * - Explicit: NOODLE_LOGIN from the settings DB always wins (also the only
+ *   source in App mode, where fetching "our own login" would need an extra
+ *   round-trip per event).
  * - Default: derived from `agent_name` → `<slug>-agent` (e.g. "Noodle" → "noodle-agent").
- * - PAT fallback: if no env var and not App mode, query `/user` once.
+ * - PAT fallback: if no setting and not App mode, query `/user` once.
  * - App mode without NOODLE_LOGIN: returns the derived default.
  */
-async function resolveSelfLogin(authProvider: AuthProvider, agentName: string): Promise<string | undefined> {
-  const fromEnv = process.env.NOODLE_LOGIN?.trim();
-  if (fromEnv) return fromEnv;
+async function resolveSelfLogin(authProvider: AuthProvider, agentName: string, settingsStore: SettingStore): Promise<string | undefined> {
+  const fromSettings = settingsStore.get("NOODLE_LOGIN")?.trim();
+  if (fromSettings) return fromSettings;
   // Derive a sensible default from the agent name.
   const derived = `${slugify(agentName)}-agent`;
-  if (isAppMode()) return derived; // App mode: use derived default.
+  if (isAppMode(settingsStore)) return derived; // App mode: use derived default.
   // PAT mode: try to resolve from the API, fall back to derived default.
   try {
     const { gh } = await authProvider.forRepo("__self__");
@@ -387,33 +473,4 @@ async function resolveSelfLogin(authProvider: AuthProvider, agentName: string): 
   } catch {
     return derived;
   }
-}
-
-/**
- * as a dry-run). Prints what would be enqueued. Reuses serve's wiring minus the
- * server/worker.
- */
-export async function scanOnce(configPath: string | undefined, repo: string): Promise<void> {
-  const config = loadConfig(configPath);
-  const queue = new JobQueue(config.storage.sqlite_path);
-  const scanState = new SqliteScanState(queue.getDb());
-  const authProvider = resolveAuthProvider();
-
-  const deps: SchedulerDeps = {
-    listOpenIssues: async (r, since) => {
-      const { gh } = await authProvider.forRepo(r);
-      return gh.listOpenIssues(r, since);
-    },
-    enqueue: async (r, n, profile) => {
-      console.log(`  → would enqueue ${r}#${n} (profile: ${profile})`);
-    },
-    state: scanState,
-  };
-  // Scope the scan to the requested repo regardless of config.scheduler settings.
-  const singleRepoConfig: NoodleConfig = {
-    ...config,
-    scheduler: { ...config.scheduler, enabled: true, repos: [repo] },
-  };
-  await runScanOnce(singleRepoConfig, deps);
-  queue.close();
 }

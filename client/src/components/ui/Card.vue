@@ -11,21 +11,27 @@ withDefaults(
     /** Optional muted descriptor shown under the title. */
     subtitle?: string;
     pad?: "default" | "flush";
+    /** Render the body slot. False = header-only (collapsed card with no gap). */
+    body?: boolean;
   }>(),
-  { pad: "default" },
+  { pad: "default", body: true },
 );
 </script>
 
 <template>
   <section class="card" :class="pad">
-    <header v-if="title || $slots.header" class="card-head">
+    <header
+      v-if="title || $slots.header"
+      class="card-head"
+      :class="{ 'no-body': !body }"
+    >
       <slot name="header">
         <h3 class="card-title">{{ title }}</h3>
       </slot>
       <div v-if="$slots.actions" class="card-actions"><slot name="actions" /></div>
     </header>
     <p v-if="subtitle" class="card-subtitle">{{ subtitle }}</p>
-    <div class="card-body">
+    <div v-if="body" class="card-body">
       <slot />
     </div>
   </section>
@@ -48,6 +54,10 @@ withDefaults(
    * up exactly with the body content's edges (no 4px right-offset on actions). */
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
+}
+/* Header-only card (collapsed): drop the divider so it reads as a single strip. */
+.card-head.no-body {
+  border-bottom: none;
 }
 .card-title {
   font-size: var(--text-md);

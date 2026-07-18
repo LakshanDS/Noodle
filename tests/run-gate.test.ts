@@ -31,7 +31,7 @@ vi.mock("../src/engine/workspace.js", () => ({
 
 const { runJob } = await import("../src/engine/run.js");
 
-function makeConfig(profiles = { p: { provider: "openai", model: "gpt-4o-mini" } }) {
+function makeConfig(profiles = { p: { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" } }) {
   return NoodleConfigSchema.parse({
     agent_name: "Noodle",
     default_profile: "p",
@@ -106,8 +106,8 @@ describe("runJob concurrency gate (cooking label)", () => {
 describe("runJob #profile routing", () => {
   it("routes to a #tagged profile over the default", async () => {
     const config = makeConfig({
-      p: { provider: "openai", model: "gpt-4o-mini" },
-      claude: { provider: "openai", model: "gpt-4o-mini" },
+      p: { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" },
+      claude: { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" },
     });
     // Issue body carries a #claude tag.
     const gh = {

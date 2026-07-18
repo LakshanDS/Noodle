@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import { verifySignature, parseWebhookEvent } from "../github/webhook.js";
+import { verifySignature, parseWebhookEvent, parseWebhookMetadata, matchTriggers } from "../github/webhook.js";
 import { log } from "../util/log.js";
 import type { TriggerConfig } from "../triggers/check.js";
+import type { TriggerStore } from "./trigger-store.js";
 
 /**
  * fastify webhook receiver. POST /webhook:
@@ -23,20 +24,21 @@ export interface WebhookHandlerDeps {
   }): Promise<void> | void;
   /**
    * Noodle's own login, used to scope `assigned` events to assignments that
-   * target Noodle (ignored when unset — assignments then do nothing).
+   * target Noodle (ignored when unset — assignments then do nothing). Supplied
+   * as a getter so changes to NOODLE_LOGIN / agent_name take effect without a
+   * restart.
    */
-  selfLogin?: string;
-  /** Configurable agent display name (default "Noodle"). Used for slash-command trigger. */
-  agentName?: string;
+  selfLogin?: () => string | undefined;
+  /** Configurable agent display name (default "Noodle"). Used for slash-command trigger. Getter for live updates. */
+  agentName?: () => string | undefined;
   /**
    * Opt-in wake filter for `issues.*` events (mention / keyword / always).
    * When omitted, `parseWebhookEvent` falls back to a safe default
-   * (mention-only). Production callers should pass the config's triggers
-   * block so the user-configured trigger set is honored.
+   * (mention-only). Getter so edits to the triggers take effect without restart.
    */
-  triggers?: TriggerConfig;
-  /** Configured profile names — enables `#<profile>` tag wake/routing. */
-  profileNames?: string[];
+  triggers?: () => TriggerConfig | undefined;
+  /** Configured profile names — enables `#<profile>` tag wake/routing. Getter for live updates. */
+  profileNames?: () => string[];
   /**
    * Active command triggers (from the command store). A `/<trigger>` in a new
    * comment wakes the agent. When omitted, only `/<agent-slug>` wakes — the
@@ -44,9 +46,20 @@ export interface WebhookHandlerDeps {
    * current set after edits (no server restart needed).
    */
   commandTriggers?: () => string[];
+  /** Trigger store for event-driven trigger matching. */
+  triggerStore?: TriggerStore;
+  /** Enqueue a trigger-originated job. */
+  enqueueTrigger?(opts: {
+    repo: string;
+    triggerId: number;
+    installationId?: number;
+    profile?: string | null;
+  }): Promise<void> | void;
+  /** Get the default profile name. */
+  defaultProfile?: () => string | undefined;
 }
 
-export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): FastifyInstance {
+export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDeps): FastifyInstance {
   const app = Fastify({ logger: false });
 
   // Capture the raw body for HMAC verification instead of letting fastify
@@ -70,8 +83,12 @@ export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): Fast
       return reply.code(200).send({ ok: true, event: "ping" });
     }
 
+    const secret = getSecret();
     const sig = req.headers["x-hub-signature-256"] as string | undefined;
-    if (!verifySignature(raw, sig, secret)) {
+    if (!secret) {
+      // No webhook secret configured — skip verification. The warning is
+      // logged once at startup (serve.ts); don't spam per-request.
+    } else if (!verifySignature(raw, sig, secret)) {
       log.warn({ event, ip: req.ip }, "webhook signature verification failed");
       return reply.code(401).send({ error: "invalid signature" });
     }
@@ -86,20 +103,54 @@ export function createWebhookApp(secret: string, deps: WebhookHandlerDeps): Fast
     const intent = parseWebhookEvent(
       event ?? "",
       payload,
-      deps.selfLogin,
-      deps.agentName,
-      deps.triggers,
-      deps.profileNames ?? [],
+      deps.selfLogin?.(),
+      deps.agentName?.(),
+      deps.triggers?.(),
+      deps.profileNames?.() ?? [],
       deps.commandTriggers?.() ?? [],
     );
     if (!intent) {
       // Acknowledge but ignore — not an event Noodle acts on.
+      // Still check for trigger matches (triggers can fire on any event type).
+    }
+
+    // Always check for trigger matches — triggers can match events that
+    // parseWebhookEvent ignores (e.g. pull_request lifecycle, push).
+    let triggerMatched = false;
+    if (deps.triggerStore && deps.enqueueTrigger) {
+      const metadata = parseWebhookMetadata(event ?? "", payload);
+      if (metadata) {
+        try {
+          const repoTriggers = deps.triggerStore.listByRepo(metadata.repo);
+          const matched = matchTriggers(metadata, repoTriggers);
+          for (const m of matched) {
+            const trigger = repoTriggers.find((t) => t.id === m.id);
+            if (!trigger) continue;
+            await deps.enqueueTrigger({
+              repo: metadata.repo,
+              triggerId: trigger.id,
+              installationId: metadata.installationId,
+              profile: trigger.profile ?? deps.defaultProfile?.() ?? null,
+            });
+            deps.triggerStore.markTriggered(trigger.id);
+            triggerMatched = true;
+            log.info({ event, repo: metadata.repo, triggerId: trigger.id }, "trigger enqueued");
+          }
+        } catch (e) {
+          log.error({ err: e, event }, "trigger matching failed");
+        }
+      }
+    }
+
+    if (!intent && !triggerMatched) {
       return reply.code(202).send({ ok: true, ignored: true });
     }
 
     try {
-      await deps.enqueue(intent);
-      log.info({ event, repo: intent.repo, issue: intent.issueNumber }, "webhook enqueued");
+      if (intent) {
+        await deps.enqueue(intent);
+        log.info({ event, repo: intent.repo, issue: intent.issueNumber }, "webhook enqueued");
+      }
       return reply.code(202).send({ ok: true, enqueued: true });
     } catch (e) {
       log.error({ err: e, event }, "webhook enqueue failed");

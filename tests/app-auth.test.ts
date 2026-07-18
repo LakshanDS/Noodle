@@ -60,21 +60,15 @@ describe("buildAppJwt", () => {
 });
 
 describe("loadPrivateKey", () => {
-  it("reads GITHUB_PRIVATE_KEY and unescapes literal \\n", () => {
+  it("unescapes literal \\n in the inline PEM", () => {
     const pem = "-----BEGIN PRIVATE KEY-----\\nABCD\\n-----END PRIVATE KEY-----";
-    process.env.GITHUB_PRIVATE_KEY = pem;
-    try {
-      expect(loadPrivateKey()).toBe(
-        "-----BEGIN PRIVATE KEY-----\nABCD\n-----END PRIVATE KEY-----",
-      );
-    } finally {
-      delete process.env.GITHUB_PRIVATE_KEY;
-    }
+    expect(loadPrivateKey(pem)).toBe(
+      "-----BEGIN PRIVATE KEY-----\nABCD\n-----END PRIVATE KEY-----",
+    );
   });
 
   it("throws when no key source is set", () => {
-    delete process.env.GITHUB_PRIVATE_KEY;
     delete process.env.GITHUB_PRIVATE_KEY_FILE;
-    expect(() => loadPrivateKey()).toThrow(/not found/);
+    expect(() => loadPrivateKey(undefined)).toThrow(/not found/);
   });
 });

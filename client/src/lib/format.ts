@@ -45,6 +45,26 @@ export function fmtTime(iso: string | null | undefined): string {
   }
 }
 
+/**
+ * Elapsed time between a run's start and finish (or now, if still running).
+ * Returns a compact hours+minutes label: "4m", "1h 12m", or "—" if no start.
+ * Sub-minute durations round up to 1m. SQLite stores naive UTC strings; append
+ * Z so JS parses them as UTC.
+ */
+export function fmtDuration(startedAt: string | null, finishedAt: string | null): string {
+  if (!startedAt) return "—";
+  const start = new Date(startedAt.endsWith("Z") ? startedAt : startedAt + "Z").getTime();
+  if (!Number.isFinite(start)) return "—";
+  const endIso = finishedAt ?? new Date().toISOString();
+  const end = new Date(endIso.endsWith("Z") ? endIso : endIso + "Z").getTime();
+  if (!Number.isFinite(end) || end < start) return "—";
+  const totalMin = Math.max(1, Math.round((end - start) / 60000));
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+}
+
 /** `owner/name` → `name` (the repo leaf), for compact titles. */
 export function repoLeaf(repo: string): string {
   return repo.split("/").pop() || repo;

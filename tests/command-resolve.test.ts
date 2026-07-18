@@ -5,7 +5,6 @@ import type { IssueInput } from "../src/profiles/types.js";
 
 function cmd(over: Partial<CommandRow> & Pick<CommandRow, "id" | "trigger">): CommandRow {
   return {
-    name: over.trigger,
     description: "",
     system_prompt: "",
     profile: null,

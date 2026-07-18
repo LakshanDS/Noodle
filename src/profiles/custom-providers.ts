@@ -3,17 +3,12 @@ import type { NoodleConfig, Profile } from "../config/schema.js";
 import { log } from "../util/log.js";
 
 /**
- * A profile is a "custom endpoint" if it has both base_url + api. Such profiles
- * point at an OpenAI-compatible or Anthropic-compatible endpoint that pi doesn't
- * know about by default (Ollama, vLLM, LM Studio, a corporate gateway, a proxy).
- *
+ * Every profile is a custom endpoint — defined by base_url + api + api_key.
  * Register each with pi's ModelRegistry so the subsequent find() resolves.
- * Built-in providers (anthropic, openai, openrouter, ...) are skipped — pi
- * already knows them.
  *
- * Returns a map from profile name → the provider key used in the registry, so
- * callers can look up the right model even when two profiles share a provider
- * name (e.g. both use `provider: nvidia`).
+ * Returns a map from profile name → the provider key used in the registry.
+ * Profile names are unique, so each is used directly as the provider key —
+ * no dedup logic needed.
  */
 export function registerCustomProviders(
   config: NoodleConfig,
@@ -21,24 +16,14 @@ export function registerCustomProviders(
 ): Map<string, string> {
   const providerKeyMap = new Map<string, string>();
 
-  // Track how many times each provider name has been used. pi's
-  // registerProvider does a full model replacement per provider name, so two
-  // profiles sharing one would clobber each other.
-  const seen = new Map<string, number>();
-
   for (const [name, profile] of Object.entries(config.profiles)) {
-    if (!isCustomEndpoint(profile)) continue;
     const apiKey = resolveApiKey(profile);
 
-    // Namespace duplicates: first use keeps the bare name, subsequent ones get
-    // `-<profileName>` so each profile's models live under a unique key.
-    const count = (seen.get(profile.provider) ?? 0) + 1;
-    seen.set(profile.provider, count);
-    const providerKey = count > 1 ? `${profile.provider}-${name}` : profile.provider;
-    providerKeyMap.set(name, providerKey);
+    // Profile name is unique — use it directly as the provider key.
+    providerKeyMap.set(name, name);
 
     try {
-      registry.registerProvider(providerKey, {
+      registry.registerProvider(name, {
         baseUrl: profile.base_url,
         api: profile.api,
         apiKey,
@@ -74,7 +59,6 @@ export function registerCustomProviders(
       log.info(
         {
           profile: name,
-          provider: providerKey,
           api: profile.api,
           baseUrl: profile.base_url,
           priced,
@@ -83,7 +67,7 @@ export function registerCustomProviders(
       );
     } catch (e) {
       throw new Error(
-        `Failed to register custom provider for profile "${name}" (${profile.provider}): ${(e as Error).message}`,
+        `Failed to register custom provider for profile "${name}": ${(e as Error).message}`,
       );
     }
   }
@@ -91,21 +75,11 @@ export function registerCustomProviders(
   return providerKeyMap;
 }
 
-export function isCustomEndpoint(p: Profile): boolean {
-  return Boolean(p.base_url && p.api);
-}
-
 /**
- * Resolve the API key for a custom endpoint.
- * - If api_key_env is set, read that env var (may be empty for local no-auth endpoints like Ollama).
- * - pi requires *some* apiKey string when models are defined, so pass a placeholder
- *   for endpoints that ignore auth. For real auth, set the env var.
+ * Resolve the API key for an endpoint. Reads it directly from the profile's
+ * `api_key` field. An empty string means no-auth (e.g. local Ollama); we pass a
+ * placeholder so pi's "apiKey required" validation passes — the endpoint ignores it.
  */
 function resolveApiKey(p: Profile): string {
-  if (p.api_key_env) {
-    return process.env[p.api_key_env] ?? "";
-  }
-  // No env var named: local endpoints (Ollama) typically need no auth; pass a placeholder
-  // so pi's validation passes. The endpoint ignores it.
-  return "noodle-no-auth";
+  return p.api_key || "noodle-no-auth";
 }

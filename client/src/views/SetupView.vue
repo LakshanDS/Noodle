@@ -4,14 +4,16 @@
  * GitHub → Model → Password → Review. On finish, shows a "restart required"
  * success state before routing to login.
  */
-import { computed, onMounted, reactive, ref } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 import { getJson, sendJson, ApiRequestError } from "../api/client.js";
-import type { SetupStatus, SetupPayload, SetupResponse } from "../api/types.js";
+import type { SetupStatus, SetupPayload, SetupResponse, Api } from "../api/types.js";
 import Icon from "../components/ui/Icon.vue";
 import Button from "../components/ui/Button.vue";
 import Field from "../components/ui/Field.vue";
 import Card from "../components/ui/Card.vue";
+import Select from "../components/ui/Select.vue";
+import type { SelectOption } from "../components/ui/Select.vue";
 
 const router = useRouter();
 const step = ref(0);
@@ -22,18 +24,17 @@ const done = ref(false);
 const ghMode = ref<"pat" | "app">("pat");
 const github = reactive({ token: "", appId: "", privateKey: "", webhookSecret: "" });
 
-const PROVIDERS = [
-  { value: "anthropic", label: "Anthropic", keyEnv: "ANTHROPIC_API_KEY" },
-  { value: "openai", label: "OpenAI", keyEnv: "OPENAI_API_KEY" },
-  { value: "openrouter", label: "OpenRouter", keyEnv: "OPENROUTER_API_KEY" },
-  { value: "groq", label: "Groq", keyEnv: "GROQ_API_KEY" },
-  { value: "deepseek", label: "DeepSeek", keyEnv: "DEEPSEEK_API_KEY" },
-  { value: "google", label: "Google (Gemini)", keyEnv: "GEMINI_API_KEY" },
-  { value: "custom", label: "Custom (OpenAI-compatible)", keyEnv: "" },
-] as const;
+const llm = reactive({ model: "", apiKey: "", baseUrl: "", api: "openai-completions" });
 
-const llm = reactive({ provider: "anthropic", model: "", apiKey: "", baseUrl: "", api: "openai-completions" });
-const currentProvider = computed(() => PROVIDERS.find((p) => p.value === llm.provider));
+/** Option list for the protocol <Select> — mirrors the full Api enum. */
+const APIS: Api[] = [
+  "openai-completions",
+  "openai-responses",
+  "anthropic-messages",
+  "google-generative-ai",
+  "mistral-conversations",
+];
+const apiStyleOptions: SelectOption[] = APIS.map((a) => ({ value: a, label: a }));
 const uiPassword = ref("");
 const uiPasswordConfirm = ref("");
 
@@ -41,7 +42,7 @@ const steps = ["GitHub", "Model", "Password", "Review"];
 
 function canAdvance(): boolean {
   if (step.value === 0) return ghMode.value === "pat" ? !!github.token : !!(github.appId && github.privateKey);
-  if (step.value === 1) return !!llm.provider && !!llm.model && (!!llm.apiKey || llm.provider === "custom");
+  if (step.value === 1) return !!llm.model && !!llm.baseUrl && !!llm.api;
   if (step.value === 2) return uiPassword.value.length > 0 && uiPassword.value === uiPasswordConfirm.value;
   return true;
 }
@@ -77,12 +78,10 @@ async function submit(): Promise<void> {
         ? { token: github.token.trim() }
         : { appId: github.appId.trim(), privateKey: github.privateKey, webhookSecret: github.webhookSecret.trim() },
     llm: {
-      provider: llm.provider,
       model: llm.model.trim(),
       apiKey: llm.apiKey.trim() || undefined,
-      apiKeyEnv: currentProvider.value?.keyEnv || undefined,
-      baseUrl: llm.provider === "custom" ? llm.baseUrl.trim() || undefined : undefined,
-      api: llm.provider === "custom" ? llm.api || undefined : undefined,
+      baseUrl: llm.baseUrl.trim(),
+      api: llm.api,
     },
     uiPassword: uiPassword.value,
   };
@@ -166,29 +165,20 @@ onMounted(checkStatus);
         <!-- Step 1: Model -->
         <div v-show="step === 1" class="step-body">
           <h2>Pick a model</h2>
-          <p class="step-desc">Choose the LLM profile Noodle uses by default. You can add more profiles in the config later.</p>
+          <p class="step-desc">Point Noodle at your LLM endpoint. Every provider — Anthropic, OpenAI, local Ollama — is configured the same way: a protocol, a base URL, and an API key.</p>
 
-          <Field label="Provider">
-            <select v-model="llm.provider" class="ctrl">
-              <option v-for="p in PROVIDERS" :key="p.value" :value="p.value">{{ p.label }}</option>
-            </select>
+          <Field label="Wire protocol" hint="The API format your endpoint speaks.">
+            <Select v-model="llm.api" :options="apiStyleOptions" mono />
           </Field>
-          <Field label="Model">
-            <input v-model="llm.model" class="ctrl" type="text" :placeholder="llm.provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'model-name'" />
+          <Field label="Base URL" hint="The endpoint URL (e.g. https://api.anthropic.com, http://localhost:11434/v1).">
+            <input v-model="llm.baseUrl" class="ctrl mono" type="text" placeholder="https://api.anthropic.com" />
           </Field>
-          <Field label="API key" :hint="`Stored as ${currentProvider?.keyEnv || '(custom)'} — applies to new runs immediately.`">
+          <Field label="Model" hint="The model identifier the endpoint accepts.">
+            <input v-model="llm.model" class="ctrl" type="text" placeholder="claude-sonnet-4-20250514" />
+          </Field>
+          <Field label="API key" hint="Stored on the profile. Leave empty for no-auth local endpoints.">
             <input v-model="llm.apiKey" class="ctrl mono" type="password" placeholder="sk-…" autocomplete="off" />
           </Field>
-          <template v-if="llm.provider === 'custom'">
-            <Field label="Base URL"><input v-model="llm.baseUrl" class="ctrl" type="text" placeholder="http://localhost:11434/v1" /></Field>
-            <Field label="API style">
-              <select v-model="llm.api" class="ctrl">
-                <option value="openai-completions">openai-completions</option>
-                <option value="openai-responses">openai-responses</option>
-                <option value="anthropic-messages">anthropic-messages</option>
-              </select>
-            </Field>
-          </template>
         </div>
 
         <!-- Step 2: Password -->
@@ -212,8 +202,8 @@ onMounted(checkStatus);
           <Card>
             <dl class="review">
               <div class="r-row"><dt>GitHub</dt><dd>{{ ghMode === "pat" ? "Personal Access Token" : "GitHub App" }}</dd></div>
-              <div class="r-row"><dt>Provider</dt><dd>{{ currentProvider?.label }}</dd></div>
               <div class="r-row"><dt>Model</dt><dd class="mono">{{ llm.model }}</dd></div>
+              <div class="r-row"><dt>Endpoint</dt><dd class="mono">{{ llm.baseUrl }}</dd></div>
               <div class="r-row"><dt>Dashboard password</dt><dd>{{ uiPassword ? "set" : "—" }}</dd></div>
             </dl>
           </Card>

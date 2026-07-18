@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { SettingStore, SETTING_CATALOG } from "../src/server/settings-store.js";
-import { hydrateEnvFromDb } from "../src/server/hydrate-env.js";
 
 let dir: string;
 let db: Database.Database;
@@ -56,9 +55,9 @@ describe("SettingStore", () => {
     expect(keys).toEqual(["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]);
   });
 
-  it("accepts keys not in the catalog (custom api_key_env)", () => {
-    store.set("NVIDIA_API_KEY", "nvj_xyz");
-    expect(store.get("NVIDIA_API_KEY")).toBe("nvj_xyz");
+  it("accepts keys not in the catalog (custom settings)", () => {
+    store.set("SOME_CUSTOM_KEY", "custom-value");
+    expect(store.get("SOME_CUSTOM_KEY")).toBe("custom-value");
   });
 
   it("mask returns empty for unset/empty values", () => {
@@ -71,16 +70,25 @@ describe("SettingStore", () => {
     expect(SettingStore.mask("short")).toBe("••••hort");
   });
 
-  it("isRestartKey is true for boot-read secrets, false for per-request LLM keys", () => {
-    expect(SettingStore.isRestartKey("GITHUB_TOKEN")).toBe(true);
-    expect(SettingStore.isRestartKey("GITHUB_APP_ID")).toBe(true);
-    expect(SettingStore.isRestartKey("GITHUB_WEBHOOK_SECRET")).toBe(true);
-    expect(SettingStore.isRestartKey("NOODLE_UI_PASSWORD")).toBe(true);
-    expect(SettingStore.isRestartKey("NOODLE_LOGIN")).toBe(true);
-    // LLM keys are read per-request via process.env[api_key_env].
+  it("isRestartKey is true for boot-read secrets, false for live (DB-backed) ones", () => {
+    // GitHub creds + the UI password are read live from the DB now (no restart).
+    expect(SettingStore.isRestartKey("GITHUB_TOKEN")).toBe(false);
+    expect(SettingStore.isRestartKey("GITHUB_APP_ID")).toBe(false);
+    expect(SettingStore.isRestartKey("GITHUB_WEBHOOK_SECRET")).toBe(false);
+    expect(SettingStore.isRestartKey("NOODLE_UI_PASSWORD")).toBe(false);
+    // agent_name / login / triggers / routing are re-overlayed onto config on
+    // save and read live by runJob + the webhook handler (via getters).
+    expect(SettingStore.isRestartKey("NOODLE_LOGIN")).toBe(false);
+    expect(SettingStore.isRestartKey("agent_name")).toBe(false);
+    expect(SettingStore.isRestartKey("trigger_on_mention")).toBe(false);
+    expect(SettingStore.isRestartKey("routing")).toBe(false);
+    // Queue retry knobs resolve via getters at dispatch time — no restart.
+    // (queue_concurrency was removed; per-profile concurrency lives on profiles.)
+    expect(SettingStore.isRestartKey("queue_max_attempts")).toBe(false);
+    expect(SettingStore.isRestartKey("queue_retry_backoff_seconds")).toBe(false);
+    // LLM keys are on profiles now, not in the settings catalog.
     expect(SettingStore.isRestartKey("ANTHROPIC_API_KEY")).toBe(false);
-    expect(SettingStore.isRestartKey("OPENAI_API_KEY")).toBe(false);
-    expect(SettingStore.isRestartKey("OPENROUTER_API_KEY")).toBe(false);
+    expect(SettingStore.isRestartKey("default_profile")).toBe(false);
   });
 
   it("catalog includes all expected keys", () => {
@@ -89,7 +97,15 @@ describe("SettingStore", () => {
     expect(keys).toContain("GITHUB_APP_ID");
     expect(keys).toContain("GITHUB_PRIVATE_KEY");
     expect(keys).toContain("NOODLE_UI_PASSWORD");
-    expect(keys).toContain("ANTHROPIC_API_KEY");
+    expect(keys).toContain("system_prompt");
+    // default_profile moved to the Profiles page UI (not a Settings catalog key).
+    expect(keys).not.toContain("default_profile");
+    // The repo-scan scheduler was removed — its keys are gone from the catalog.
+    expect(keys).not.toContain("scheduler_enabled");
+    expect(keys).not.toContain("scheduler_interval_minutes");
+    expect(keys).not.toContain("scheduler_repos");
+    // LLM API keys are NOT in the catalog — they live on profiles now.
+    expect(keys).not.toContain("ANTHROPIC_API_KEY");
     // Every catalog entry has the required fields.
     for (const s of SETTING_CATALOG) {
       expect(typeof s.key).toBe("string");
@@ -97,40 +113,5 @@ describe("SettingStore", () => {
       expect(typeof s.secret).toBe("boolean");
       expect(typeof s.restartRequired).toBe("boolean");
     }
-  });
-});
-
-describe("hydrateEnvFromDb", () => {
-  it("copies DB values into process.env when the env var is unset", () => {
-    const env: Record<string, string | undefined> = {};
-    store.set("ANTHROPIC_API_KEY", "sk-ant-fromdb");
-    store.set("GITHUB_TOKEN", "ghp_fromdb");
-    const hydrated = hydrateEnvFromDb(db, env);
-    expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-fromdb");
-    expect(env.GITHUB_TOKEN).toBe("ghp_fromdb");
-    expect(hydrated.sort()).toEqual(["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]);
-  });
-
-  it("does NOT overwrite a value already set in the real environment (real env wins)", () => {
-    const env: Record<string, string | undefined> = {
-      ANTHROPIC_API_KEY: "sk-ant-fromenv",
-    };
-    store.set("ANTHROPIC_API_KEY", "sk-ant-fromdb");
-    hydrateEnvFromDb(db, env);
-    expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-fromenv"); // env wins
-  });
-
-  it("does not hydrate empty-string rows (cleared fields stay unset)", () => {
-    const env: Record<string, string | undefined> = {};
-    store.set("GITHUB_TOKEN", "");
-    hydrateEnvFromDb(db, env);
-    expect(env.GITHUB_TOKEN).toBeUndefined();
-  });
-
-  it("treats an empty real-env value as unset (DB fills it)", () => {
-    const env: Record<string, string | undefined> = { GITHUB_TOKEN: "" };
-    store.set("GITHUB_TOKEN", "ghp_fromdb");
-    hydrateEnvFromDb(db, env);
-    expect(env.GITHUB_TOKEN).toBe("ghp_fromdb");
   });
 });

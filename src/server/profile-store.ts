@@ -41,7 +41,6 @@ export interface StoredProfile {
 /** A lightweight view for list endpoints — name + parsed identity fields. */
 export interface ProfileSummary {
   name: string;
-  provider: string;
   model: string;
   created_at: string;
   updated_at: string;
@@ -95,7 +94,6 @@ export class ProfileStore {
   listSummaries(): ProfileSummary[] {
     return this.list().map(({ name, profile, created_at, updated_at }) => ({
       name,
-      provider: profile.provider,
       model: profile.model,
       created_at,
       updated_at,
@@ -191,8 +189,8 @@ export function parseProfile(data: string): Profile | null {
 
 /**
  * Parse + validate a caller-supplied object, returning the typed `Profile` or a
- * human-readable error string. The `base_url ↔ api` pairing rule is enforced
- * here too (mirrors the cross-validator the YAML path runs in schema.ts).
+ * human-readable error string. base_url + api are both required (enforced by
+ * ProfileSchema).
  */
 export function validateProfileInput(obj: unknown): Profile | { error: string } {
   const res = ProfileSchema.safeParse(obj);
@@ -201,10 +199,7 @@ export function validateProfileInput(obj: unknown): Profile | { error: string } 
     const path = first?.path.length ? `${first.path.join(".")}: ` : "";
     return { error: `${path}${first?.message ?? "invalid profile"}` };
   }
-  const p = res.data;
-  if (p.base_url && !p.api) return { error: '"api" is required when "base_url" is set (custom endpoint)' };
-  if (p.api && !p.base_url) return { error: '"base_url" is required when "api" is set (custom endpoint)' };
-  return p;
+  return res.data;
 }
 
 /** Serialize a validated `Profile` for storage. */

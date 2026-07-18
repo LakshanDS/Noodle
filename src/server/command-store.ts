@@ -1,6 +1,7 @@
 import type { Database as Db } from "better-sqlite3";
-import { defaultCommandPrompt } from "../engine/prompt.js";
+import { defaultCommandPrompt, fixCommandPrompt, reviewCommandPrompt } from "../engine/prompt.js";
 import { slugify } from "../util/slugify.js";
+import { stripCodeBlocks } from "../commands/match.js";
 
 /**
  * DB-backed store for slash commands. A command is a named wake trigger
@@ -22,7 +23,6 @@ export interface CommandRow {
   id: number;
   /** Trigger word without the leading slash, e.g. "question". Lowercase. */
   trigger: string;
-  name: string;
   description: string;
   /** Framing prompt the agent receives (wraps the issue context block). */
   system_prompt: string;
@@ -37,18 +37,25 @@ export interface CommandRow {
   enabled: number; // 0 | 1 (SQLite has no native bool)
   /** 1 for the seeded /<agent> default — non-deletable. */
   is_builtin: number; // 0 | 1
+  /**
+   * Optional custom label set as a JSON string
+   * ({cooking:{name,color}, cooked:{...}, failed:{...}}). Null = use the global
+   * default labels. See src/engine/labels.ts.
+   */
+  labels: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export interface NewCommand {
   trigger: string;
-  name: string;
   description?: string;
   system_prompt?: string;
   profile?: string | null;
   runtime?: string | null;
   enabled?: number;
+  /** JSON label-set string, or null to use the global defaults. */
+  labels?: string | null;
 }
 
 /**
@@ -56,20 +63,20 @@ export interface NewCommand {
  * editable through this type — it is set only by the boot-time seed.
  */
 export type CommandUpdate = Partial<
-  Pick<NewCommand, "trigger" | "name" | "description" | "system_prompt" | "profile" | "runtime" | "enabled">
+  Pick<NewCommand, "trigger" | "description" | "system_prompt" | "profile" | "runtime" | "enabled" | "labels">
 >;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS commands (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trigger TEXT NOT NULL UNIQUE,
-  name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   system_prompt TEXT NOT NULL DEFAULT '',
   profile TEXT,
   runtime TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   is_builtin INTEGER NOT NULL DEFAULT 0,
+  labels TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -87,6 +94,14 @@ export class CommandStore {
     if (!cols.some((c) => c.name === "runtime")) {
       db.exec("ALTER TABLE commands ADD COLUMN runtime TEXT");
     }
+    // Add `labels` (custom per-command label set) to pre-existing tables.
+    if (!cols.some((c) => c.name === "labels")) {
+      db.exec("ALTER TABLE commands ADD COLUMN labels TEXT");
+    }
+    // Drop the removed `name` column from pre-existing tables.
+    if (cols.some((c) => c.name === "name")) {
+      db.exec("ALTER TABLE commands DROP COLUMN name");
+    }
   }
 
   /** For tests that want to inject an in-memory DB. */
@@ -98,17 +113,17 @@ export class CommandStore {
   create(input: NewCommand): CommandRow {
     this.db
       .prepare(
-        `INSERT INTO commands (trigger, name, description, system_prompt, profile, runtime, enabled)
-         VALUES (@trigger, @name, @description, @system_prompt, @profile, @runtime, @enabled)`,
+        `INSERT INTO commands (trigger, description, system_prompt, profile, runtime, enabled, labels)
+         VALUES (@trigger, @description, @system_prompt, @profile, @runtime, @enabled, @labels)`,
       )
       .run({
         trigger: input.trigger,
-        name: input.name,
         description: input.description ?? "",
         system_prompt: input.system_prompt ?? "",
         profile: input.profile ?? null,
         runtime: input.runtime ?? null,
         enabled: input.enabled ?? 1,
+        labels: input.labels ?? null,
       });
     const id = (this.db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
     return this.get(id);
@@ -120,7 +135,7 @@ export class CommandStore {
     const cols: string[] = [];
     const params: Record<string, unknown> = { id };
 
-    for (const key of ["trigger", "name", "description", "system_prompt", "profile", "runtime"] as const) {
+    for (const key of ["trigger", "description", "system_prompt", "profile", "runtime", "labels"] as const) {
       if (update[key] !== undefined) {
         cols.push(`${key} = @${key}`);
         params[key] = update[key];
@@ -149,6 +164,11 @@ export class CommandStore {
     if (row.is_builtin === 1) {
       throw new Error(`command ${id} is built-in and cannot be deleted`);
     }
+    this.db.prepare("DELETE FROM commands WHERE id = ?").run(id);
+  }
+
+  /** Delete a command bypassing the built-in guard. Used by the seed function to clean up stale built-ins on rename. */
+  forceDelete(id: number): void {
     this.db.prepare("DELETE FROM commands WHERE id = ?").run(id);
   }
 
@@ -184,39 +204,64 @@ export class CommandStore {
     return rows.map((r) => r.trigger);
   }
   /**
-   * The first enabled command whose `/<trigger>` appears as a standalone token
-   * in `text`. Returns null when nothing matches. Ordered by id so the
-   * built-in default is evaluated first (and loses only to a more specific
-   * command that actually appears in the text).
+   * The enabled command whose `/<trigger>` appears as a standalone token in the
+   * given text segments. Returns null when nothing matches across any segment.
+   *
+   * Segments are scanned in the ORDER GIVEN — callers should pass them
+   * newest-first (latest comment → issue body) so the most recent intent wins
+   * when multiple commands appear in the thread. Within each segment, candidates
+   * are tested LONGEST-trigger-first so a more specific command wins over a
+   * prefix-named one: `/noodle-fix` is tested before `/noodle`, so typing
+   * `/noodle-fix` resolves to the fix workflow, not the generic `/noodle`.
+   *
+   * The trailing boundary `(?![\w-])` (not followed by a word char or hyphen)
+   * ensures `/noodle` does not match inside `/noodle-fix` — a plain `\b` would,
+   * since it treats `-` as a boundary.
+   *
+   * Accepts either a single string (back-compat) or an array of segments.
    */
-  resolveByTrigger(text: string): CommandRow | null {
-    if (!text) return null;
+  resolveByTrigger(textOrSegments: string | string[]): CommandRow | null {
+    const segments = Array.isArray(textOrSegments)
+      ? textOrSegments
+      : [textOrSegments];
+    if (segments.length === 0) return null;
     const rows = this.db
-      .prepare("SELECT * FROM commands WHERE enabled = 1 ORDER BY id ASC")
+      .prepare("SELECT * FROM commands WHERE enabled = 1")
       .all() as CommandRow[];
-    for (const cmd of rows) {
-      const escaped = cmd.trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(`(?:^|\\s)/${escaped}\\b`, "i");
-      if (re.test(text)) return cmd;
+    // Longest trigger first — most specific command wins on overlap.
+    rows.sort((a, b) => b.trigger.length - a.trigger.length);
+    const regexes = rows.map((cmd) => ({
+      cmd,
+      re: new RegExp(`(?:^|\\s)/${cmd.trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`, "i"),
+    }));
+    // Scan segments in order; first segment with a match wins (recency). Strip
+    // code blocks from each segment so a `/trigger` inside a code example
+    // doesn't resolve (matches the wake-gate behaviour in matchesCommandTrigger).
+    for (const seg of segments) {
+      if (!seg) continue;
+      const stripped = stripCodeBlocks(seg);
+      for (const { cmd, re } of regexes) {
+        if (re.test(stripped)) return cmd;
+      }
     }
     return null;
   }
 
   /**
-   * Insert the built-in command row. Only called by `seedBuiltinCommand` when
-   * no built-in exists yet. User-created commands go through `create()`; this
-   * path is the sole way a row with `is_builtin = 1` enters the table.
+   * Insert a built-in command row. Only called by `seedBuiltinCommand` when
+   * no built-in with this trigger exists yet. User-created commands go through
+   * `create()`; this path is the sole way a row with `is_builtin = 1` enters
+   * the table.
    */
-  upsertBuiltin(trigger: string, systemPrompt: string): void {
+  upsertBuiltin(trigger: string, systemPrompt: string, description: string): void {
     this.db
       .prepare(
-        `INSERT INTO commands (trigger, name, description, system_prompt, profile, enabled, is_builtin)
-         VALUES (@trigger, @name, @description, @system_prompt, @profile, @enabled, @is_builtin)`,
+        `INSERT INTO commands (trigger, description, system_prompt, profile, enabled, is_builtin)
+         VALUES (@trigger, @description, @system_prompt, @profile, @enabled, @is_builtin)`,
       )
       .run({
         trigger,
-        name: "Default (fix workflow)",
-        description: `The built-in /${trigger} command — loads the noodle-default + noodle-fix skills and runs the fix workflow. Non-deletable.`,
+        description,
         system_prompt: systemPrompt,
         profile: null,
         enabled: 1,
@@ -227,40 +272,84 @@ export class CommandStore {
 
 /**
  * Normalise a raw trigger (as typed by a user) into storage form: lowercase,
- * strip leading slashes, trim, collapse internal whitespace to hyphens.
- * Returns the empty string if the input has no usable content.
+ * strip leading AND trailing slashes, trim, collapse internal whitespace to
+ * hyphens. Returns the empty string if the input has no usable content.
  *
- *   normalizeTrigger("Question")   → "question"
- *   normalizeTrigger("/Question")  → "question"
- *   normalizeTrigger("  review ")  → "review"
- *   normalizeTrigger("//question") → "question"
+ *   normalizeTrigger("Question")    → "question"
+ *   normalizeTrigger("/Question")   → "question"
+ *   normalizeTrigger("  review ")   → "review"
+ *   normalizeTrigger("//question")  → "question"
+ *   normalizeTrigger("question//")  → "question"
  */
 export function normalizeTrigger(raw: string): string {
   return raw
     .trim()
     .toLowerCase()
     .replace(/^\/+/, "")
+    .replace(/\/+$/, "")
     .trim();
 }
 
 /**
- * Ensure the built-in `/<agent>` command exists. Called once at boot. If a
- * built-in row is already present, its trigger + system_prompt are refreshed
- * in place (so an agent-name change or a prompt-text update propagates without
- * leaving a stale row). If no built-in exists, one is seeded.
+ * Ensure the three built-in commands exist: `/<agent>` (general-purpose),
+ * `/<agent>-fix` (fix workflow), and `/<agent>-review` (code review). Called
+ * once at boot.
  *
- * The built-in is the default fix workflow: its `system_prompt` is the exact
- * framing `buildPrompt` used before commands existed, so a `/noodle` run is
- * byte-identical to the pre-commands behaviour.
+ * On initial seed (no built-in with that trigger yet): inserts with the
+ * default prompt, description, and enabled=1.
+ *
+ * On subsequent boots (row already exists): preserves the operator's
+ * system_prompt, description, and profile edits — only the trigger is
+ * refreshed (for agent-name renames, though agent_name is now fixed to
+ * "Noodle") and the command is forced enabled=1 so built-ins are always
+ * available as the documentation contract states.
+ *
+ * Stale built-ins whose triggers no longer match expected ones (e.g. an
+ * agent rename left behind old "noodle"-prefixed triggers) are cleaned up.
  */
 export function seedBuiltinCommand(store: CommandStore, agentName: string): void {
-  const trigger = slugify(agentName);
-  const prompt = defaultCommandPrompt(agentName);
-  const existing = store.list().find((c) => c.is_builtin === 1);
-  if (existing) {
-    // Refresh trigger (agent may have been renamed) + prompt text in place.
-    store.update(existing.id, { trigger, system_prompt: prompt });
-    return;
+  const base = slugify(agentName);
+  const specs = [
+    {
+      trigger: base,
+      prompt: defaultCommandPrompt(agentName),
+      description: `The built-in /${base} command — loads the noodle-default skill. Non-deletable.`,
+    },
+    {
+      trigger: `${base}-fix`,
+      prompt: fixCommandPrompt(agentName),
+      description: `The built-in /${base}-fix command — loads noodle-default + noodle-fix skills and runs the fix workflow. Non-deletable.`,
+    },
+    {
+      trigger: `${base}-review`,
+      prompt: reviewCommandPrompt(agentName),
+      description: `The built-in /${base}-review command — loads noodle-default + noodle-review skills and runs the code review workflow. Non-deletable.`,
+    },
+  ];
+  // Remove stale built-ins whose triggers no longer match (e.g. agent renamed
+  // from "Noodle" to "MyBot" — old "noodle"/"noodle-fix"/"noodle-review" rows
+  // must be replaced by "mybot"/"mybot-fix"/"mybot-review").
+  const expectedTriggers = new Set(specs.map((s) => s.trigger));
+  for (const row of store.list().filter((c) => c.is_builtin === 1)) {
+    if (!expectedTriggers.has(row.trigger)) {
+      store.forceDelete(row.id);
+    }
   }
-  store.upsertBuiltin(trigger, prompt);
+  for (const spec of specs) {
+    const existing = store.getByTrigger(spec.trigger);
+    if (existing) {
+      // Already exists — preserve the operator's prompt/description edits.
+      // Only ensure the trigger stays current and the command is enabled.
+      // Built-ins are documented as "always available", so force enabled=1.
+      if (!existing.enabled || existing.trigger !== spec.trigger) {
+        store.update(existing.id, {
+          trigger: spec.trigger,
+          enabled: 1,
+        });
+      }
+    } else {
+      // First-time seed — insert with the full defaults.
+      store.upsertBuiltin(spec.trigger, spec.prompt, spec.description);
+    }
+  }
 }

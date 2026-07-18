@@ -2,8 +2,15 @@
  * Thin fetch wrapper for the Noodle JSON API.
  *
  * All calls send credentials: "same-origin" so the signed auth cookie travels.
- * A 401 anywhere means the session expired — the caller rejects with
- * `UnauthorizedError` and the auth composable bounces the user to /login.
+ * A 401 anywhere means the session expired — `parseBody` fires the registered
+ * onUnauthorized callback (which flips the auth state and redirects to /login),
+ * then throws `UnauthorizedError` so the caller's catch block can short-circuit.
+ *
+ * The callback is registered from composables/useAuth.ts (which can't be
+ * imported here directly — circular dependency). This keeps the redirect logic
+ * centralized: every API call — whether from onMounted, a click handler, or a
+ * watcher — triggers the login redirect on 401 without each view needing to
+ * detect UnauthorizedError individually.
  *
  * Body handling note: the production server (a shared webhook app) parses
  * application/json as a RAW string for HMAC verification, so req.body can
@@ -28,6 +35,32 @@ export class ApiRequestError extends Error {
   }
 }
 
+/**
+ * Check if an error is an auth failure (401). Views use this in catch blocks
+ * to silently bail instead of showing a misleading error message — the global
+ * 401 handler already redirects to /login.
+ *
+ *   } catch (e) {
+ *     if (isAuthError(e)) return;
+ *     loadError.value = e instanceof ApiRequestError ? e.message : "Could not load.";
+ *   }
+ */
+export function isAuthError(e: unknown): boolean {
+  return e instanceof UnauthorizedError || (e instanceof Error && e.name === "UnauthorizedError");
+}
+
+/**
+ * Callback fired when any API call receives a 401. Registered by useAuth.ts at
+ * app startup. Triggers the login redirect so the user never stays on a page
+ * with an expired session.
+ */
+let onUnauthorized: (() => void) | null = null;
+
+/** Register the global 401 handler. Called once from useAuth.ts. */
+export function setUnauthorizedHandler(fn: () => void): void {
+  onUnauthorized = fn;
+}
+
 /** GET a JSON endpoint, throwing UnauthorizedError on 401. */
 export async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(path, { credentials: "same-origin" });
@@ -50,7 +83,12 @@ export async function sendJson<T>(
 }
 
 async function parseBody<T>(res: Response): Promise<T> {
-  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 401) {
+    // Fire the global handler so the auth state flips + redirect happens,
+    // no matter where this fetch was called from (onMounted, click handler, etc).
+    onUnauthorized?.();
+    throw new UnauthorizedError();
+  }
   if (!res.ok) {
     let message = `request failed (${res.status})`;
     try {

@@ -329,12 +329,13 @@ profiles:
 ```
 
 `api` selects the wire protocol — `openai-completions` covers Ollama/vLLM/
-LM Studio/DeepSeek/Cerebras and anything OpenAI-compatible; `anthropic-messages`
-covers Anthropic-protocol proxies/gateways; the schema also accepts
-`openai-responses`, `azure-openai-responses`, `google-generative-ai`,
-`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream` for
-rarer shapes. Built-in providers (anthropic, openai, openrouter, …) are
-resolved by name and need neither `api` nor `base_url` — only custom endpoints do.
+LM Studio/DeepSeek/Cerebras/NVIDIA NIM and anything OpenAI-compatible;
+`openai-responses` covers OpenAI's own Responses API (api.openai.com);
+`anthropic-messages` covers Anthropic-protocol proxies/gateways;
+`google-generative-ai` covers Google/Gemini endpoints; and
+`mistral-conversations` covers Mistral. Built-in providers (anthropic, openai,
+openrouter, …) are resolved by name and need neither `api` nor `base_url` —
+only custom endpoints do.
 
 pi-ai has a built-in price table for the built-in providers; the `*_price`
 fields are only used for custom endpoints, where pi would otherwise report

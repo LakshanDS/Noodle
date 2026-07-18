@@ -32,9 +32,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        // Matches the port in noodle.config.yaml (server.port). Override with
-        // NOODLE_DEV_PROXY if you serve on a different port.
-        target: process.env.NOODLE_DEV_PROXY ?? "http://localhost:4444",
+        // Matches the server's default port (ServerConfigSchema, 3000). Override
+        // with NOODLE_DEV_PROXY if you serve on a different port.
+        target: process.env.NOODLE_DEV_PROXY ?? "http://localhost:3000",
         changeOrigin: true,
       },
     },

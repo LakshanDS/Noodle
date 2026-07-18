@@ -9,7 +9,7 @@ import {
   type RunStats,
 } from "../src/engine/run.js";
 
-const profile = { name: "claude", provider: "anthropic", model: "claude-sonnet-4-20250514" };
+const profile = { name: "claude", model: "claude-sonnet-4-20250514" };
 const changedFiles = ["src/auth.ts", "tests/auth.test.ts"];
 const agentMessage =
   "Yes, the project has a dashboard. It lives at `/jasladmin/dashboard`, " +
@@ -44,7 +44,7 @@ describe("buildFooter", () => {
 
   it("includes profile + model on the Profile line", () => {
     const f = buildFooter(profile, "Noodle-Agent", stats);
-    expect(f).toContain("Profile: claude (`anthropic/claude-sonnet-4-20250514`)");
+    expect(f).toContain("Profile: claude (`claude-sonnet-4-20250514`)");
   });
 
   it("includes duration, tool calls, and turns on the Cooked-for line", () => {
@@ -147,7 +147,7 @@ describe("buildIssueComment", () => {
     const c = buildIssueComment(profile, agentMessage, "Noodle", stats);
     expect(c.startsWith(agentMessage)).toBe(true);
     expect(c).toContain("**Noodle-Agent**");
-    expect(c).toContain("anthropic/claude-sonnet-4-20250514");
+    expect(c).toContain("claude-sonnet-4-20250514");
     expect(c).toContain("4m 12s");
     // no PR link — shown in the issue timeline, not the footer
     expect(c).not.toContain("PR #");
@@ -229,14 +229,16 @@ describe("labelsFor (failed label)", () => {
   it("includes a red 'got Cooked' label for errored runs", () => {
     const labels = labelsFor("Noodle");
     expect(labels.failed.name).toBe("Noodle got Cooked");
-    expect(labels.failed.color).toBe("b91c1c");
+    expect(labels.failed.color).toBe("c76b6b");
     expect(labels.failed.description).toMatch(/errored/i);
   });
 
-  it("uses the configurable agent name in the failed label", () => {
+  it("uses the hardcoded Noodle name in the failed label", () => {
+    // agent_name is hardcoded to "Noodle" now (the setting was removed); the
+    // arg is accepted for back-compat but ignored.
     const labels = labelsFor("MyBot");
-    expect(labels.failed.name).toBe("MyBot got Cooked");
-    expect(labels.failed.description).toContain("MyBot");
+    expect(labels.failed.name).toBe("Noodle got Cooked");
+    expect(labels.failed.description).toContain("Noodle");
   });
 
   it("keeps the three labels distinct", () => {

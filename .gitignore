@@ -6,6 +6,9 @@ sessions/
 .env
 .env.local
 noodle.config.yaml
+noodle.db
+noodle.db-shm
+noodle.db-wal
 tmp/
 .cache/
 .DS_Store

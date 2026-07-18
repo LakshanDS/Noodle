@@ -23,6 +23,7 @@ export function resolveProfile(
     const p = config.profiles[name];
     if (!p) {
       // fall back rather than crash if a configured profile vanished
+      if (!effectiveDefault) throw new Error(`No profile "${name}" and no default_profile configured`);
       const fallback = config.profiles[effectiveDefault];
       if (!fallback) throw new Error(`No profile "${name}" and no valid default "${effectiveDefault}"`);
       return { name: effectiveDefault, ...fallback };
@@ -58,6 +59,9 @@ export function resolveProfile(
   }
 
   // 4. default.
+  if (!effectiveDefault) {
+    throw new Error("No routing rule matched and no default_profile is configured.");
+  }
   return pick(effectiveDefault);
 }
 

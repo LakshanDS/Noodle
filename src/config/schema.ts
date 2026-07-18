@@ -22,10 +22,12 @@ export const ThinkingLevel = z.enum([
 
 /**
  * The wire protocol a custom endpoint speaks. Pick by what the endpoint mimics:
- * - openai-completions: Ollama, vLLM, LM Studio, DeepSeek, Cerebras, any OpenAI-compatible API
+ * - openai-completions: Ollama, vLLM, LM Studio, DeepSeek, Cerebras, NVIDIA NIM,
+ *   any OpenAI-compatible API (the common catch-all case)
+ * - openai-responses: OpenAI's own Responses API (api.openai.com)
  * - anthropic-messages: Anthropic-format proxies/gateways (e.g. Cloudflare, Fireworks)
- * - openai-responses / azure-openai-responses: OpenAI/Azure Responses API
- * - google-generative-ai / google-vertex / mistral-conversations / bedrock-converse-stream: rarer
+ * - google-generative-ai: Google Generative AI / Gemini endpoints
+ * - mistral-conversations: Mistral's conversation API
  *
  * Built-in providers (anthropic, openai, openrouter, ...) are resolved by name
  * and need no `api`/`base_url` — only set these for custom endpoints.
@@ -33,26 +35,20 @@ export const ThinkingLevel = z.enum([
 export const Api = z.enum([
   "openai-completions",
   "openai-responses",
-  "azure-openai-responses",
   "anthropic-messages",
   "google-generative-ai",
-  "google-vertex",
   "mistral-conversations",
-  "bedrock-converse-stream",
 ]);
-
-export const ProviderName = z.string().min(1); // pi supports many; validated at resolve time
 
 /** A named agent profile pinned to one model + tool set. */
 export const ProfileSchema = z.object({
-  provider: ProviderName,
   model: z.string().min(1),
-  /** Custom endpoint. When set with `api`, the profile is treated as a custom provider. */
-  base_url: z.string().url().optional(),
-  /** Wire protocol the custom endpoint speaks (required when base_url is set). */
-  api: Api.optional(),
-  /** Env var holding the endpoint's API key. Defaults to no auth (e.g. local Ollama). */
-  api_key_env: z.string().optional(),
+  /** Endpoint URL every profile speaks (always required — all profiles are custom endpoints). */
+  base_url: z.string().url(),
+  /** Wire protocol the endpoint speaks. */
+  api: Api,
+  /** The API key for this endpoint. Empty string = no-auth (e.g. local Ollama). */
+  api_key: z.string().default(""),
   /** Model metadata for custom endpoints (pi needs context window etc.). */
   context_window: z.number().int().positive().optional(),
   max_tokens: z.number().int().positive().optional(),
@@ -82,7 +78,6 @@ export const ProfileSchema = z.object({
   reasoning: z.boolean().default(false),
   thinking_level: ThinkingLevel.default("medium"),
   tools: z.array(z.string()).default([...BUILTIN_TOOLS]),
-  system_prompt_file: z.string().optional(),
   /**
    * Max LLM requests per minute for this profile. Noodle installs a pre-request
    * throttle (via pi's `before_provider_request` extension hook) that sleeps to
@@ -108,16 +103,21 @@ export const ProfileSchema = z.object({
    */
   retry_base_delay_ms: z.number().int().min(0).default(3000),
   /**
-   * Max jobs of this profile that may run at the same time. Optional — when
-   * unset, the profile is limited only by the global `queue.concurrency`.
-   *
-   * Set this when profiles use separate API keys (e.g. one NVIDIA key per
-   * profile) so they can run in parallel up to each key's budget, while still
-   * preventing N jobs of the same profile from splitting a single key's rate
-   * limit. The global `queue.concurrency` stays the hard total ceiling across
-   * ALL profiles.
+   * Max jobs of this profile that may run at the same time. Defaults to 1 — a
+   * profile runs one job at a time unless this is raised. The dispatcher's
+   * `claimNext` skips a queued job whose profile is already at its cap, so this
+   * is the ONLY concurrency control: there's no global pool size. Profiles on
+   * separate API keys can each run up to their own cap in parallel.
    */
-  max_concurrent: z.number().int().min(1).optional(),
+  max_concurrent: z.number().int().min(1).default(1),
+  /**
+   * Route this profile's API requests through the relay server for rate
+   * limiting. When true, the relay sleeps to enforce the `api_rpm` interval
+   * before forwarding — so the in-process throttle is skipped (the relay
+   * handles it). When false (default), requests go direct to the provider
+   * and the in-process throttle enforces `api_rpm`.
+   */
+  use_relay: z.boolean().default(false),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
 
@@ -165,20 +165,6 @@ export const SchedulerConfigSchema = z.object({
 export type SchedulerConfig = z.infer<typeof SchedulerConfigSchema>;
 
 /**
- * API relay server settings. When enabled, the relay provides a centralized
- * rate-limiting layer that multiple agents (Noodle, OpenCode CLI, etc.) can
- * share. Agents point their base_url to the relay instead of the real API.
- */
-export const RelayConfigSchema = z.object({
-  enabled: z.boolean().default(false),
-  /** Port the relay listens on. */
-  port: z.number().int().positive().max(65535).default(4445),
-  /** Host the relay binds to. */
-  host: z.string().default("0.0.0.0"),
-});
-export type RelayConfig = z.infer<typeof RelayConfigSchema>;
-
-/**
  * Per-run controls. The stall watcher aborts a run that has emitted no agent
  * activity (tool calls, turns, messages, tool output, compactions) for N
  * minutes — a strong signal of a hang (dropped socket, deadlock) that a
@@ -206,14 +192,13 @@ export const RunConfigSchema = z.object({
 export type RunConfig = z.infer<typeof RunConfigSchema>;
 
 /**
- * Job-queue behavior: how many jobs run at once, and how failed jobs are
- * retried. The worker pool shares one SQLite queue; `concurrency` is the number
- * of workers pulling from it. Raise carefully on a small VPS — each concurrent
- * agent run holds a workspace + a pi session in memory. Defaults are safe.
+ * Job-queue retry behavior. How many jobs run at once is controlled entirely by
+ * each profile's `max_concurrent` cap (default 1) — the dispatcher's
+ * `claimNext` skips a job whose profile is at its cap, so there's no global
+ * pool size here. Each concurrent agent run holds a workspace + a pi session in
+ * memory, so raise a profile's cap only with headroom.
  */
 export const QueueConfigSchema = z.object({
-  /** Max jobs running at once. */
-  concurrency: z.number().int().min(1).default(1),
   /** Total attempts per job (1 = no retry). */
   max_attempts: z.number().int().min(1).default(3),
   /** Base backoff seconds; doubles each attempt, capped at 10 min. */
@@ -252,8 +237,10 @@ export type TriggersConfig = z.infer<typeof TriggersConfigSchema>;
 export const NoodleConfigSchema = z.object({
   /** Display name used in issue labels, comments, PR bodies, branch names, etc. */
   agent_name: z.string().min(1).default("Noodle"),
-  default_profile: z.string().min(1),
-  profiles: z.record(z.string(), ProfileSchema),
+  /** The fallback profile when no routing rule matches. Loaded from the DB at boot. */
+  default_profile: z.string().min(1).optional(),
+  /** Profiles are loaded from the DB at boot; YAML profiles are not supported. */
+  profiles: z.record(z.string(), ProfileSchema).default({}),
   routing: z.array(RoutingRuleSchema).nullish().transform((v) => v ?? []),
   repos: z.record(z.string(), RepoOverrideSchema).nullish().transform((v) => v ?? {}),
   server: ServerConfigSchema.nullish().transform((v) => v ?? { host: "0.0.0.0", port: 3000 }),
@@ -265,7 +252,6 @@ export const NoodleConfigSchema = z.object({
   }),
   run: RunConfigSchema.nullish().transform((v) => v ?? { stall_timeout_minutes: 15, tool_stall_minutes: 60 }),
   queue: QueueConfigSchema.nullish().transform((v) => v ?? {
-    concurrency: 1,
     max_attempts: 3,
     retry_backoff_seconds: 60,
   }),
@@ -279,12 +265,6 @@ export const NoodleConfigSchema = z.object({
     trigger_keywords: [],
     trigger_on_open: false,
   }),
-  /**
-   * API relay server. When enabled, provides centralized rate limiting for
-   * multiple agents sharing the same API keys. Agents point their base_url
-   * to the relay (e.g. http://localhost:4445/v1) instead of the real API.
-   */
-  relay: RelayConfigSchema.nullish().transform((v) => v ?? { enabled: false, port: 4445, host: "0.0.0.0" }),
 });
 export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;
 
@@ -292,12 +272,19 @@ export type NoodleConfig = z.infer<typeof NoodleConfigSchema>;
  * Validate cross-references that zod can't express: every routing rule's
  * `profile` and the top-level `default_profile` must name a real profile.
  * Returns a list of human-readable error strings (empty = valid).
+ *
+ * When profiles is empty (profiles are loaded from the DB at boot, not from
+ * the YAML), cross-references can't be checked yet — returns no errors. The
+ * post-merge step in serve.ts handles validation once DB profiles are loaded.
  */
 export function crossValidate(config: NoodleConfig): string[] {
   const errors: string[] = [];
   const names = new Set(Object.keys(config.profiles));
 
-  if (!names.has(config.default_profile)) {
+  // Profiles come from the DB — skip cross-reference checks when empty.
+  if (names.size === 0) return errors;
+
+  if (config.default_profile && !names.has(config.default_profile)) {
     errors.push(
       `default_profile "${config.default_profile}" is not defined in profiles`,
     );
@@ -321,31 +308,17 @@ export function crossValidate(config: NoodleConfig): string[] {
     }
   }
 
-  // Custom-endpoint profiles need both base_url and api together.
-  for (const [name, p] of Object.entries(config.profiles)) {
-    if (p.base_url && !p.api) {
-      errors.push(`profiles.${name}: "api" is required when "base_url" is set (custom endpoint)`);
-    }
-    if (p.api && !p.base_url) {
-      errors.push(`profiles.${name}: "base_url" is required when "api" is set (custom endpoint)`);
-    }
-  }
-
+  // base_url + api are both required (enforced by Zod). No pairing check needed.
   for (const [repo, override] of Object.entries(config.repos)) {
     if (override.default_profile && !names.has(override.default_profile)) {
       errors.push(`repos.${repo}.default_profile "${override.default_profile}" is not defined`);
     }
   }
 
-  // Scheduler: when enabled, it must have at least one repo to watch.
-  if (config.scheduler.enabled && config.scheduler.repos.length === 0) {
-    errors.push(`scheduler: "repos" must list at least one repo when scheduler.enabled is true`);
-  }
-  for (const [i, repo] of config.scheduler.repos.entries()) {
-    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
-      errors.push(`scheduler.repos[${i}]: "${repo}" is not a valid "owner/name"`);
-    }
-  }
+  // NOTE: the repo-scan scheduler was removed (cron + webhooks + manual runs
+  // cover all trigger paths now). The `scheduler` config block is still parsed
+  // for back-compat so existing YAML configs don't crash on load, but it's no
+  // longer validated or consumed — nothing boots from it.
 
   return errors;
 }

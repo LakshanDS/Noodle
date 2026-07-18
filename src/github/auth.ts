@@ -9,17 +9,16 @@ import { Octokit } from "octokit";
 const GH_API_VERSION = "2022-11-28";
 
 /**
- * Phase 1 auth: a classic Personal Access Token (GITHUB_TOKEN env).
- * Phase 2 will add GitHub-App installation tokens (see PLAN.md §2.1).
+ * Create an Octokit instance authenticated with a PAT. The token is passed
+ * explicitly — callers read it from the settings DB (no env-var fallback).
  */
-export function createOctokit(token?: string): Octokit {
-  const tok = token ?? process.env.GITHUB_TOKEN;
-  if (!tok) {
+export function createOctokit(token: string): Octokit {
+  if (!token) {
     throw new Error(
-      "GITHUB_TOKEN is not set. Create a PAT with repo (or fine-grained contents/pull-requests/issues) scope.",
+      "No GitHub token. Set GITHUB_TOKEN in the Settings page.",
     );
   }
-  return new Octokit({ auth: tok, previews: [], request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } });
+  return new Octokit({ auth: token, previews: [], request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } });
 }
 
 /** Split "owner/name" into [owner, name]. Throws on malformed input. */

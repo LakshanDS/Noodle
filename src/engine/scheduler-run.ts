@@ -6,13 +6,15 @@ import { log, runLogger } from "../util/log.js";
 import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
-import { buildCronPrompt } from "./prompt.js";
+import { buildSchedulerPrompt } from "./prompt.js";
+import { expandTags } from "./tags.js";
 import { generateIssueTitle, templateTitle } from "./title.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
 import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
+import { defaultLabelSet, parseLabelSet, labelDescription, type LabelSet } from "./labels.js";
 import {
   AuthStorage,
   ModelRegistry,
@@ -62,7 +64,7 @@ function sleep(ms: number): Promise<void> {
  * no source issue — the agent works a freeform prompt and its final message is
  * turned into a NEW issue by Noodle after the run.
  */
-export interface CronRunInput {
+export interface SchedulerRunInput {
   /** "owner/name" */
   repo: string;
   /** Freeform task prompt (e.g. "find bugs and open issues"). */
@@ -94,15 +96,24 @@ export interface CronRunInput {
  * The branch is reused across runs when it exists on the remote — a daily cron
  * stacks onto yesterday's branch, giving a running timeline of the sweep.
  */
-export async function runCronJob(
+export async function runSchedulerJob(
   config: NoodleConfig,
   gh: GitHubClient,
-  input: CronRunInput,
+  input: SchedulerRunInput,
   deps?: {
     authStorage?: AuthStorageInstance;
     runStore?: RunStore;
     createAgentSessionFn?: typeof createAgentSession;
     tokenProvider?: () => Promise<string>;
+    /** Custom system prompt text from the settings DB (same as runJob). */
+    systemPrompt?: string;
+    /**
+     * Custom label-set override for this cron (JSON string from the cron row's
+     * `labels` field). When null/absent, the global Settings labels apply. The
+     * cooked (success) / failed (error) entry is applied to the output issue so
+     * cron results get the same color-coded status filtering as regular runs.
+     */
+    labelOverrides?: string | null;
   },
 ): Promise<RunResult> {
   const jobId = input.jobId ?? `cron-${input.repo.replace("/", "-")}`;
@@ -116,7 +127,7 @@ export async function runCronJob(
   });
   log.info("═══════════════════════════════════════════════════════════════");
   log.info(
-    `cron run started — repo=${input.repo} | branch=${branchName} | jobId=${jobId} | pid=${process.pid}`,
+    `scheduler run started — repo=${input.repo} | branch=${branchName} | jobId=${jobId} | pid=${process.pid}`,
   );
 
   const runStore = deps?.runStore;
@@ -131,20 +142,23 @@ export async function runCronJob(
 
   // 1. Resolve profile: explicit cron profile, else the config default.
   const profileName = input.profile ?? config.default_profile;
+  if (!profileName) {
+    throw new Error("No profile specified and no default_profile is configured.");
+  }
   const profileDef = config.profiles[profileName];
   if (!profileDef) {
     throw new Error(
-      `Cron profile "${profileName}" is not defined in profiles (default_profile: ${config.default_profile}).`,
+      `Cron profile "${profileName}" is not defined in profiles (default_profile: ${config.default_profile ?? "(none)"}).`,
     );
   }
-  const profile = { name: profileName, ...profileDef };
+  const profile = { name: profileName, provider: profileName, ...profileDef };
   log_.info({ profile: profile.name, model: profile.model }, "routed profile");
 
   // 2. Resolve model via the registry (same as runJob).
   const authStorage = deps?.authStorage ?? AuthStorage.create();
   const modelRegistry = ModelRegistry.create(authStorage);
   const providerKeyMap = registerCustomProviders(config, modelRegistry);
-  const providerKey = providerKeyMap.get(profile.name) ?? profile.provider;
+  const providerKey = providerKeyMap.get(profile.name) ?? profile.name;
   let model: Model<Api> | undefined;
   try {
     model = modelRegistry.find(providerKey, profile.model);
@@ -159,7 +173,7 @@ export async function runCronJob(
   }
 
   // 3. Clone.
-  const tokenProvider = deps?.tokenProvider ?? (async () => input.token ?? process.env.GITHUB_TOKEN ?? "");
+  const tokenProvider = deps?.tokenProvider ?? (async () => input.token ?? "");
   const freshToken = async () => {
     const t = await tokenProvider();
     if (!t) {
@@ -182,8 +196,20 @@ export async function runCronJob(
 
     // 5. Build prompt + resource loader.
     const sysFacts = collectSysFacts();
-    log_.debug({ sysFacts }, "probed system info for cron prompt");
-    const prompt = buildCronPrompt(input.prompt, input.repo, config.agent_name, buildSysInfoGuidance(sysFacts));
+    log_.debug({ sysFacts }, "probed system info for scheduler prompt");
+
+    // Expand the custom system prompt's template tags, then prepend to sysInfo.
+    const sysInfo = buildSysInfoGuidance(sysFacts);
+    let fullSysInfo = sysInfo;
+    if (deps?.systemPrompt) {
+      try {
+        const expanded = await expandTags(deps.systemPrompt, { sysFacts, gh, repo: input.repo });
+        if (expanded.trim()) fullSysInfo = `${expanded}\n\n---\n\n${sysInfo}`;
+      } catch (e) {
+        log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using sysInfo only");
+      }
+    }
+    const prompt = buildSchedulerPrompt(input.prompt, input.repo, config.agent_name, fullSysInfo);
     const throttle = throttleForRpm(profile.api_rpm);
     // pi retry settings tuned from the profile config so 429 retries don't cascade.
     const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
@@ -192,7 +218,7 @@ export async function runCronJob(
       agentDir: join(ws.path, ".noodle-agent"),
       settingsManager,
       ...(throttle
-        ? { extensionFactories: [throttleExtensionFactory(throttle, `${profile.provider}/${profile.model}`)] }
+        ? { extensionFactories: [throttleExtensionFactory(throttle, `${profile.name}/${profile.model}`)] }
         : {}),
     });
     await loader.reload();
@@ -232,7 +258,7 @@ export async function runCronJob(
       return { session, sessionManager, watcher, unsubStall };
     };
 
-    log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" }, "starting cron run");
+    log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" }, "starting scheduler run");
     const startedAt = Date.now();
 
     // First attempt: fresh session.
@@ -334,10 +360,10 @@ export async function runCronJob(
       };
       log_.info(
         { durationMs, tokens: runStats.tokens?.total, cost: runStats.cost, toolCalls: runStats.toolCalls, turns: runStats.turns },
-        "cron run stats",
+        "scheduler run stats",
       );
       await session.dispose?.();
-      log_.info("cron run finished");
+      log_.info("scheduler run finished");
 
       const sessionPath = sessionManager.getSessionFile() ?? undefined;
       if (runStore && sessionPath) {
@@ -348,7 +374,7 @@ export async function runCronJob(
       const stopReason = lastAssistantStopReason(session);
       const errored = stopReason.stopReason === "error";
       if (errored) {
-        log_.error({ errorMessage: stopReason.errorMessage, stopReason: stopReason.stopReason }, "cron run ended on error");
+        log_.error({ errorMessage: stopReason.errorMessage, stopReason: stopReason.stopReason }, "scheduler run ended on error");
       } else {
         agentAnswer = extractLastAssistantText(session);
       }
@@ -360,7 +386,7 @@ export async function runCronJob(
       );
       if (committed) {
         await ws.push(branchName, cloneUrlFor(input.repo, await freshToken()), reused);
-        log_.info({ branch: branchName, reused }, "pushed cron branch");
+        log_.info({ branch: branchName, reused }, "pushed scheduler branch");
       }
 
       // Open the cron output issue: the agent's final message as the body, with
@@ -376,7 +402,7 @@ export async function runCronJob(
       // errored run uses the task as the title since there are no findings.
       const issueTitle = errored
         ? templateTitle(input.prompt)
-        : await generateIssueTitle(agentAnswer ?? "", input.prompt, config, profile);
+        : await generateIssueTitle(agentAnswer ?? "", input.prompt, profile);
       // Ensure the cron-issue label exists with the brand teal color so cron
       // output issues are visually identifiable in a triage list. Idempotent.
       const cronLabel = `${config.agent_name}-Issue`;
@@ -386,8 +412,16 @@ export async function runCronJob(
         CRON_LABEL_COLOR,
         `${config.agent_name}-Agent scheduled job result`,
       );
-      const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [cronLabel]);
-      log_.info({ issue: issue.number, url: issue.html_url, errored }, "opened cron output issue");
+      // Also apply the outcome status label (cooked on success, failed on error)
+      // from this cron's label override or the global default, so cron issues
+      // get the same color-coded status filtering as regular runs. The issue is
+      // created post-run, so the "cooking" (in-progress) label never applies.
+      const labelSet: LabelSet = parseLabelSet(deps?.labelOverrides ?? null) ?? defaultLabelSet();
+      const outcomeStage = errored ? "failed" : "cooked";
+      const outcome = labelSet[outcomeStage];
+      await gh.ensureLabel(input.repo, outcome.name, outcome.color, labelDescription(outcomeStage));
+      const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [cronLabel, outcome.name]);
+      log_.info({ issue: issue.number, url: issue.html_url, errored }, "opened scheduler output issue");
 
       if (runStore) {
         runStore.updateRun(jobId, {
@@ -453,12 +487,12 @@ async function tryReuseBranch(
     throw e;
   }
   await ws.checkoutOrReuse(name, freshCloneUrl);
-  log_.debug({ branch: name }, "reused existing remote cron branch");
+  log_.debug({ branch: name }, "reused existing remote scheduler branch");
   return true;
 }
 
 /**
- * Mirror pi agent events into the cron run log — same minimal shape as runJob's
+ * Mirror pi agent events into the scheduler run log — same minimal shape as runJob's
  * subscriber (one line per notable event; full detail lives in the session file).
  * Duplicated from run.ts because that subscriber is a private function there;
  * keeping a cron-specific copy avoids coupling the two run paths and lets cron

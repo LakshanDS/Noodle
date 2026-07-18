@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Noodle deploy: pull latest image, recreate the container, clean up.
 #
-# Run from the same directory as docker-compose.yml (i.e. where .env lives):
+# Run from the same directory as docker-compose.yml:
 #   ./deploy.sh
 #
 # The CI workflow scp's a fresh docker-compose.yml into this directory before

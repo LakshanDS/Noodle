@@ -1,16 +1,15 @@
 <script setup lang="ts">
 /**
  * Root shell. Two responsibilities:
- *   1. Render <RouterView/> — all routing is hash-based (see router.ts).
- *   2. Guard navigation: until auth is probed, show nothing; if not logged in
- *      and on any route other than /login (or /setup, a future first-run
- *      exception), bounce to /login. On a 401 mid-session, the auth composable
- *      flips loggedIn and this guard catches it.
+ *   1. Render <RouterView/> — routing + navigation guard live in router.ts.
+ *   2. Watch auth state: when a session expires mid-use (loggedIn flips to
+ *      false), redirect to /login. The initial-route redirect is handled by
+ *      the beforeEach guard in router.ts (registered before the initial
+ *      navigation, unlike a guard added in setup()).
  */
 import { computed, watch } from "vue";
 import { useRouter } from "vue-router";
-import { useAuth, markLoggedOut } from "./composables/useAuth.js";
-import { UnauthorizedError } from "./api/client.js";
+import { useAuth } from "./composables/useAuth.js";
 
 const router = useRouter();
 const { state } = useAuth();
@@ -30,26 +29,6 @@ watch(
     }
   },
 );
-
-// Navigation guard: require login for everything except /login and /setup.
-router.beforeEach((to) => {
-  if (state.known !== true) return true; // still probing — allow through; the shell guards render
-  const publicRoutes = new Set(["login", "setup"]);
-  if (!publicRoutes.has(String(to.name)) && !state.loggedIn) {
-    return { name: "login" };
-  }
-  // If already logged in and somehow on /login, go to runs.
-  if (to.name === "login" && state.loggedIn) {
-    return { name: "runs" };
-  }
-  return true;
-});
-
-// Surface UnauthorizedError from async view setup. Views call into the API
-// directly and may reject; re-derive loggedIn from the error type here.
-router.onError((err) => {
-  if (err instanceof UnauthorizedError) markLoggedOut();
-});
 </script>
 
 <template>
