@@ -49,11 +49,10 @@ COPY skills/ skills/
 # source public/ dir.
 COPY --from=client-builder /public/ public/
 
-# Persistent volume mount for SQLite DB
+# Persistent volume mount for SQLite DB + logs
 RUN mkdir -p /data
 
 ENV NODE_ENV=production
-ENV NOODLE_CONFIG=/app/noodle.config.yaml
 
 EXPOSE 3000
 

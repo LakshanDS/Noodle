@@ -1,5 +1,7 @@
 import pino from "pino";
 import { Writable } from "node:stream";
+import { createWriteStream, mkdirSync, existsSync, statSync, renameSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 
 /**
  * Noodle's logger. Always pretty to stdout — simple human-readable lines:
@@ -66,6 +68,85 @@ export interface LogEntry {
  */
 const LOG_BUFFER_MAX = 1000;
 const logBuffer: LogEntry[] = [];
+
+// --- Persistent log file with rotation ---
+// Every log line is appended to <logDir>/noodle.log. When it exceeds
+// LOG_FILE_MAX_BYTES, the files rotate: .4→.5 (delete old .5), .3→.4, … .log→.1.
+// This keeps up to LOG_FILE_COUNT rotated files alongside the active one.
+const LOG_FILE_NAME = "noodle.log";
+const LOG_FILE_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const LOG_FILE_COUNT = 5;
+
+let fileStream: ReturnType<typeof createWriteStream> | null = null;
+let fileDir: string | null = null;
+let fileBytes = 0;
+
+/**
+ * Open the persistent log file for appending. Creates the directory if missing.
+ * Called from serve.ts after config resolution, before the server starts.
+ * If the directory can't be created (read-only filesystem, permissions), file
+ * logging is silently skipped — stdout + the ring buffer still work.
+ */
+export function initLogFile(logDir: string): void {
+  try {
+    mkdirSync(logDir, { recursive: true });
+    const logPath = join(logDir, LOG_FILE_NAME);
+    // Track current size so we know when to rotate without a stat() per line.
+    fileBytes = existsSync(logPath) ? statSync(logPath).size : 0;
+    fileStream = createWriteStream(logPath, { flags: "a" });
+    fileDir = logDir;
+  } catch {
+    // Non-fatal: stdout + ring buffer still work.
+    fileStream = null;
+    fileDir = null;
+  }
+}
+
+/** Close the file stream (on graceful shutdown). */
+export function closeLogFile(): void {
+  if (fileStream) {
+    fileStream.end();
+    fileStream = null;
+  }
+}
+
+/** Strip ANSI escape codes so the file stays clean text. */
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/** Rotate the log files: shift .1→.2, .2→.3, … delete old .(count), rename active→.1. */
+function rotateFiles(): void {
+  if (!fileDir) return;
+  // Delete the oldest rotated file.
+  const oldest = join(fileDir, `${LOG_FILE_NAME}.${LOG_FILE_COUNT}`);
+  try { if (existsSync(oldest)) unlinkSync(oldest); } catch { /* ignore */ }
+  // Shift each rotated file up by one (.4→.5, .3→.4, … .1→.2), oldest first.
+  for (let i = LOG_FILE_COUNT - 1; i >= 1; i--) {
+    const from = join(fileDir, `${LOG_FILE_NAME}.${i}`);
+    const to = join(fileDir, `${LOG_FILE_NAME}.${i + 1}`);
+    try { if (existsSync(from)) renameSync(from, to); } catch { /* ignore */ }
+  }
+  // Rename the active file to .1.
+  try {
+    renameSync(join(fileDir, LOG_FILE_NAME), join(fileDir, `${LOG_FILE_NAME}.1`));
+  } catch { /* ignore */ }
+}
+
+/** Write a pretty-formatted line to the log file (if initialized). Handles rotation. */
+function writeToFile(pretty: string): void {
+  if (!fileStream || !fileDir) return;
+  const line = stripAnsi(pretty) + "\n";
+  fileStream.write(line);
+  fileBytes += Buffer.byteLength(line);
+  if (fileBytes >= LOG_FILE_MAX_BYTES) {
+    // Close current stream, rotate, open fresh.
+    fileStream.end();
+    rotateFiles();
+    fileBytes = 0;
+    fileStream = createWriteStream(join(fileDir, LOG_FILE_NAME), { flags: "a" });
+  }
+}
 
 /**
  * Snapshot the current ring buffer, oldest-first. The array is copied so callers
@@ -137,6 +218,8 @@ const prettyStdout = new Writable({
       out.push(pretty);
       // Tee into the ring buffer for the dashboard's System log tab.
       logBuffer.push(entry);
+      // Append to the persistent log file (with rotation).
+      writeToFile(pretty);
     }
     // Trim the buffer once for the whole batch (cheaper than per-line).
     if (logBuffer.length > LOG_BUFFER_MAX) {

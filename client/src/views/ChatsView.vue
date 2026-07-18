@@ -45,7 +45,7 @@ onMounted(load);
   <AppShell>
     <template #actions>
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        Refresh
+        <span class="btn-label">Refresh</span>
       </Button>
       <Button variant="primary" size="sm" icon="plus" @click="create">New chat</Button>
     </template>

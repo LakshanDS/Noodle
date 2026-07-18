@@ -70,20 +70,16 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
     }
 
     // 1. Rate-limit: sleep the fixed RPM interval (60000/rpm ms) so we never
-    //    exceed the provider's limit. Throws if the model isn't configured.
-    let apiKeyEnv: string;
+    //    exceed the provider's limit. Returns the API key for the model.
+    //    Throws if the model isn't configured.
+    let apiKey: string;
     try {
-      apiKeyEnv = await acquireSlot(profiles, model);
+      apiKey = await acquireSlot(profiles, model);
     } catch (e) {
       return reply.code(400).send({ error: (e as Error).message });
     }
 
-    // 2. Resolve API key + base URL.
-    const apiKey = process.env[apiKeyEnv];
-    if (!apiKey) {
-      log.error({ model, apiKeyEnv }, "relay: API key env var not set");
-      return reply.code(500).send({ error: `API key not configured (${apiKeyEnv})` });
-    }
+    // 2. Resolve base URL.
     const baseUrl = findProviderUrl(config, model, providerUrls);
     if (!baseUrl) {
       return reply.code(400).send({ error: `No base_url configured for model "${model}"` });
@@ -127,38 +123,16 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
   return app;
 }
 
-/**
- * Start the relay server. Called from the CLI or from serve.ts.
- */
-export async function startRelay(config: NoodleConfig, opts: RelayOptions = {}): Promise<void> {
-  const relayConfig = (config as Record<string, unknown>).relay as { port?: number; host?: string } | undefined;
-  const port = opts.port ?? relayConfig?.port ?? 4445;
-  const host = opts.host ?? relayConfig?.host ?? "0.0.0.0";
-
-  const app = createRelayServer(config);
-
-  await app.listen({ port, host });
-  log.info({ port, host }, "relay server listening");
-
-  // Graceful shutdown.
-  const shutdown = async (signal: string) => {
-    log.info({ signal }, "relay shutting down");
-    await app.close();
-    process.exit(0);
-  };
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-}
-
 // --- Helpers ---
 
-/** Build a map of model → profile config from the Noodle config. */
+/** Build a map of model → profile config, filtered to relay-enabled profiles only. */
 function buildProfileMap(config: NoodleConfig): Map<string, ProfileConfig> {
   const map = new Map<string, ProfileConfig>();
   for (const [name, profile] of Object.entries(config.profiles)) {
+    if (!profile.use_relay) continue;
     map.set(profile.model, {
       model: profile.model,
-      api_key_env: profile.api_key_env ?? "",
+      api_key: profile.api_key ?? "",
       api_rpm: profile.api_rpm,
     });
     log.debug({ profile: name, model: profile.model, rpm: profile.api_rpm }, "relay: registered profile");
@@ -166,11 +140,11 @@ function buildProfileMap(config: NoodleConfig): Map<string, ProfileConfig> {
   return map;
 }
 
-/** Resolve provider base URLs from config profiles. */
+/** Resolve provider base URLs from relay-enabled config profiles. */
 function resolveProviderUrls(config: NoodleConfig): Map<string, string> {
   const urls = new Map<string, string>();
   for (const profile of Object.values(config.profiles)) {
-    if (profile.base_url) {
+    if (profile.use_relay && profile.base_url) {
       urls.set(profile.model, profile.base_url);
     }
   }
@@ -187,7 +161,7 @@ function findProviderUrl(
   if (direct) return direct;
 
   for (const profile of Object.values(config.profiles)) {
-    if (profile.model === model && profile.base_url) {
+    if (profile.use_relay && profile.model === model && profile.base_url) {
       return profile.base_url;
     }
   }

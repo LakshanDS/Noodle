@@ -1,25 +1,20 @@
 import type { Database as Db } from "better-sqlite3";
 
 /**
- * DB-backed key/value store for self-hosted instance secrets and flags that
- * the web UI manages: GitHub creds, LLM API keys, the webhook secret, the UI
- * password, the agent login.
+ * DB-backed key/value store for ALL instance configuration that the web UI
+ * manages: GitHub creds, the webhook secret, the UI password, the agent login,
+ * plus behavioral settings (agent name, triggers, routing, queue, scheduler,
+ * run timeouts). Everything is editable from the Settings page.
  *
- * Why a DB table (not the .env / YAML like the rest of config): these are the
- * things an operator sets once at first run and then edits through the browser.
- * Keeping them in the same SQLite DB the server already runs on lets the UI
- * read/write them directly — no file rewriting, no separate secrets store.
+ * Why a DB table (not .env / YAML): these are the things an operator sets once
+ * at first run and then edits through the browser. Keeping them in the same
+ * SQLite DB the server already runs on lets the UI read/write them directly —
+ * no file rewriting, no separate secrets store, no env-var hydration bridge.
  *
- * The YAML config keeps the *behavioral* config (profiles, routing, triggers,
- * queue, scheduler) — the portable "how the agent works" stuff. This table is
- * the *instance* config — "what this deployment is wired to."
- *
- * At boot, `hydrateEnvFromDb()` (hydrate-env.ts) copies every row into
- * `process.env` unless the real environment already set it — so DB-stored
- * secrets behave identically to env vars for every consumer (providers read
- * `process.env[api_key_env]`, auth reads GITHUB_* once at boot, etc.) with
- * zero code changes there. Real env wins, so a `.env`/`-e` flag isn't silently
- * clobbered by stale rows.
+ * Consumers read from this store directly (or via getters that re-query the DB
+ * per-request for hot-reloadable values like the UI password and webhook secret).
+ * Only the DB path, server host/port, and log level remain env/CLI flags —
+ * they're needed before the DB opens or the server starts listening.
  *
  * Mirrors RunStore / CronStore: a class over the shared better-sqlite3 handle,
  * with `fromDb` for in-memory tests.
@@ -51,22 +46,43 @@ export interface SettingMeta {
  * (GitHub auth, webhook secret, UI password, login) vs per-request (LLM keys).
  */
 export const SETTING_CATALOG: readonly SettingMeta[] = [
+  // --- Public URL (where GitHub / webhooks reach Noodle) ---
+  { key: "NOODLE_PUBLIC_URL", label: "Public URL", restartRequired: false, secret: false, hint: "The public http(s) address GitHub can reach Noodle at (for webhook delivery). Required for the GitHub App flow when you browse via localhost — set this to a tunnel (e.g. https://abc.ngrok.io) or your public host. A raw public IP works too (e.g. http://203.0.113.50:3000). If unset, the browser's current address is used." },
   // --- GitHub (App mode) ---
-  { key: "GITHUB_APP_ID", label: "GitHub App ID", restartRequired: true, secret: false, hint: "The numeric App ID." },
-  { key: "GITHUB_PRIVATE_KEY", label: "GitHub App private key (PEM)", restartRequired: true, secret: true, hint: "The full PEM text, including BEGIN/END lines." },
+  { key: "GITHUB_APP_ID", label: "GitHub App ID", restartRequired: false, secret: false, hint: "The numeric App ID." },
+  { key: "GITHUB_PRIVATE_KEY", label: "GitHub App private key (PEM)", restartRequired: false, secret: true, hint: "The full PEM text, including BEGIN/END lines." },
   // --- GitHub (PAT mode) ---
-  { key: "GITHUB_TOKEN", label: "GitHub token (PAT)", restartRequired: true, secret: true, hint: "A PAT with repo (or fine-grained contents/pull-requests/issues) scope." },
+  { key: "GITHUB_TOKEN", label: "GitHub token (PAT)", restartRequired: false, secret: true, hint: "A PAT with repo (or fine-grained contents/pull-requests/issues) scope." },
   // --- Webhook + UI auth ---
-  { key: "GITHUB_WEBHOOK_SECRET", label: "Webhook secret", restartRequired: true, secret: true, hint: "The HMAC secret GitHub signs webhooks with." },
-  { key: "NOODLE_UI_PASSWORD", label: "Dashboard password", restartRequired: true, secret: true, hint: "Also signs the auth cookie. Setting this enables the web UI." },
-  { key: "NOODLE_LOGIN", label: "Agent login", restartRequired: true, secret: false, hint: "The agent's GitHub username (scopes assignment triggers). Defaults to <agent>-agent." },
-  // --- LLM API keys (read per-request via process.env[api_key_env]) ---
-  { key: "ANTHROPIC_API_KEY", label: "Anthropic API key", restartRequired: false, secret: true },
-  { key: "OPENAI_API_KEY", label: "OpenAI API key", restartRequired: false, secret: true },
-  { key: "OPENROUTER_API_KEY", label: "OpenRouter API key", restartRequired: false, secret: true },
-  { key: "GROQ_API_KEY", label: "Groq API key", restartRequired: false, secret: true },
-  { key: "DEEPSEEK_API_KEY", label: "DeepSeek API key", restartRequired: false, secret: true },
-  { key: "GEMINI_API_KEY", label: "Google (Gemini) API key", restartRequired: false, secret: true },
+  { key: "GITHUB_WEBHOOK_SECRET", label: "Webhook secret", restartRequired: false, secret: true, hint: "The HMAC secret GitHub signs webhooks with." },
+  // --- Internal: GitHub App setup state (CSRF token for manifest flow) ---
+  { key: "GITHUB_APP_SETUP_STATE", label: "Setup state", restartRequired: false, secret: true, hint: "Temporary CSRF token for GitHub App creation flow." },
+  { key: "NOODLE_UI_PASSWORD", label: "Dashboard password", restartRequired: false, secret: true, hint: "Also signs the auth cookie. Setting this enables the web UI. Changing it logs out all existing sessions." },
+  { key: "NOODLE_LOGIN", label: "Agent login", restartRequired: false, secret: false, hint: "The agent's GitHub username (scopes assignment triggers). Defaults to <agent>-agent." },
+  // --- GitHub labels (the 3 status labels applied to issues during a run).
+  // Rendered by a custom UI block in SettingsView (3 name+color rows), not the
+  // generic field loop. Stored as a JSON string; null = hardcoded defaults. ---
+  { key: "labels", label: "GitHub labels", restartRequired: false, secret: false, hint: "The 3 status labels (cooking/cooked/failed) applied to issues during a run. Each command can override these with its own labels." },
+  // --- System prompt (global role/context, prepended to every run). The default
+  // profile is set from the Profiles page, not here. ---
+  { key: "system_prompt", label: "System prompt", restartRequired: false, secret: false, hint: "Role + context prepended to every agent run (composed WITH each command's own prompt). Keep it short — just tell the agent its role and let it decide its approach from the system info it receives. Supports {agent}, {system}, {pr}, {issue} tags." },
+  // --- Triggers (wake filters for issues — re-overlayed live on save). The two
+  // booleans render side-by-side on one row (see SettingsView grouping). ---
+  { key: "trigger_keywords", label: "Trigger keywords", restartRequired: false, secret: false, hint: 'JSON array of extra substrings that fire the agent (e.g. ["agent-fix"]).' },
+  { key: "trigger_on_mention", label: "Trigger on @mention", restartRequired: false, secret: false, hint: 'Fire Agent when body/comments contains "@Noodle" or /Noodle.' },
+  { key: "trigger_on_open", label: "Trigger on open", restartRequired: false, secret: false, hint: "Fire Agent on any new/reopened/labeled issue or Pull Request." },
+  // --- Routing rules (re-overlayed live on save) ---
+  { key: "routing", label: "Routing rules", restartRequired: false, secret: false, hint: 'JSON array of {kind, match, profile} objects (e.g. [{"kind":"slash","match":"/claude","profile":"claude"}]).' },
+  // --- Queue retry knobs. Both resolve via getters at dispatch time, so a
+  // change applies to the next job failure — no restart. (How many jobs run at
+  // once is controlled per-profile by each profile's `max_concurrent` cap, set
+  // on the Profiles page — not here.) ---
+  { key: "queue_max_attempts", label: "Queue max attempts", restartRequired: false, secret: false, hint: "Total attempts per job (1 = no retry). Applies to the next job failure — no restart needed." },
+  { key: "queue_retry_backoff_seconds", label: "Queue retry backoff (s)", restartRequired: false, secret: false, hint: "Base backoff seconds; doubles each attempt, capped at 10 min. Applies on the next failure — no restart needed." },
+  // --- Run timeouts ---
+  { key: "run_stall_timeout_minutes", label: "Stall timeout (min)", restartRequired: false, secret: false, hint: "Abort after N minutes of silence while no tool is running. 0 = off." },
+  { key: "run_tool_stall_minutes", label: "Tool stall timeout (min)", restartRequired: false, secret: false, hint: "Abort after N minutes of silence while a tool IS running. 0 = off." },
+  // --- LLM API keys live on profiles now (api_key field), not here. ---
 ] as const;
 
 /** Keys whose change requires a restart. */
@@ -113,16 +129,14 @@ export class SettingStore {
     return v != null && v !== "";
   }
 
-  /** Fetch every row. Used by hydrateEnvFromDb at boot. */
+  /** Fetch every row. Used by the settings GET endpoint + config loading. */
   all(): SettingRow[] {
     return this.db.prepare("SELECT key, value, updated_at FROM settings").all() as SettingRow[];
   }
 
   /**
    * Insert or update a value. An empty string deletes the row (so "clear this
-   * field" in the UI actually clears it rather than storing empty). Unknown
-   * keys are accepted — custom profiles may reference arbitrary api_key_env
-   * names the catalog doesn't pre-list.
+   * field" in the UI actually clears it rather than storing empty).
    */
   set(key: string, value: string): void {
     if (value === "") {

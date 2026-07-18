@@ -34,9 +34,11 @@ export interface RunRow {
   session_path: string | null;
   started_at: string;
   finished_at: string | null;
-  /** The cron_jobs row that produced this run, or NULL for issue-driven runs. */
+  /** The scheduler_jobs row that produced this run, or NULL for issue-driven runs. */
   cron_job_id: number | null;
-  /** URL of an issue a cron run opened (its output). NULL for normal runs. */
+  /** The triggers row that produced this run, or NULL for non-trigger runs. */
+  trigger_id: number | null;
+  /** URL of an issue a cron/trigger run opened (its output). NULL for normal runs. */
   output_issue_url: string | null;
 }
 
@@ -50,6 +52,8 @@ export interface NewRun {
   session_path?: string | null;
   /** Set for cron runs so the dashboard can group runs by their cron. */
   cron_job_id?: number | null;
+  /** Set for trigger runs so the dashboard can group runs by their trigger. */
+  trigger_id?: number | null;
 }
 
 /** Partial update applied by `updateRun` — only set fields are written. */
@@ -77,6 +81,7 @@ CREATE TABLE IF NOT EXISTS runs (
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at TEXT,
   cron_job_id INTEGER,
+  trigger_id INTEGER,
   output_issue_url TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -106,17 +111,19 @@ const IDX_CRON_JOB_ID =
 function migrateAddCronColumns(db: Db): void {
   const cols = db.prepare("PRAGMA table_info(runs)").all() as { name: string; notnull: number }[];
   const hasCronJobId = cols.some((c) => c.name === "cron_job_id");
+  const hasTriggerId = cols.some((c) => c.name === "trigger_id");
   const hasOutputIssueUrl = cols.some((c) => c.name === "output_issue_url");
   const issueCol = cols.find((c) => c.name === "issue");
 
   // Fast path: table already has all columns + nullable issue. Nothing to do.
-  if (hasCronJobId && hasOutputIssueUrl && (!issueCol || issueCol.notnull === 0)) {
+  if (hasCronJobId && hasTriggerId && hasOutputIssueUrl && (!issueCol || issueCol.notnull === 0)) {
     db.exec(IDX_CRON_JOB_ID);
     return;
   }
 
   // Add the new columns if missing (works on existing tables via ALTER).
   if (!hasCronJobId) db.exec("ALTER TABLE runs ADD COLUMN cron_job_id INTEGER");
+  if (!hasTriggerId) db.exec("ALTER TABLE runs ADD COLUMN trigger_id INTEGER");
   if (!hasOutputIssueUrl) db.exec("ALTER TABLE runs ADD COLUMN output_issue_url TEXT");
 
   // Relax NOT NULL on `issue` via a table rebuild when it's still constrained.
@@ -138,10 +145,11 @@ function migrateAddCronColumns(db: Db): void {
         started_at TEXT NOT NULL DEFAULT (datetime('now')),
         finished_at TEXT,
         cron_job_id INTEGER,
+        trigger_id INTEGER,
         output_issue_url TEXT
       );
-      INSERT INTO runs_new (job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url)
-      SELECT job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, output_issue_url FROM runs;
+      INSERT INTO runs_new (job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, trigger_id, output_issue_url)
+      SELECT job_id, repo, issue, branch, profile, model, status, pr_url, comment_url, summary, error, session_path, started_at, finished_at, cron_job_id, trigger_id, output_issue_url FROM runs;
       DROP TABLE runs;
       ALTER TABLE runs_new RENAME TO runs;
       CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -232,6 +240,13 @@ export class RunStore {
     return this.db
       .prepare("SELECT * FROM runs WHERE cron_job_id = ? ORDER BY started_at DESC LIMIT ?")
       .all(cronJobId, limit) as RunRow[];
+  }
+
+  /** Runs belonging to one trigger, newest-first (for the trigger detail view). */
+  listRunsForTrigger(triggerId: number, limit = 20): RunRow[] {
+    return this.db
+      .prepare("SELECT * FROM runs WHERE trigger_id = ? ORDER BY started_at DESC LIMIT ?")
+      .all(triggerId, limit) as RunRow[];
   }
 
   /** Count runs by status (for dashboard stats). */

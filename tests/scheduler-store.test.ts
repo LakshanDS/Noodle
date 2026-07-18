@@ -3,16 +3,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { CronStore, sqliteUtc } from "../src/server/cron-store.js";
+import { SchedulerStore, sqliteUtc } from "../src/server/scheduler-store.js";
 
 let dir: string;
-let store: CronStore;
+let store: SchedulerStore;
 let db: Database.Database;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "noodle-cron-"));
   db = new Database(join(dir, "test.db"));
-  store = CronStore.fromDb(db);
+  store = SchedulerStore.fromDb(db);
 });
 
 afterEach(() => {
@@ -20,9 +20,9 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe("CronStore", () => {
-  it("creates a cron job and reads it back", () => {
-    const cron = store.createCron({
+describe("SchedulerStore", () => {
+  it("creates a scheduler job and reads it back", () => {
+    const cron = store.createScheduler({
       name: "Bug sweep",
       repo: "owner/repo",
       prompt: "Find bugs",
@@ -35,12 +35,12 @@ describe("CronStore", () => {
     expect(cron.next_run_at).not.toBeNull();
     expect(cron.id).toBeGreaterThan(0);
 
-    const fetched = store.getCron(cron.id);
+    const fetched = store.getScheduler(cron.id);
     expect(fetched.name).toBe("Bug sweep");
   });
 
   it("seeds next_run_at from the expression on create", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "hourly",
       repo: "o/r",
       prompt: "p",
@@ -52,7 +52,7 @@ describe("CronStore", () => {
   });
 
   it("disabled crons get null next_run_at on create", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "disabled",
       repo: "o/r",
       prompt: "p",
@@ -65,7 +65,7 @@ describe("CronStore", () => {
   });
 
   it("updates fields and recomputes next_run_at when expression changes", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "test",
       repo: "o/r",
       prompt: "p",
@@ -73,7 +73,7 @@ describe("CronStore", () => {
       cron_expression: "0 0 * * *",
     });
     const oldNext = cron.next_run_at;
-    const updated = store.updateCron(cron.id, { cron_expression: "0 * * * *", prompt: "new prompt" });
+    const updated = store.updateScheduler(cron.id, { cron_expression: "0 * * * *", prompt: "new prompt" });
     expect(updated.prompt).toBe("new prompt");
     expect(updated.cron_expression).toBe("0 * * * *");
     // next_run_at changes because the expression changed.
@@ -81,7 +81,7 @@ describe("CronStore", () => {
   });
 
   it("re-enabling a disabled cron recomputes next_run_at", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "test",
       repo: "o/r",
       prompt: "p",
@@ -90,13 +90,13 @@ describe("CronStore", () => {
       enabled: 0,
     });
     expect(cron.next_run_at).toBeNull();
-    const enabled = store.updateCron(cron.id, { enabled: 1 });
+    const enabled = store.updateScheduler(cron.id, { enabled: 1 });
     expect(enabled.enabled).toBe(1);
     expect(enabled.next_run_at).not.toBeNull();
   });
 
   it("disabling clears next_run_at", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "test",
       repo: "o/r",
       prompt: "p",
@@ -104,40 +104,40 @@ describe("CronStore", () => {
       cron_expression: "0 0 * * *",
     });
     expect(cron.next_run_at).not.toBeNull();
-    const disabled = store.updateCron(cron.id, { enabled: 0 });
+    const disabled = store.updateScheduler(cron.id, { enabled: 0 });
     expect(disabled.enabled).toBe(0);
     expect(disabled.next_run_at).toBeNull();
   });
 
   it("deletes a cron", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "test",
       repo: "o/r",
       prompt: "p",
       branch_name: "b",
       cron_expression: "0 0 * * *",
     });
-    store.deleteCron(cron.id);
-    expect(() => store.getCron(cron.id)).toThrow(/not found/);
+    store.deleteScheduler(cron.id);
+    expect(() => store.getScheduler(cron.id)).toThrow(/not found/);
   });
 
-  it("listCrons returns all crons newest-first", () => {
-    store.createCron({ name: "first", repo: "o/r", prompt: "p", branch_name: "b", cron_expression: "0 0 * * *" });
-    store.createCron({ name: "second", repo: "o/r", prompt: "p", branch_name: "b", cron_expression: "0 0 * * *" });
-    const list = store.listCrons();
+  it("listSchedulers returns all crons newest-first", () => {
+    store.createScheduler({ name: "first", repo: "o/r", prompt: "p", branch_name: "b", cron_expression: "0 0 * * *" });
+    store.createScheduler({ name: "second", repo: "o/r", prompt: "p", branch_name: "b", cron_expression: "0 0 * * *" });
+    const list = store.listSchedulers();
     expect(list).toHaveLength(2);
     expect(list[0].name).toBe("second");
   });
 
-  it("listDueCrons returns only enabled crons whose next_run_at has passed", () => {
-    const due = store.createCron({
+  it("listDueSchedulers returns only enabled crons whose next_run_at has passed", () => {
+    const due = store.createScheduler({
       name: "due",
       repo: "o/r",
       prompt: "p",
       branch_name: "b",
       cron_expression: "0 0 * * *",
     });
-    const notDue = store.createCron({
+    const notDue = store.createScheduler({
       name: "not-due",
       repo: "o/r",
       prompt: "p",
@@ -145,16 +145,16 @@ describe("CronStore", () => {
       cron_expression: "0 0 * * *",
     });
     // Force `due`'s next_run_at into the past; leave `notDue` in the future.
-    db.prepare("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+    db.prepare("UPDATE scheduler_jobs SET next_run_at = ? WHERE id = ?")
       .run("2020-01-01 00:00:00", due.id);
-    const dueList = store.listDueCrons(new Date());
+    const dueList = store.listDueSchedulers(new Date());
     const ids = dueList.map((c) => c.id);
     expect(ids).toContain(due.id);
     expect(ids).not.toContain(notDue.id);
   });
 
-  it("listDueCrons skips disabled crons", () => {
-    const disabled = store.createCron({
+  it("listDueSchedulers skips disabled crons", () => {
+    const disabled = store.createScheduler({
       name: "disabled",
       repo: "o/r",
       prompt: "p",
@@ -163,14 +163,14 @@ describe("CronStore", () => {
       enabled: 0,
     });
     // Even with a past next_run_at, disabled crons are excluded.
-    db.prepare("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+    db.prepare("UPDATE scheduler_jobs SET next_run_at = ? WHERE id = ?")
       .run("2020-01-01 00:00:00", disabled.id);
-    const dueList = store.listDueCrons(new Date());
+    const dueList = store.listDueSchedulers(new Date());
     expect(dueList.map((c) => c.id)).not.toContain(disabled.id);
   });
 
   it("markScheduled stamps last_run_at and advances next_run_at", () => {
-    const cron = store.createCron({
+    const cron = store.createScheduler({
       name: "test",
       repo: "o/r",
       prompt: "p",
@@ -182,14 +182,14 @@ describe("CronStore", () => {
     // the create-time computation (which used the real now).
     const later = new Date(Date.now() + 2 * 60 * 60 * 1000);
     store.markScheduled(cron.id, later);
-    const updated = store.getCron(cron.id);
+    const updated = store.getScheduler(cron.id);
     expect(updated.last_run_at).not.toBeNull();
     // next_run_at should have advanced (computed from 2h later, not create time).
     expect(updated.next_run_at).not.toBe(beforeNext);
   });
 
   it("nextRunFromExpr throws on an invalid expression", () => {
-    expect(() => CronStore.nextRunFromExpr("not a cron")).toThrow();
+    expect(() => SchedulerStore.nextRunFromExpr("not a cron")).toThrow();
   });
 });
 

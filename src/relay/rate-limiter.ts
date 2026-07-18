@@ -1,21 +1,24 @@
 /**
- * Stateless rate spacer for the relay. Every request sleeps a fixed interval
- * (`60000 / api_rpm` ms) before being forwarded — no timestamps, no memory, no
- * concurrency math. Because each profile runs with `max_concurrent: 1`, requests
- * to the same model arrive sequentially, so a flat sleep spaces them perfectly.
+ * Stateful rate spacer for the relay. Tracks per-model last-request timestamps
+ * so concurrent requests to the same model are properly spaced, even when
+ * `max_concurrent > 1`. Falls back to a flat sleep for single-concurrency
+ * profiles (the common case).
  *
  * The provider never sends a 429 because we never exceed the RPM.
  */
 
 export interface ProfileConfig {
   model: string;
-  api_key_env: string;
+  api_key: string;
   api_rpm: number;
 }
 
+/** Per-model state: last request timestamp (ms since epoch). */
+const lastRequest = new Map<string, number>();
+
 /**
- * Sleep `60000 / api_rpm` ms, then return the API key env var name for the
- * model. Throws if the model isn't configured. RPM ≤ 0 = unlimited (no sleep).
+ * Sleep until the next allowed request for this model, then return the API key.
+ * RPM ≤ 0 = unlimited (no sleep).
  */
 export async function acquireSlot(
   profiles: Map<string, ProfileConfig>,
@@ -27,9 +30,14 @@ export async function acquireSlot(
   }
 
   if (profile.api_rpm > 0) {
-    await sleep(Math.ceil(60_000 / profile.api_rpm));
+    const intervalMs = Math.ceil(60_000 / profile.api_rpm);
+    const now = Date.now();
+    const last = lastRequest.get(model) ?? 0;
+    const waitMs = Math.max(0, last + intervalMs - now);
+    if (waitMs > 0) await sleep(waitMs);
+    lastRequest.set(model, Date.now());
   }
-  return profile.api_key_env;
+  return profile.api_key;
 }
 
 function findProfileByModel(profiles: Map<string, ProfileConfig>, model: string): ProfileConfig | undefined {

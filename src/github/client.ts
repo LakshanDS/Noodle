@@ -37,6 +37,17 @@ export interface PullRequestData {
   state: string;
 }
 
+/** A repo the authenticated user/app can access (for the dashboard's repo picker). */
+export interface RepoData {
+  full_name: string;
+  default_branch: string;
+}
+
+/** A branch in a repo (for the dashboard's branch picker). */
+export interface BranchData {
+  name: string;
+}
+
 /**
  * Thin GitHub client. Methods map 1:1 to REST calls and return plain data.
  * The engine orchestrates these; no business logic here.
@@ -202,19 +213,23 @@ export class GitHubClient {
     agentSlug: string,
   ): Promise<{ branch: string; number: number; html_url: string } | null> {
     const [owner, name] = parseRepo(repo);
-    const { data } = await this.octokit.rest.pulls.list({
+    const pattern = new RegExp(`^${agentSlug}/issue-${issueNumber}($|-)`);
+    // Paginate through all open PRs — repos with >100 open PRs would otherwise
+    // miss a matching branch on the first page.
+    for await (const response of this.octokit.paginate.iterator(this.octokit.rest.pulls.list, {
       owner,
       repo: name,
       state: "open",
       per_page: 100,
-    });
-    const pattern = new RegExp(`^${agentSlug}/issue-${issueNumber}($|-)`);
-    const match = data.find(
-      (pr) => typeof pr.head?.ref === "string" && pattern.test(pr.head.ref),
-    );
-    return match
-      ? { branch: match.head.ref, number: match.number, html_url: match.html_url }
-      : null;
+    })) {
+      const match = response.data.find(
+        (pr) => typeof pr.head?.ref === "string" && pattern.test(pr.head.ref),
+      );
+      if (match) {
+        return { branch: match.head.ref, number: match.number, html_url: match.html_url };
+      }
+    }
+    return null;
   }
 
   async createPullRequest(
@@ -321,5 +336,61 @@ export class GitHubClient {
       if (status === 404) return null;
       throw e;
     }
+  }
+
+  /**
+   * List repos the authenticated user (PAT) or installation (App) can access.
+   * Used by the dashboard's repo picker on the cron form. Returns up to 100;
+   * the UI filters client-side as the user types.
+   */
+  async listRepos(): Promise<RepoData[]> {
+    const { data } = await this.octokit.rest.repos.listForAuthenticatedUser({
+      per_page: 100,
+      sort: "updated",
+      direction: "desc",
+    });
+    return data.map((r) => ({ full_name: r.full_name, default_branch: r.default_branch }));
+  }
+
+  /**
+   * List branches in a repo. Used by the dashboard's branch picker — loaded when
+   * the user selects/types a repo on the cron form.
+   */
+  async listBranches(repo: string): Promise<BranchData[]> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.repos.listBranches({
+      owner,
+      repo: name,
+      per_page: 100,
+    });
+    return data.map((b) => ({ name: b.name }));
+  }
+
+  /**
+   * List a repo's open pull requests, newest first (up to 100). Used by the
+   * system-prompt template tags ({pr}, {pr.0}, etc.) to give the agent awareness
+   * of open PRs in the repo.
+   */
+  async listOpenPRs(repo: string): Promise<PullRequestData[]> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.pulls.list({
+      owner,
+      repo: name,
+      state: "open",
+      sort: "created",
+      direction: "desc",
+      per_page: 100,
+    });
+    return data.map((p) => ({
+      number: p.number,
+      title: p.title,
+      body: p.body ?? "",
+      head_branch: p.head?.ref ?? "",
+      head_repo: p.head?.repo?.full_name ?? repo,
+      base_branch: p.base?.ref ?? "",
+      is_fork: (p.head?.repo?.full_name ?? repo).toLowerCase() !== repo.toLowerCase(),
+      html_url: p.html_url,
+      state: p.state,
+    }));
   }
 }

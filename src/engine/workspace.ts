@@ -32,6 +32,22 @@ export class Workspace {
   }
 
   /**
+   * Create a new local branch from a remote branch. Fetches `remoteBranch` from
+   * the remote, then creates `newBranch` at FETCH_HEAD. Used when an issue has
+   * an open PR — the agent works on a fresh branch derived from the PR's branch
+   * rather than reusing the PR branch directly.
+   */
+  async branchFrom(newBranch: string, remoteBranch: string, freshCloneUrl?: string): Promise<void> {
+    if (freshCloneUrl) {
+      await this.git.remote(["set-url", "origin", freshCloneUrl]);
+    }
+    await this.git.fetch("origin", remoteBranch);
+    await this.git.checkoutLocalBranch(newBranch);
+    await this.git.reset(["--hard", "FETCH_HEAD"]);
+    log.debug({ dir: this.path, newBranch, from: remoteBranch }, "created branch from remote");
+  }
+
+  /**
    * Reuse an existing remote branch: fetch it and hard-reset onto its tip so
    * the agent's work stacks on top of the previous attempt's commits. Used
    * when a follow-up run targets an issue that already has an OPEN PR — the
@@ -84,8 +100,15 @@ export class Workspace {
 
   /** List of changed files vs the branch point (for PR summary). */
   async changedFiles(): Promise<string[]> {
-    const diff = await this.git.diff(["--name-only", "HEAD~1"]);
-    return diff.split("\n").filter(Boolean);
+    try {
+      const diff = await this.git.diff(["--name-only", "HEAD~1"]);
+      return diff.split("\n").filter(Boolean);
+    } catch {
+      // Shallow clone with only 1 commit — HEAD~1 doesn't exist. Fall back to
+      // diffing against the empty tree (shows all tracked files as "changed").
+      const diff = await this.git.diff(["--name-only", "--root", "HEAD"]);
+      return diff.split("\n").filter(Boolean);
+    }
   }
 
   /**

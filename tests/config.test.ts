@@ -1,11 +1,16 @@
 import { describe, it, expect } from "vitest";
 import { NoodleConfigSchema, crossValidate } from "../src/config/schema.js";
 
+/** A minimal valid profile (base_url + api are required fields). */
+function profile(provider = "openrouter", model = "haiku") {
+  return { provider, model, base_url: "https://api.example.com", api: "openai-completions", api_key: "sk-test" };
+}
+
 const validBase = {
   default_profile: "cheap",
   profiles: {
-    cheap: { provider: "openrouter", model: "haiku" },
-    claude: { provider: "anthropic", model: "sonnet" },
+    cheap: profile("openrouter", "haiku"),
+    claude: profile("anthropic", "sonnet"),
   },
   routing: [{ kind: "slash", match: "/claude", profile: "claude" }],
 };
@@ -35,30 +40,30 @@ describe("config schema", () => {
     const c = NoodleConfigSchema.parse({
       ...validBase,
       profiles: {
-        cheap: { provider: "openrouter", model: "haiku" }, // api_rpm omitted → 30
-        unlimited: { provider: "openrouter", model: "haiku", api_rpm: 0 },
+        cheap: profile(), // api_rpm omitted → 30
+        unlimited: { ...profile(), api_rpm: 0 },
       },
     });
     expect(c.profiles.cheap.api_rpm).toBe(30);
     expect(c.profiles.unlimited.api_rpm).toBe(0);
   });
 
-  it("accepts an optional per-profile max_concurrent (undefined by default)", () => {
+  it("defaults per-profile max_concurrent to 1 when omitted", () => {
     const c = NoodleConfigSchema.parse({
       ...validBase,
       profiles: {
-        cheap: { provider: "openrouter", model: "haiku" }, // omitted → undefined
-        capped: { provider: "openrouter", model: "haiku", max_concurrent: 2 },
+        cheap: profile(), // omitted → defaults to 1
+        capped: { ...profile(), max_concurrent: 2 },
       },
     });
-    expect(c.profiles.cheap.max_concurrent).toBeUndefined();
+    expect(c.profiles.cheap.max_concurrent).toBe(1);
     expect(c.profiles.capped.max_concurrent).toBe(2);
   });
 
   it("rejects an unknown thinking_level", () => {
     const r = NoodleConfigSchema.safeParse({
       ...validBase,
-      profiles: { cheap: { provider: "x", model: "y", thinking_level: "nope" } },
+      profiles: { cheap: { ...profile(), thinking_level: "nope" } },
     });
     expect(r.success).toBe(false);
   });
@@ -138,20 +143,15 @@ describe("Phase 2 config blocks", () => {
     });
   });
 
-  it("flags scheduler enabled with no repos", () => {
-    const c = NoodleConfigSchema.parse({
-      ...validBase,
-      scheduler: { enabled: true, repos: [] },
-    });
-    expect(crossValidate(c).join("\n")).toMatch(/scheduler.*repos/);
-  });
-
-  it("flags a malformed repo in scheduler.repos", () => {
+  // The repo-scan scheduler was removed. Its config block is still parsed for
+  // back-compat (existing YAML won't crash), but it's no longer validated or
+  // consumed — so enabling it with no/malformed repos produces no errors.
+  it("no longer validates scheduler.repos (scheduler removed)", () => {
     const c = NoodleConfigSchema.parse({
       ...validBase,
       scheduler: { enabled: true, repos: ["not-a-repo"] },
     });
-    expect(crossValidate(c).join("\n")).toMatch(/not a valid "owner\/name"/);
+    expect(crossValidate(c)).toHaveLength(0);
   });
 
   it("passes when scheduler is enabled with valid repos", () => {
@@ -167,7 +167,7 @@ describe("Phase 3 config blocks (run + queue)", () => {
   it("applies defaults when run/queue are omitted", () => {
     const c = NoodleConfigSchema.parse(validBase);
     expect(c.run).toEqual({ stall_timeout_minutes: 15, tool_stall_minutes: 60 });
-    expect(c.queue).toEqual({ concurrency: 1, max_attempts: 3, retry_backoff_seconds: 60 });
+    expect(c.queue).toEqual({ max_attempts: 3, retry_backoff_seconds: 60 });
   });
 
   it("parses an explicit run block with both budgets", () => {
@@ -182,9 +182,8 @@ describe("Phase 3 config blocks (run + queue)", () => {
   it("parses an explicit queue block", () => {
     const c = NoodleConfigSchema.parse({
       ...validBase,
-      queue: { concurrency: 2, max_attempts: 5, retry_backoff_seconds: 120 },
+      queue: { max_attempts: 5, retry_backoff_seconds: 120 },
     });
-    expect(c.queue.concurrency).toBe(2);
     expect(c.queue.max_attempts).toBe(5);
     expect(c.queue.retry_backoff_seconds).toBe(120);
   });
@@ -209,13 +208,26 @@ describe("Phase 3 config blocks (run + queue)", () => {
     expect(r.success).toBe(false);
   });
 
-  it("rejects concurrency < 1", () => {
-    const r = NoodleConfigSchema.safeParse({ ...validBase, queue: { concurrency: 0 } });
+  it("rejects max_concurrent < 1", () => {
+    const r = NoodleConfigSchema.safeParse({ ...validBase, profiles: { p: { ...profile(), max_concurrent: 0 } } });
     expect(r.success).toBe(false);
   });
 
   it("rejects max_attempts < 1", () => {
     const r = NoodleConfigSchema.safeParse({ ...validBase, queue: { max_attempts: 0 } });
     expect(r.success).toBe(false);
+  });
+});
+
+describe("DB-only profiles", () => {
+  it("accepts a config with no profiles (loaded from DB at boot)", () => {
+    const c = NoodleConfigSchema.parse({});
+    expect(c.profiles).toEqual({});
+    expect(c.default_profile).toBeUndefined();
+  });
+
+  it("skips crossValidate checks when profiles is empty", () => {
+    const c = NoodleConfigSchema.parse({});
+    expect(crossValidate(c)).toHaveLength(0);
   });
 });

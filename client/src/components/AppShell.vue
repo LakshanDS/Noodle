@@ -3,8 +3,9 @@
  * The application shell: a fixed sidebar on the left and a main content column
  * on the right. No full-width top bar — instead each page's contextual actions
  * (refresh, new, save, …) float in an elevated panel pinned to the top-right of
- * the content area. The active sidebar item indicates the current page, so no
- * page title is shown.
+ * the content area. On mobile the hamburger + brand join the actions inside
+ * that same panel, so there's no separate mobile header bar. The active sidebar
+ * item indicates the current page, so no page title is shown.
  *
  * The sidebar holds the brand, primary nav (Runs / Crons / Settings), and a
  * footer with the sign-out action. The default slot is the page body, centered
@@ -44,8 +45,9 @@ const NAV: NavItem[] = [
   // { name: "chats", label: "Chats", icon: "message", target: { name: "chats" }, activeOn: ["chats", "chat-detail", "chat-new"], create: { name: "chat-new", label: "New chat" } },
   { name: "skills", label: "Skills", icon: "book", target: { name: "skills" }, activeOn: ["skills", "skill-detail", "skill-new"], create: { name: "skill-new", label: "New skill" } },
   { name: "profiles", label: "Profiles", icon: "key", target: { name: "profiles" }, activeOn: ["profiles", "profile-detail", "profile-new"], create: { name: "profile-new", label: "New profile" } },
-  { name: "crons", label: "Schedules", icon: "cron", target: { name: "crons" }, activeOn: ["crons", "cron-detail", "cron-new"], create: { name: "cron-new", label: "New schedule" } },
-  { name: "commands", label: "Commands", icon: "bolt", target: { name: "commands" }, activeOn: ["commands", "command-detail", "command-new"], create: { name: "command-new", label: "New command" } },
+  { name: "triggers", label: "Triggers", icon: "zap", target: { name: "triggers" }, activeOn: ["triggers", "trigger-detail", "trigger-new"], create: { name: "trigger-new", label: "New trigger" } },
+  { name: "schedulers", label: "Schedules", icon: "cron", target: { name: "schedulers" }, activeOn: ["schedulers", "scheduler-detail", "scheduler-new"], create: { name: "scheduler-new", label: "New schedule" } },
+  { name: "commands", label: "Commands", icon: "command", target: { name: "commands" }, activeOn: ["commands", "command-detail", "command-new"], create: { name: "command-new", label: "New command" } },
   // GitHub bot moved to Settings page — credentials are now a section there.
   { name: "logs", label: "System log", icon: "log", target: { name: "logs" }, activeOn: ["logs"] },
   { name: "settings", label: "Settings", icon: "settings", target: { name: "settings" }, activeOn: ["settings"] },
@@ -91,19 +93,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 
 <template>
   <div class="shell">
-    <!-- Mobile top bar — hidden on desktop, shows hamburger + brand. Only the
-         hamburger toggles; the brand label is mirrored here because the sidebar
-         brand is off-canvas when the drawer is closed. -->
-    <header class="mobile-bar">
-      <button class="hamburger" :aria-expanded="sidebarOpen" aria-label="Menu" @click="sidebarOpen = !sidebarOpen">
-        <Icon name="menu" :size="20" />
-      </button>
-      <span class="mobile-brand">
-        <Icon name="logo" :size="18" />
-        <span>Noodle</span>
-      </span>
-    </header>
-
     <!-- Backdrop — dims the page behind the open drawer, click closes it. -->
     <div v-if="sidebarOpen" class="backdrop" @click="sidebarOpen = false" />
 
@@ -155,6 +144,20 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
              page, scroll or no scroll. -->
         <div class="content-inner">
           <div class="action-panel">
+            <!-- On mobile the hamburger + brand live inside this panel, so
+                 there's no separate top bar. On desktop these are hidden. -->
+            <button
+              class="hamburger"
+              :aria-expanded="sidebarOpen"
+              aria-label="Menu"
+              @click="sidebarOpen = !sidebarOpen"
+            >
+              <Icon name="menu" :size="20" />
+            </button>
+            <span class="panel-brand">
+              <Icon name="logo" :size="18" />
+              <span>Noodle</span>
+            </span>
             <slot name="actions" />
           </div>
           <slot />
@@ -280,6 +283,15 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
   padding-top: var(--space-3);
   border-top: 1px solid var(--border-subtle);
 }
+/* The sign-out button reuses .nav-item for its hover/height treatment, but
+ * unlike the rows above it has no inner .nav-link to carry the indent. Mirror
+ * that indent here so the icon + label line up with the nav rows on both
+ * desktop and mobile. */
+.sidebar-foot .nav-item {
+  width: 100%;
+  gap: var(--space-3);
+  padding: 0 var(--space-3);
+}
 
 /* ---------- Main column ---------- */
 /* .main is the scroll container for the whole page. The action panel and the
@@ -331,12 +343,20 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
   white-space: nowrap;
 }
 
-/* ---------- Mobile (≤768px) ----------
- * The sidebar becomes a slide-in drawer, a compact top bar holds the hamburger,
- * and content padding shrinks to reclaim horizontal space on phones. */
-.mobile-bar {
+/* Hamburger + in-panel brand are mobile-only; hidden on desktop where the
+ * sidebar brand is always visible. */
+.hamburger {
   display: none;
 }
+.panel-brand {
+  display: none;
+}
+
+/* ---------- Mobile (≤768px) ----------
+ * No separate top bar: the sidebar becomes a slide-in drawer, and the hamburger
+ * + brand move into the floating action panel — one elevated bar across the
+ * top (brand left, actions right). Content padding shrinks to reclaim
+ * horizontal space on phones. */
 .backdrop {
   display: none;
 }
@@ -344,32 +364,16 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 @media (max-width: 768px) {
   .shell {
     grid-template-columns: 1fr;
-    /* mobile-bar (auto) + main fills the rest. */
-    grid-template-rows: auto 1fr;
   }
 
-  /* Top bar with hamburger — sits above the content column. */
-  .mobile-bar {
-    position: sticky;
-    top: 0;
-    z-index: 30;
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    height: 52px;
-    padding: 0 var(--space-3);
-    background: color-mix(in srgb, var(--surface-1) 95%, transparent);
-    border-bottom: 1px solid var(--border);
-    backdrop-filter: blur(8px);
-    /* Stretch across the grid's single column. */
-    grid-column: 1;
-  }
+  /* Hamburger + in-panel brand now visible inside the action panel. */
   .hamburger {
     display: flex;
     align-items: center;
     justify-content: center;
     width: 40px;
     height: 40px;
+    flex: 0 0 auto;
     border-radius: var(--radius-md);
     color: var(--text-2);
   }
@@ -377,7 +381,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
     background: var(--surface-3);
     color: var(--text);
   }
-  .mobile-brand {
+  .panel-brand {
     display: flex;
     align-items: center;
     gap: var(--space-2);
@@ -385,8 +389,10 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
     font-weight: var(--weight-semibold);
     letter-spacing: var(--tracking-tight);
     color: var(--text);
+    /* Push everything after the brand (the page actions) to the right edge. */
+    margin-right: auto;
   }
-  .mobile-brand :deep(svg) {
+  .panel-brand :deep(svg) {
     color: var(--accent);
   }
 
@@ -408,6 +414,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
   .nav-item {
     min-height: 44px;
   }
+  /* Widen the row gap on mobile so the taller 44px pills read as separate
+   * items instead of a cramped stack. Desktop keeps the tight 2px density. */
+  .nav {
+    gap: var(--space-1);
+  }
 
   /* Backdrop dims + dismisses. */
   .backdrop {
@@ -421,20 +432,51 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 
   /* Content reclaims horizontal space. */
   .main {
-    /* Fill the remaining grid row below the mobile bar instead of forcing
-     * 100dvh (which would overflow by the bar's height). */
-    height: 100%;
+    height: 100dvh;
     min-height: 0;
     /* Disable the desktop scrollbar gutter — it wastes width on mobile. */
     scrollbar-gutter: auto;
     padding: var(--space-3) var(--space-3) var(--space-6);
   }
+  /* The panel becomes a full-width header bar: brand on the left, page actions
+   * pushed to the right by the brand's margin-right: auto. Height is auto so it
+   * can grow to fit wrapped actions (e.g. the log page's select + 2 buttons) —
+   * the desktop fixed height would clip the second row. Vertical padding gives
+   * the buttons clearance so their hover backgrounds don't touch the panel's
+   * top/bottom border (the base rule has 0 vertical padding). */
   .action-panel {
-    white-space: normal;
-    flex-wrap: wrap;
-    width: auto;
-    margin-left: 0;
+    /* Drop sticky on mobile — it's a simple header bar that scrolls with the
+     * page. Without sticky the panel's containing block is .content-inner
+     * (not the scroll container .main), so width:100% stretches it to the
+     * exact same box the cards use → edges align perfectly. */
+    position: static;
+    width: 100%;
+    box-sizing: border-box;
+    height: auto;
+    min-height: 44px;
+    /* Vertical padding keeps button hover bg clear of the top/bottom border;
+     * horizontal padding is larger so the right-aligned button cluster has the
+     * same breathing room on the right edge as it does top/bottom (the buttons
+     * were visually crammed against the right border). */
+    padding: var(--space-1) var(--space-2);
+    /* Full-bleed header (margin 0) but restore the bottom gap the desktop rule
+     * provides — without it the header sits hard against the first card. */
+    margin: 0 0 var(--space-4);
     justify-content: flex-end;
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+}
+</style>
+
+<!--
+  Global (unscoped) — hide button text labels on mobile so action panels stay
+  compact (icon-only buttons). Each view wraps its label text in <span class="btn-label">.
+-->
+<style>
+@media (max-width: 768px) {
+  .btn-label {
+    display: none;
   }
 }
 </style>

@@ -77,15 +77,16 @@ withDefaults(
   padding: 0 var(--space-3);
 }
 
-/* On touch screens the 30/36px heights are below the comfortable tap target.
- * Grow to a 40px minimum below the mobile breakpoint without changing the
- * visual proportions on desktop. */
+/* Buttons keep their compact sm/md sizes on mobile. The earlier 40px tap-
+ * target bump inflated action-panel buttons until they crowded the panel
+ * border; the natural 30px sm height leaves comfortable breathing room inside
+ * the ~44px header bar. */
 @media (max-width: 768px) {
   .sm {
-    min-height: 40px;
+    min-height: 30px;
   }
   .md {
-    min-height: 40px;
+    min-height: 36px;
   }
 }
 

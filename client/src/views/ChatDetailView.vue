@@ -93,7 +93,7 @@ onMounted(load);
     <template #actions>
       <Button variant="ghost" size="sm" icon="back" @click="back">Back</Button>
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        Refresh
+        <span class="btn-label">Refresh</span>
       </Button>
     </template>
 

@@ -186,3 +186,91 @@ export function parseWebhookEvent(
 
   return null;
 }
+
+/**
+ * Raw metadata extracted from a webhook payload for trigger matching.
+ * Unlike WebhookIntent (which is filtered to Noodle-relevant events),
+ * this captures the raw event type/action/repo so triggers can match
+ * against any GitHub event.
+ */
+export interface WebhookMetadata {
+  /** The GitHub event type (e.g. "issues", "pull_request", "push"). */
+  eventType: string;
+  /** The event action (e.g. "opened", "created"). Undefined for events without actions. */
+  action?: string;
+  /** "owner/name" of the repo. */
+  repo: string;
+  /** For push events, the branch ref (e.g. "refs/heads/main"). */
+  branch?: string;
+  /** Installation ID, when present (App auth mode). */
+  installationId?: number;
+  /** The full webhook payload for prompt context. */
+  payload: unknown;
+}
+
+/**
+ * Extract raw event metadata from a webhook payload for trigger matching.
+ * This is a pure extraction function — no filtering logic. Returns null when
+ * the payload lacks the minimum required fields (repository.full_name).
+ */
+export function parseWebhookMetadata(event: string, payload: unknown): WebhookMetadata | null {
+  const p = payload as {
+    action?: string;
+    installation?: { id?: number };
+    repository?: { full_name?: string };
+    ref?: string;
+  };
+
+  if (!p.repository?.full_name) return null;
+
+  return {
+    eventType: event,
+    action: p.action,
+    repo: p.repository.full_name,
+    branch: p.ref,
+    installationId: p.installation?.id,
+    payload,
+  };
+}
+
+/**
+ * Match a webhook event against stored trigger definitions. Returns the
+ * triggers that should fire for this event.
+ */
+export function matchTriggers(
+  metadata: WebhookMetadata,
+  triggers: Array<{
+    id: number;
+    event_type: string;
+    event_action: string | null;
+    branch_pattern: string | null;
+  }>,
+): Array<{ id: number }> {
+  const matched: Array<{ id: number }> = [];
+
+  for (const trigger of triggers) {
+    // Event type must match exactly.
+    if (trigger.event_type !== metadata.eventType) continue;
+
+    // If the trigger specifies an action, it must match.
+    if (trigger.event_action && trigger.event_action !== metadata.action) continue;
+
+    // If the trigger specifies a branch pattern (for push events), check it.
+    if (trigger.branch_pattern && metadata.branch) {
+      // Extract branch name from ref (e.g. "refs/heads/main" → "main").
+      const branchName = metadata.branch.replace(/^refs\/heads\//, "");
+      // Simple glob: "main" matches "main", "feature/*" matches "feature/foo".
+      const pattern = trigger.branch_pattern;
+      if (pattern.includes("*")) {
+        const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$");
+        if (!regex.test(branchName)) continue;
+      } else if (branchName !== pattern) {
+        continue;
+      }
+    }
+
+    matched.push({ id: trigger.id });
+  }
+
+  return matched;
+}

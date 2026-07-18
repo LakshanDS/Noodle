@@ -5,8 +5,7 @@ import { loadConfig, ConfigError } from "./config/load.js";
 import { createOctokit } from "./github/auth.js";
 import { GitHubClient } from "./github/client.js";
 import { runJob } from "./engine/run.js";
-import { serve, scanOnce } from "./server/serve.js";
-import { startRelay } from "./relay/server.js";
+import { serve } from "./server/serve.js";
 import { log } from "./util/log.js";
 
 const program = new Command();
@@ -26,11 +25,16 @@ configCmd
     try {
       const config = loadConfig(opts.config);
       console.log(
-        `✓ config valid — ${Object.keys(config.profiles).length} profiles, ${config.routing.length} routing rules.`,
+        `✓ config valid — ${config.routing.length} routing rules.`,
       );
-      console.log(`  default_profile: ${config.default_profile}`);
-      for (const [name, p] of Object.entries(config.profiles)) {
-        console.log(`  - ${name}: ${p.provider}/${p.model} [${p.thinking_level}]`);
+      console.log(`  Profiles are loaded from the DB at boot.`);
+      if (config.default_profile) {
+        console.log(`  default_profile: ${config.default_profile} (from DB)`);
+      }
+      if (config.routing.length > 0) {
+        for (const r of config.routing) {
+          console.log(`  route: ${r.kind} ${r.match} → ${r.profile}`);
+        }
       }
     } catch (e) {
       if (e instanceof ConfigError) {
@@ -45,28 +49,29 @@ configCmd
 // --- noodle run -------------------------------------------------------------
 program
   .command("run")
-  .description("Run the agent on an issue, or dry-run a scan over open issues.")
+  .description("Run the agent on an issue.")
   .requiredOption("-r, --repo <owner/name>", "target repository (owner/name)")
-  .option("-i, --issue <number>", "issue number to fix", (v) => parseInt(v, 10))
-  .option("--scan", "list open issues and show which profile would run (dry-run)")
+  .requiredOption("-i, --issue <number>", "issue number to fix", (v) => parseInt(v, 10))
   .option("-c, --config <path>", "path to config file")
-  .action(async (opts: { repo: string; issue?: number; scan?: boolean; config?: string }) => {
-    if (!opts.issue && !opts.scan) {
-      console.error("✗ Provide --issue <n> to run on one issue, or --scan to dry-run all open issues.");
-      process.exit(2);
-    }
+  .action(async (opts: { repo: string; issue: number; config?: string }) => {
     const config = loadConfig(opts.config);
-    const gh = new GitHubClient(createOctokit());
-
-    if (opts.scan) {
-      // Dry-run: list open issues and show what would be enqueued.
-      console.log(`Scanning open issues in ${opts.repo} (dry-run)…\n`);
-      await scanOnce(opts.config, opts.repo);
-      process.exit(0);
+    // Read the GitHub token from the settings DB (not env vars).
+    const dbPath = process.env.NOODLE_DB_PATH ?? config.storage.sqlite_path;
+    const { SettingStore } = await import("./server/settings-store.js");
+    const { ProfileStore } = await import("./server/profile-store.js");
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(dbPath, { readonly: true });
+    const token = SettingStore.fromDb(db).get("GITHUB_TOKEN");
+    for (const { name, profile } of ProfileStore.fromDb(db).list()) config.profiles[name] = profile;
+    db.close();
+    if (!token) {
+      console.error("✗ No GITHUB_TOKEN in the settings DB. Set it via the dashboard or the setup wizard.");
+      process.exit(1);
     }
+    const gh = new GitHubClient(createOctokit(token));
 
     if (opts.issue) {
-      const result = await runJob(config, gh, { repo: opts.repo, issueNumber: opts.issue });
+      const result = await runJob(config, gh, { repo: opts.repo, issueNumber: opts.issue, token });
       console.log(`\n✓ Done — profile: ${result.profile} (${result.model})`);
       if (result.prUrl) {
         console.log(`  PR:   ${result.prUrl}`);
@@ -89,32 +94,30 @@ program
     await serve(opts.config, { host: opts.host, port: opts.port });
   });
 
-// --- noodle relay (API relay for rate limiting) ------------------------------
-program
-  .command("relay")
-  .description("Run the API relay server for centralized rate limiting.")
-  .option("-c, --config <path>", "path to config file")
-  .option("-H, --host <host>", "bind host (default: 0.0.0.0)")
-  .option("-p, --port <number>", "bind port (default: 4445)", (v) => parseInt(v, 10))
-  .action(async (opts: { config?: string; host?: string; port?: number }) => {
-    const config = loadConfig(opts.config);
-    await startRelay(config, { host: opts.host, port: opts.port });
-  });
-
 // --- noodle doctor ----------------------------------------------------------
 program
   .command("doctor")
   .description("Check that pi, API keys, and GitHub token are ready.")
-  .action(async () => {
+  .option("-c, --config <path>", "path to config file")
+  .action(async (opts: { config?: string }) => {
     let ok = true;
 
-    // GitHub auth: PAT (Phase 1) OR GitHub App (Phase 2).
-    const hasAppCreds = Boolean(
-      process.env.GITHUB_APP_ID && (process.env.GITHUB_PRIVATE_KEY || process.env.GITHUB_PRIVATE_KEY_FILE),
-    );
-    if (process.env.GITHUB_TOKEN) {
+    // Open the DB to read all config (creds + profiles + settings).
+    const config = loadConfig(opts.config);
+    const dbPath = process.env.NOODLE_DB_PATH ?? config.storage.sqlite_path;
+    const { ProfileStore } = await import("./server/profile-store.js");
+    const { SettingStore } = await import("./server/settings-store.js");
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(dbPath, { readonly: true });
+    const settingsStore = SettingStore.fromDb(db);
+    const profileStore = ProfileStore.fromDb(db);
+
+    // GitHub auth: check PAT or App creds in the DB.
+    const hasAppCreds = settingsStore.has("GITHUB_APP_ID") && (settingsStore.has("GITHUB_PRIVATE_KEY") || !!process.env.GITHUB_PRIVATE_KEY_FILE);
+    const token = settingsStore.get("GITHUB_TOKEN");
+    if (token) {
       try {
-        const gh = new GitHubClient(createOctokit());
+        const gh = new GitHubClient(createOctokit(token));
         const me = await gh.currentUserLogin();
         console.log(`✓ GITHUB_TOKEN valid (as @${me}).`);
       } catch (e) {
@@ -122,25 +125,36 @@ program
         console.error(`✗ GITHUB_TOKEN set but failed: ${(e as Error).message}`);
       }
     } else if (hasAppCreds) {
-      console.log("✓ GitHub App credentials present (GITHUB_APP_ID + private key).");
+      console.log("✓ GitHub App credentials present in DB.");
       console.log("  (App token exchange is exercised by `noodle serve`.)");
     } else {
       ok = false;
-      console.error("✗ No GitHub auth: set GITHUB_TOKEN (PAT) or GITHUB_APP_ID + GITHUB_PRIVATE_KEY (App).");
+      console.error("✗ No GitHub auth: set GITHUB_TOKEN (PAT) or GITHUB_APP_ID + GITHUB_PRIVATE_KEY (App) in the Settings page.");
     }
 
-    if (hasAppCreds && !process.env.GITHUB_WEBHOOK_SECRET) {
+    if (hasAppCreds && !settingsStore.has("GITHUB_WEBHOOK_SECRET")) {
       console.warn("⚠ GITHUB_WEBHOOK_SECRET not set — required for `noodle serve` webhook verification.");
     }
 
-    // LLM keys — at least one provider key should be present per the configured profiles.
-    const llmKeys = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY"];
-    const present = llmKeys.filter((k) => process.env[k]);
-    if (present.length === 0) {
+    // LLM config — profiles are in the DB.
+    try {
+      const profiles = profileStore.list();
+      if (profiles.length === 0) {
+        ok = false;
+        console.error("✗ No profiles configured — create one via the dashboard.");
+      } else {
+        const missing = profiles.filter((p) => !p.profile.api_key);
+        if (missing.length > 0) {
+          console.warn(`⚠ Profiles without an api_key (may be no-auth local endpoints): ${missing.map((p) => p.name).join(", ")}`);
+        }
+        const defaultProfile = settingsStore.get("default_profile");
+        console.log(`✓ ${profiles.length} profile(s) in DB.`);
+        if (defaultProfile) console.log(`  default_profile: ${defaultProfile}`);
+      }
+      db.close();
+    } catch {
       ok = false;
-      console.error("✗ No LLM API key found (expected at least one of ANTHROPIC/OPENAI/OPENROUTER/...).");
-    } else {
-      console.log(`✓ LLM keys present: ${present.join(", ")}`);
+      console.error("✗ Could not read profiles from the DB.");
     }
 
     // pi import sanity (proves @earendil-works/pi-coding-agent installed correctly)

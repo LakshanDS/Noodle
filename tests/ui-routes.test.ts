@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
-import { CronStore } from "../src/server/cron-store.js";
+import { SchedulerStore } from "../src/server/scheduler-store.js";
 import { CommandStore } from "../src/server/command-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
 import { ProfileStore } from "../src/server/profile-store.js";
@@ -25,7 +25,7 @@ const PASSWORD = "test-password";
 
 let dir: string;
 let store: RunStore;
-let cronStore: CronStore;
+let cronStore: SchedulerStore;
 let commandStore: CommandStore;
 let settingsStore: SettingStore;
 let db: Database.Database;
@@ -35,7 +35,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "noodle-ui-"));
   db = new Database(join(dir, "runs.db"));
   store = RunStore.fromDb(db);
-  cronStore = CronStore.fromDb(db);
+  cronStore = SchedulerStore.fromDb(db);
   commandStore = CommandStore.fromDb(db);
   settingsStore = SettingStore.fromDb(db);
   sessionPath = join(dir, "session.jsonl");
@@ -56,7 +56,7 @@ function makeApp() {
   const app = Fastify({ logger: false });
   registerUiRoutes(app, {
     runStore: store,
-    secret: PASSWORD,
+    getSecret: () => PASSWORD,
     cronStore,
     commandStore,
     settingsStore,
@@ -77,10 +77,10 @@ function makeApp() {
  * test (parsed object body) would miss that. This is what serve.ts does.
  */
 function makeWebhookAppWithUi() {
-  const app = createWebhookApp("wh-secret", { enqueue: async () => {} });
+  const app = createWebhookApp(() => "wh-secret", { enqueue: async () => {} });
   registerUiRoutes(app, {
     runStore: store,
-    secret: PASSWORD,
+    getSecret: () => PASSWORD,
     cronStore,
     commandStore,
     settingsStore,

@@ -6,8 +6,8 @@ import type { IssueInput } from "../src/profiles/types.js";
 const cfg: NoodleConfig = {
   default_profile: "cheap",
   profiles: {
-    claude: { provider: "anthropic", model: "sonnet", thinking_level: "medium", tools: ["read"] },
-    cheap: { provider: "openrouter", model: "haiku", thinking_level: "off", tools: ["read"] },
+    claude: { provider: "anthropic", model: "sonnet", base_url: "https://api.anthropic.com", api: "anthropic-messages", api_key: "sk-1", thinking_level: "medium", tools: ["read"], input_token_price: 0, output_token_price: 0, cache_read_price: 0, cache_write_price: 0, reasoning: false, api_rpm: 30, retry_max_attempts: 5, retry_base_delay_ms: 3000 },
+    cheap: { provider: "openrouter", model: "haiku", base_url: "https://openrouter.ai/v1", api: "openai-completions", api_key: "sk-2", thinking_level: "off", tools: ["read"], input_token_price: 0, output_token_price: 0, cache_read_price: 0, cache_write_price: 0, reasoning: false, api_rpm: 30, retry_max_attempts: 5, retry_base_delay_ms: 3000 },
   },
   routing: [
     { kind: "slash", match: "/claude", profile: "claude" },

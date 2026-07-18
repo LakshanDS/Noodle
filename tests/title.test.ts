@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { templateTitle, phraseOutput } from "../src/engine/title.js";
-import { NoodleConfigSchema, type NoodleConfig, type Profile } from "../src/config/schema.js";
+import { NoodleConfigSchema, type Profile } from "../src/config/schema.js";
 
 describe("templateTitle (fallback)", () => {
   it("uses the first non-empty line of the task, capped to 80 chars", () => {
@@ -29,9 +29,9 @@ describe("templateTitle (fallback)", () => {
 const config = NoodleConfigSchema.parse({
   agent_name: "TestBot",
   default_profile: "p",
-  profiles: { p: { provider: "openai", model: "gpt-4o-mini" } },
+  profiles: { p: { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" } },
   routing: [],
-}) as NoodleConfig;
+});
 const profile: Profile = config.profiles.p;
 
 /** Minimal fetch mock returning a relay-style chat completion response. */
@@ -59,7 +59,6 @@ describe("phraseOutput", () => {
     globalThis.fetch = mockFetchResponse("## Cleaned\n\nThe fix is in `src/x.ts`.") as never;
     const result = await phraseOutput(
       "Let me check... running grep... The fix is in src/x.ts.",
-      config,
       profile,
     );
     expect(result).toBe("## Cleaned\n\nThe fix is in `src/x.ts`.");
@@ -68,27 +67,27 @@ describe("phraseOutput", () => {
   it("falls back to the raw agent message when the relay is down (non-ok)", async () => {
     const raw = "The fix is in src/x.ts.";
     globalThis.fetch = mockFetchResponse("", false, 503) as never;
-    const result = await phraseOutput(raw, config, profile);
+    const result = await phraseOutput(raw, profile);
     expect(result).toBe(raw);
   });
 
   it("falls back to the raw agent message when the relay returns empty", async () => {
     const raw = "The fix is in src/x.ts.";
     globalThis.fetch = mockFetchResponse("   ") as never;
-    const result = await phraseOutput(raw, config, profile);
+    const result = await phraseOutput(raw, profile);
     expect(result).toBe(raw);
   });
 
   it("falls back when fetch throws (relay unreachable)", async () => {
     const raw = "The fix is in src/x.ts.";
     globalThis.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED")) as never;
-    const result = await phraseOutput(raw, config, profile);
+    const result = await phraseOutput(raw, profile);
     expect(result).toBe(raw);
   });
 
   it("returns the input unchanged when the agent message is empty", async () => {
     globalThis.fetch = mockFetchResponse("should not be called") as never;
-    const result = await phraseOutput("   ", config, profile);
+    const result = await phraseOutput("   ", profile);
     expect(result).toBe("");
   });
 });

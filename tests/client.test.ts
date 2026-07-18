@@ -61,33 +61,33 @@ function makeStub(opts: {
 describe("GitHubClient.ensureLabel", () => {
   it("creates the label with color + description when it is missing (404)", async () => {
     const { client, calls } = makeStub();
-    await client.ensureLabel("owner/repo", "Noodle is cooking", "f0be04", "Noodle agent is working on this");
+    await client.ensureLabel("owner/repo", "Noodle is cooking", "d4a942", "Noodle agent is working on this");
 
     expect(calls.map((c) => c.method)).toEqual(["getLabel", "createLabel"]);
     expect(calls[1].args).toMatchObject({
       owner: "owner",
       repo: "repo",
       name: "Noodle is cooking",
-      color: "f0be04",
+      color: "d4a942",
       description: "Noodle agent is working on this",
     });
   });
 
   it("does nothing when the label already exists", async () => {
     const { client, calls } = makeStub({ getLabel: () => ({ name: "exists", color: "ffffff" }) });
-    await client.ensureLabel("owner/repo", "Noodle cooked here", "22c55e", "Noodle agent run finished");
+    await client.ensureLabel("owner/repo", "Noodle cooked here", "6fae6f", "Noodle agent run finished");
     expect(calls.map((c) => c.method)).toEqual(["getLabel"]); // no createLabel
   });
 
   it("creates the failed (red) label when missing", async () => {
     const { client, calls } = makeStub();
-    await client.ensureLabel("owner/repo", "Noodle got Cooked", "b91c1c", "Noodle agent run errored out");
+    await client.ensureLabel("owner/repo", "Noodle got Cooked", "c76b6b", "Noodle agent run errored out");
     expect(calls.map((c) => c.method)).toEqual(["getLabel", "createLabel"]);
     expect(calls[1].args).toMatchObject({
       owner: "owner",
       repo: "repo",
       name: "Noodle got Cooked",
-      color: "b91c1c",
+      color: "c76b6b",
       description: "Noodle agent run errored out",
     });
   });

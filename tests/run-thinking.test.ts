@@ -39,7 +39,7 @@ vi.mock("../src/engine/workspace.js", () => ({
 const { runJob } = await import("../src/engine/run.js");
 
 function makeConfig(thinkingLevel?: string) {
-  const profile: Record<string, unknown> = { provider: "openai", model: "gpt-4o-mini" };
+  const profile: Record<string, unknown> = { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" };
   if (thinkingLevel !== undefined) profile.thinking_level = thinkingLevel;
   return NoodleConfigSchema.parse({
     agent_name: "TestBot",

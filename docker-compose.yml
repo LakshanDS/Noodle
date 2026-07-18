@@ -6,11 +6,21 @@ services:
     network_mode: host
     volumes:
       - noodle-data:/data
-      - ./noodle.config.yaml:/app/noodle.config.yaml:ro
-    env_file:
-      - .env
+    environment:
+      NOODLE_DB_PATH: /data/noodle.db
+      NOODLE_PORT: "3000"
+      NOODLE_HOST: "0.0.0.0"
+      # Optional: override log verbosity (default: info).
+      # LOG_LEVEL: info
+      # Optional: GitHub App private key as a file mount (K8s/Docker secrets).
+      # GITHUB_PRIVATE_KEY_FILE: /run/secrets/github-private-key.pem
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -1,15 +1,15 @@
 <script setup lang="ts">
 /**
- * Skills list — a table of agent skills. The bundled ones mirror the real
- * skills/ directory at the repo root; custom ones come from the Add form.
- *
- * MOCK ONLY: backed by src/lib/mock.ts. Swap mockListSkills →
- * getJson<SkillsResponse>("/api/skills") to migrate.
+ * Skills list — a table of agent skills read live from the skills/ directory
+ * via GET /api/skills. Bundled skills (noodle-default/fix/review) ship with the
+ * package; custom ones are created through the Add form (which writes a new
+ * skills/<name>/SKILL.md on disk).
  */
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { mockListSkills } from "../lib/mock.js";
-import type { SkillRow } from "../api/types.js";
+import { getJson } from "../api/client.js";
+import { isAuthError } from "../api/client.js";
+import type { SkillRow, SkillsResponse } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import EmptyState from "../components/ui/EmptyState.vue";
@@ -23,9 +23,10 @@ async function load(): Promise<void> {
   loading.value = true;
   loadError.value = "";
   try {
-    const body = await mockListSkills();
+    const body = await getJson<SkillsResponse>("/api/skills");
     skills.value = body.skills ?? [];
   } catch (e) {
+    if (isAuthError(e)) return;
     loadError.value = e instanceof Error ? e.message : "Could not load skills.";
   } finally {
     loading.value = false;
@@ -46,7 +47,7 @@ onMounted(load);
   <AppShell>
     <template #actions>
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        Refresh
+        <span class="btn-label">Refresh</span>
       </Button>
       <Button variant="primary" size="sm" icon="plus" @click="create">Add skill</Button>
     </template>
@@ -70,7 +71,6 @@ onMounted(load);
           <tr>
             <th>Name</th>
             <th>Description</th>
-            <th class="col-source">Source</th>
             <th class="col-updated">Updated</th>
           </tr>
         </thead>
@@ -79,10 +79,7 @@ onMounted(load);
             <td data-label="Name">
               <span class="skill-name mono">{{ s.name }}</span>
             </td>
-            <td class="muted ellipsis" data-label="Description">{{ s.description }}</td>
-            <td class="col-source" data-label="Source">
-              <span class="badge" :class="s.source">{{ s.source }}</span>
-            </td>
+            <td data-label="Description"><span class="desc muted">{{ s.description }}</span></td>
             <td class="col-updated muted" data-label="Updated">{{ s.updated_at ? s.updated_at.replace("T", " ").slice(0, 16) : "—" }}</td>
           </tr>
         </tbody>
@@ -149,31 +146,24 @@ tbody tr:last-child td {
   font-weight: var(--weight-medium);
   color: var(--text);
 }
-.badge {
-  font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
-  padding: 2px 7px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-4);
-  color: var(--text-3);
-}
-.badge.bundled {
-  background: var(--accent-weak);
-  color: var(--accent);
-}
-.col-source,
 .col-updated {
   white-space: nowrap;
 }
-.ellipsis {
-  max-width: 0;
+/* Clamp the description to a couple of lines everywhere — desktop table cell
+ * and mobile card alike. Overflow trails off with an ellipsis; the full text
+ * lives on the skill's detail/edit page (tap the row → "view all"). */
+.desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-/* ---------- Mobile (≤768px) — stacked cards ---------- */
+/* ---------- Mobile (≤768px) — card ----------
+ * Each row is a wrapping flex row: Name (top-left) + Updated (top-right) share
+ * the first line; the Description's 100% basis wraps it onto a full-width
+ * second line. No label gutters — just the values. */
 @media (max-width: 768px) {
   .table-wrap {
     background: transparent;
@@ -181,46 +171,53 @@ tbody tr:last-child td {
     border-radius: 0;
   }
   .table,
-  tbody,
-  tr,
-  td {
+  tbody {
     display: block;
   }
   thead {
     display: none;
   }
   tr.row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    padding: var(--space-2) var(--space-4);
+    padding: var(--space-3) var(--space-4);
     margin-bottom: var(--space-3);
   }
   tr.row:hover {
     background: var(--surface-3);
   }
   tbody td {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-2) 0;
-    border-bottom: 1px solid var(--border-subtle);
+    display: block;
+    padding: 0;
+    border: none;
   }
-  tbody tr:last-child td {
-    border-bottom: none;
+  /* Top row: Name left (semi-bold), Updated pushed to the right edge. */
+  td[data-label="Name"] {
+    flex: 0 0 auto;
+    order: 1;
   }
-  td::before {
-    content: attr(data-label);
-    flex: 0 0 92px;
+  td[data-label="Name"] .skill-name {
+    font-weight: var(--weight-semibold);
+  }
+  td[data-label="Updated"] {
+    flex: 0 0 auto;
+    order: 2;
+    margin-left: auto;
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-caps);
-    color: var(--text-3);
-    font-weight: var(--weight-medium);
   }
-  .ellipsis {
-    max-width: none;
-    white-space: normal;
+  /* Description: full-width second line, clamped to 3 lines. */
+  td[data-label="Description"] {
+    flex: 0 0 100%;
+    order: 3;
+    margin-top: var(--space-2);
+  }
+  td[data-label="Description"] .desc {
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
   }
 }
 </style>

@@ -36,10 +36,10 @@ async function postWebhook(opts: {
   triggers?: TriggerConfig;
   enqueue: (i: { kind: string; repo: string; issueNumber: number; installationId?: number }) => Promise<void> | void;
 }) {
-  const app = createWebhookApp(SECRET, {
+  const app = createWebhookApp(() => SECRET, {
     enqueue: opts.enqueue,
-    selfLogin: opts.selfLogin,
-    triggers: opts.triggers,
+    selfLogin: () => opts.selfLogin,
+    triggers: () => opts.triggers,
   });
   apps.add(app);
   return app.inject({
@@ -160,7 +160,7 @@ describe("webhook http endpoint", () => {
   });
 
   it("responds ok on GET /health", async () => {
-    const app = createWebhookApp(SECRET, { enqueue: async () => {} });
+    const app = createWebhookApp(() => SECRET, { enqueue: async () => {} });
     apps.add(app);
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);

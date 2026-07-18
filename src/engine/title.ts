@@ -1,5 +1,5 @@
 import { log } from "../util/log.js";
-import type { NoodleConfig, Profile } from "../config/schema.js";
+import type { Profile } from "../config/schema.js";
 
 /**
  * Generate a concise GitHub issue title from the agent's findings via a single
@@ -22,11 +22,10 @@ const SYSTEM_PROMPT =
 export async function generateIssueTitle(
   agentMessage: string,
   task: string,
-  config: NoodleConfig,
   profile: Profile,
   relayPort?: number,
 ): Promise<string> {
-  const port = relayPort ?? config.relay?.port ?? 4445;
+  const port = relayPort ?? 4445;
   const url = `http://localhost:${port}/v1/chat/completions`;
 
   // Trim the message — a long findings dump wastes tokens for a one-line title.
@@ -143,14 +142,13 @@ const PHRASE_SYSTEM_PROMPT =
  */
 export async function phraseOutput(
   agentMessage: string,
-  config: NoodleConfig,
   profile: Profile,
   relayPort?: number,
 ): Promise<string> {
   const original = agentMessage.trim();
   if (!original) return original;
 
-  const port = relayPort ?? config.relay?.port ?? 4445;
+  const port = relayPort ?? 4445;
   const url = `http://localhost:${port}/v1/chat/completions`;
 
   const controller = new AbortController();

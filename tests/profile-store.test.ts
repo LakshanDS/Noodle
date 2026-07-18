@@ -13,9 +13,15 @@ let dir: string;
 let store: ProfileStore;
 let db: Database.Database;
 
-/** A minimal valid profile (required fields only); defaults fill the rest. */
+/** A minimal valid profile (required fields: provider, model, base_url, api); defaults fill the rest. */
 function baseProfile(overrides: Partial<Profile> = {}): Profile {
-  return { provider: "anthropic", model: "claude-sonnet-4-20250514", ...overrides };
+  return {
+    model: "claude-sonnet-4-20250514",
+    base_url: "https://api.anthropic.com",
+    api: "anthropic-messages",
+    api_key: "sk-test",
+    ...overrides,
+  };
 }
 
 beforeEach(() => {
@@ -33,14 +39,12 @@ describe("ProfileStore", () => {
   it("creates a profile and reads it back", () => {
     const stored = store.create("claude-fast", baseProfile());
     expect(stored.name).toBe("claude-fast");
-    expect(stored.profile.provider).toBe("anthropic");
     expect(stored.profile.model).toBe("claude-sonnet-4-20250514");
     // Schema defaults are applied on read.
     expect(stored.profile.thinking_level).toBe("medium");
     expect(stored.profile.api_rpm).toBe(30);
 
     const fetched = store.get("claude-fast");
-    expect(fetched.profile.provider).toBe("anthropic");
   });
 
   it("throws on creating a duplicate name", () => {
@@ -115,17 +119,17 @@ describe("ProfileStore", () => {
   });
 
   it("listSummaries returns name + identity fields without the full payload", () => {
-    store.create("p", baseProfile({ provider: "openai", model: "gpt-4o" }));
+    store.create("p", baseProfile({ model: "gpt-4o" }));
     const sums = store.listSummaries();
     expect(sums).toHaveLength(1);
-    expect(sums[0]).toMatchObject({ name: "p", provider: "openai", model: "gpt-4o" });
+    expect(sums[0]).toMatchObject({ name: "p", model: "gpt-4o" });
   });
 
   it("persists across a new store instance on the same DB", () => {
     store.create("persistent", baseProfile());
     const reopened = ProfileStore.fromDb(db);
     expect(reopened.has("persistent")).toBe(true);
-    expect(reopened.get("persistent").profile.provider).toBe("anthropic");
+    expect(reopened.get("persistent").profile.model).toBe("claude-sonnet-4-20250514");
   });
 
   it("stored data round-trips nested fields (tools, pricing, thinking_level)", () => {
@@ -148,42 +152,40 @@ describe("ProfileStore", () => {
 
 describe("validateProfileInput", () => {
   it("accepts a minimal valid profile and applies defaults", () => {
-    const res = validateProfileInput({ provider: "anthropic", model: "m" });
+    const res = validateProfileInput({
+      model: "m",
+      base_url: "https://api.anthropic.com",
+      api: "anthropic-messages",
+    });
     expect("error" in res).toBe(false);
     if (!("error" in res)) {
-      expect(res.provider).toBe("anthropic");
       expect(res.api_rpm).toBe(30); // default applied
     }
   });
 
   it("rejects a profile missing required fields", () => {
-    const res = validateProfileInput({ provider: "anthropic" });
+    const res = validateProfileInput({ model: "test" });
     expect("error" in res).toBe(true);
   });
 
-  it("rejects base_url without api", () => {
+  it("rejects base_url without api (both required)", () => {
     const res = validateProfileInput({
-      provider: "ollama",
       model: "llama3",
       base_url: "http://localhost:11434/v1",
     });
     expect("error" in res).toBe(true);
-    if ("error" in res) expect(res.error).toMatch(/api.*required/);
   });
 
-  it("rejects api without base_url", () => {
+  it("rejects api without base_url (both required)", () => {
     const res = validateProfileInput({
-      provider: "ollama",
       model: "llama3",
       api: "openai-completions",
     });
     expect("error" in res).toBe(true);
-    if ("error" in res) expect(res.error).toMatch(/base_url.*required/);
   });
 
   it("accepts a custom endpoint with both base_url and api", () => {
     const res = validateProfileInput({
-      provider: "ollama",
       model: "llama3",
       base_url: "http://localhost:11434/v1",
       api: "openai-completions",

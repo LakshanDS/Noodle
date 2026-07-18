@@ -8,7 +8,7 @@
  */
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { getJson, sendJson, ApiRequestError } from "../api/client.js";
+import { getJson, sendJson, ApiRequestError, isAuthError } from "../api/client.js";
 import type { RunDetailResponse, ParsedMessage, RunRow } from "../api/types.js";
 import { fmtTime } from "../lib/format.js";
 import AppShell from "../components/AppShell.vue";
@@ -50,7 +50,7 @@ const trigger = computed(() => {
   if (!r) return "";
   const cmd = r.command ? ` · /${r.command}` : "";
   if (r.issue != null) return `Issue #${r.issue}${cmd}`;
-  if (r.cron_job_id != null) return "Cron";
+  if (r.cron_job_id != null) return "Schedule";
   return "Manual";
 });
 
@@ -70,6 +70,7 @@ async function load(): Promise<void> {
     messages.value = body.messages ?? [];
     await nextTick(scrollToBottom);
   } catch (e) {
+    if (isAuthError(e)) return;
     loadError.value = e instanceof ApiRequestError ? e.message : "Could not load run.";
   } finally {
     loading.value = false;
@@ -111,7 +112,7 @@ onMounted(load);
     <template #actions>
       <Button variant="ghost" size="sm" icon="back" @click="back">Back</Button>
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        Refresh
+        <span class="btn-label">Refresh</span>
       </Button>
       <Button
         v-if="isRunning"

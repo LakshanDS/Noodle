@@ -1,12 +1,12 @@
 import type { JobQueue } from "./queue.js";
-import type { CronStore } from "./cron-store.js";
+import type { SchedulerStore } from "./scheduler-store.js";
 import type { AuthProvider } from "../github/auth-provider.js";
 import { log } from "../util/log.js";
 import type { NoodleConfig } from "../config/schema.js";
 
 /**
  * Periodic cron-job scheduler — the cron equivalent of `Scheduler` (which polls
- * for new issues). Every tick it asks `CronStore.listDueCrons()` for enabled
+ * for new issues). Every tick it asks `SchedulerStore.listDueSchedulers()` for enabled
  * cron jobs whose `next_run_at` has passed, enqueues each into the shared job
  * queue (where a worker picks it up and runs `runCronJob`), and advances the
  * job's `next_run_at` to its next fire time.
@@ -16,14 +16,14 @@ import type { NoodleConfig } from "../config/schema.js";
  * next_run_at still advances, and the missed run is skipped rather than queued
  * on top of the live one.
  *
- * Deps are injected (listDueCrons / enqueue / markScheduled) so the pure
- * `runCronTick` function unit-tests without a DB or the network. The
- * `CronScheduler` class just wires it to the real stores + a setInterval.
+ * Deps are injected (listDueSchedulers / enqueue / markScheduled) so the pure
+ * `runSchedulerTick` function unit-tests without a DB or the network. The
+ * `SchedulerRunner` class just wires it to the real stores + a setInterval.
  */
 
-export interface CronSchedulerDeps {
-  listDueCrons(now?: Date): ReturnType<CronStore["listDueCrons"]>;
-  enqueueCron(repo: string, cronJobId: number, installationId: number | null | undefined, profile: string | null): Promise<void>;
+export interface SchedulerRunnerDeps {
+  listDueSchedulers(now?: Date): ReturnType<SchedulerStore["listDueSchedulers"]>;
+  enqueueScheduler(repo: string, cronJobId: number, installationId: number | null | undefined, profile: string | null): Promise<void>;
   markScheduled(id: number, now?: Date): void;
 }
 
@@ -34,23 +34,23 @@ export interface CronSchedulerDeps {
  * (bad repo, no installation, transient API error) is logged + skipped without
  * stalling the others or aborting the tick.
  */
-export async function runCronTick(deps: CronSchedulerDeps, now: Date = new Date()): Promise<number> {
-  const due = deps.listDueCrons(now);
+export async function runSchedulerTick(deps: SchedulerRunnerDeps, now: Date = new Date()): Promise<number> {
+  const due = deps.listDueSchedulers(now);
   if (due.length === 0) return 0;
-  log.info({ due: due.length }, "cron tick: enqueuing due cron jobs");
+  log.info({ due: due.length }, "scheduler tick: enqueuing due scheduler jobs");
   let enqueued = 0;
-  for (const cron of due) {
-    const log_ = log.child({ cronId: cron.id, name: cron.name, repo: cron.repo, component: "cron-scheduler" });
+  for (const scheduler of due) {
+    const log_ = log.child({ schedulerId: scheduler.id, name: scheduler.name, repo: scheduler.repo, component: "scheduler-runner" });
     try {
-      await deps.enqueueCron(cron.repo, cron.id, null, cron.profile);
-      deps.markScheduled(cron.id, now);
+      await deps.enqueueScheduler(scheduler.repo, scheduler.id, null, scheduler.profile);
+      deps.markScheduled(scheduler.id, now);
       enqueued++;
-      log_.info({ expr: cron.cron_expression }, "enqueued cron run");
+      log_.info({ expr: scheduler.cron_expression }, "enqueued scheduler run");
     } catch (e) {
       // Don't advance next_run_at on failure — we want a retry on the next tick.
       // But DO log loudly so a permanently-broken cron (deleted repo, revoked
       // installation) is visible rather than silently spinning.
-      log_.error({ err: e }, "failed to enqueue cron run; will retry next tick");
+      log_.error({ err: e }, "failed to enqueue scheduler run; will retry next tick");
     }
   }
   return enqueued;
@@ -65,12 +65,12 @@ export async function runCronTick(deps: CronSchedulerDeps, now: Date = new Date(
  * target, without busy-looping. The actual schedule is computed by cron-parser
  * from each job's expression, not by this interval.
  */
-export class CronScheduler {
+export class SchedulerRunner {
   private timer: NodeJS.Timeout | null = null;
   private readonly tickMs: number;
 
   constructor(
-    private readonly deps: CronSchedulerDeps,
+    private readonly deps: SchedulerRunnerDeps,
     tickIntervalMs = 60_000,
   ) {
     this.tickMs = tickIntervalMs;
@@ -78,10 +78,10 @@ export class CronScheduler {
 
   start(): void {
     if (this.timer) return;
-    log.info({ tickIntervalMs: this.tickMs }, "cron scheduler started");
-    runCronTick(this.deps).catch((e) => log.error({ err: e }, "initial cron tick failed"));
+    log.info({ tickIntervalMs: this.tickMs }, "scheduler runner started");
+    runSchedulerTick(this.deps).catch((e) => log.error({ err: e }, "initial scheduler tick failed"));
     this.timer = setInterval(() => {
-      runCronTick(this.deps).catch((e) => log.error({ err: e }, "scheduled cron tick failed"));
+      runSchedulerTick(this.deps).catch((e) => log.error({ err: e }, "scheduled scheduler tick failed"));
     }, this.tickMs);
   }
 
@@ -89,26 +89,26 @@ export class CronScheduler {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
-      log.info("cron scheduler stopped");
+      log.info("scheduler runner stopped");
     }
   }
 }
 
 /**
- * Build the real CronSchedulerDeps from the shared stores + auth provider.
+ * Build the real SchedulerRunnerDeps from the shared stores + auth provider.
  * Installation-id resolution happens lazily at job-run time inside the auth
  * provider (forRepo auto-resolves when no id is passed), so enqueueCron doesn't
  * need to do any API calls — it just drops the job in the queue.
  */
-export function buildCronSchedulerDeps(
-  cronStore: CronStore,
+export function buildSchedulerRunnerDeps(
+  schedulerStore: SchedulerStore,
   queue: JobQueue,
   _authProvider: AuthProvider,
   config: NoodleConfig,
-): CronSchedulerDeps {
+): SchedulerRunnerDeps {
   return {
-    listDueCrons: (now) => cronStore.listDueCrons(now),
-    enqueueCron: async (repo, cronJobId, _installationId, profile) => {
+    listDueSchedulers: (now) => schedulerStore.listDueSchedulers(now),
+    enqueueScheduler: async (repo, cronJobId, _installationId, profile) => {
       // No installation-id resolution here — the worker's forRepo() call
       // resolves it from the repo name via the App JWT (see auth-provider.ts).
       // This keeps enqueue fast (no API round-trips) and lets the dedupe index
@@ -119,6 +119,6 @@ export function buildCronSchedulerDeps(
         profile: profile ?? config.default_profile,
       });
     },
-    markScheduled: (id, now) => cronStore.markScheduled(id, now),
+    markScheduled: (id, now) => schedulerStore.markScheduled(id, now),
   };
 }

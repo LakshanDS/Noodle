@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { RunStore } from "../src/server/run-store.js";
-import { CronStore } from "../src/server/cron-store.js";
+import { SchedulerStore } from "../src/server/scheduler-store.js";
 import { CommandStore } from "../src/server/command-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
 import { ProfileStore } from "../src/server/profile-store.js";
@@ -29,7 +29,7 @@ beforeEach(() => {
   db = new Database(join(dir, "runs.db"));
   settingsStore = SettingStore.fromDb(db);
   RunStore.fromDb(db); // ensure runs table exists
-  CronStore.fromDb(db); // ensure cron table exists
+  SchedulerStore.fromDb(db); // ensure cron table exists
   CommandStore.fromDb(db); // ensure command table exists
 });
 
@@ -42,15 +42,15 @@ function makeApp() {
   const app = Fastify({ logger: false });
   registerUiRoutes(app, {
     runStore: RunStore.fromDb(db),
-    secret: PASSWORD,
-    cronStore: CronStore.fromDb(db),
+    getSecret: () => PASSWORD,
+    cronStore: SchedulerStore.fromDb(db),
     commandStore: CommandStore.fromDb(db),
     settingsStore,
     profileStore: ProfileStore.fromDb(db),
     queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
     authProvider: {} as never,
     agentName: "TestBot",
-    config: { profiles: {}, default_profile: "x" } as never,
+    config: { profiles: {}, default_profile: "x", queue: { max_attempts: 3, retry_backoff_seconds: 60 } } as never,
   });
   return app;
 }
@@ -105,12 +105,18 @@ describe("UI settings routes — GET", () => {
       expect(body.values.GITHUB_TOKEN).toBe("••••3456");
       // Non-secret value is cleartext.
       expect(body.values.NOODLE_LOGIN).toBe("noodle-agent");
-      // Unset secret is empty string.
-      expect(body.values.ANTHROPIC_API_KEY).toBe("");
-      // restartKeys lists the boot-read keys.
-      expect(body.restartKeys).toContain("GITHUB_TOKEN");
-      expect(body.restartKeys).toContain("NOODLE_UI_PASSWORD");
-      expect(body.restartKeys).not.toContain("ANTHROPIC_API_KEY");
+      // agent_name was removed from the catalog (hardcoded "Noodle" now).
+      expect(body.values.agent_name).toBeUndefined();
+      // default_profile moved to the Profiles page — no longer in the settings catalog.
+      expect(body.values.default_profile).toBeUndefined();
+      // restartKeys lists the boot-read keys. GitHub creds (PAT/App), the UI
+      // password, agent_name/login/triggers/routing are all read live now, and
+      // the queue retry knobs resolve via getters at dispatch time. Nothing in
+      // the catalog requires a restart.
+      expect(body.restartKeys).not.toContain("GITHUB_TOKEN");
+      expect(body.restartKeys).not.toContain("NOODLE_UI_PASSWORD");
+      expect(body.restartKeys).not.toContain("default_profile");
+      expect(body.restartKeys).not.toContain("agent_name");
     } finally {
       await app.close();
     }
@@ -118,7 +124,7 @@ describe("UI settings routes — GET", () => {
 });
 
 describe("UI settings routes — PUT", () => {
-  it("writes new values and reports needsRestart for boot-read keys", async () => {
+  it("writes new values and reports needsRestart=false", async () => {
     const app = makeApp();
     try {
       const res = await app.inject({
@@ -127,7 +133,7 @@ describe("UI settings routes — PUT", () => {
         headers: { cookie: authCookie(), "content-type": "application/json" },
         payload: JSON.stringify({
           values: {
-            GITHUB_TOKEN: "ghp_newvalue",
+            queue_max_attempts: "5",
             ANTHROPIC_API_KEY: "sk-ant-new",
           },
         }),
@@ -135,10 +141,11 @@ describe("UI settings routes — PUT", () => {
       expect(res.statusCode).toBe(200);
       const body = res.json();
       expect(body.ok).toBe(true);
-      expect(body.needsRestart).toBe(true); // GITHUB_TOKEN is a restart key
-      expect(body.restartKeys).toEqual(["GITHUB_TOKEN"]);
+      // All catalog fields are live-editable — no restart.
+      expect(body.needsRestart).toBe(false);
+      expect(body.restartKeys).toEqual([]);
       // Persisted.
-      expect(settingsStore.get("GITHUB_TOKEN")).toBe("ghp_newvalue");
+      expect(settingsStore.get("queue_max_attempts")).toBe("5");
       expect(settingsStore.get("ANTHROPIC_API_KEY")).toBe("sk-ant-new");
     } finally {
       await app.close();

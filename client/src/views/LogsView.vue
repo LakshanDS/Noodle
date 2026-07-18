@@ -2,18 +2,20 @@
 /**
  * System log — a live, auto-refreshing view of the server's in-memory log ring
  * buffer (GET /api/logs). This mirrors what `docker logs` shows for Noodle's own
- * output: every pino line tee'd into the buffer. Entries arrive newest-first;
- * polling appends fresh lines on an interval and can be paused.
+ * output. Entries arrive oldest-first; newest lines appear at the bottom.
+ * The viewport auto-scrolls down as new entries arrive.
  *
  * The buffer is per-boot and bounded, so this shows recent history (not the
  * full container lifetime) — same as `docker logs --since` on a fresh process.
  */
-import { computed, onMounted, onUnmounted, ref } from "vue";
-import { getJson, ApiRequestError } from "../api/client.js";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { getJson, ApiRequestError, isAuthError } from "../api/client.js";
 import type { LogsResponse, LogEntry } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import Icon from "../components/ui/Icon.vue";
+import Select from "../components/ui/Select.vue";
+import type { SelectOption } from "../components/ui/Select.vue";
 
 const POLL_MS = 4000;
 
@@ -22,6 +24,15 @@ const loading = ref(false);
 const loadError = ref("");
 const levelFilter = ref<"all" | "debug" | "info" | "warn" | "error">("info");
 const autoRefresh = ref(true);
+const streamEl = ref<HTMLElement | null>(null);
+
+const levelOptions: SelectOption[] = [
+  { value: "all", label: "All" },
+  { value: "debug", label: "Debug+" },
+  { value: "info", label: "Info+" },
+  { value: "warn", label: "Warn+" },
+  { value: "error", label: "Error+" },
+];
 let timer: ReturnType<typeof setInterval> | null = null;
 
 /** Numeric floor for the selected level filter (matches the server's ?level=). */
@@ -38,13 +49,22 @@ const filtered = computed(() => {
   return floor === 0 ? entries.value : entries.value.filter((e) => e.level >= floor);
 });
 
+function scrollToBottom(): void {
+  nextTick(() => {
+    const el = streamEl.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  });
+}
+
 async function load(): Promise<void> {
   loading.value = true;
   loadError.value = "";
   try {
     const body = await getJson<LogsResponse>(`/api/logs?limit=500`);
     entries.value = body.entries ?? [];
+    scrollToBottom();
   } catch (e) {
+    if (isAuthError(e)) return;
     loadError.value = e instanceof ApiRequestError ? e.message : "Could not load logs.";
   } finally {
     loading.value = false;
@@ -74,6 +94,16 @@ function levelColor(level: number): string {
   return "var(--text-3)";
 }
 
+/** Download all persistent log files as a single text file. */
+function downloadLogs(): void {
+  const a = document.createElement("a");
+  a.href = "/api/logs/download";
+  a.download = "noodle-logs.txt";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 onMounted(async () => {
   await load();
   if (autoRefresh.value) startPolling();
@@ -84,23 +114,26 @@ onUnmounted(stopPolling);
 <template>
   <AppShell>
     <template #actions>
-      <select v-model="levelFilter" class="level-select ctrl" title="Minimum level">
-        <option value="all">All levels</option>
-        <option value="debug">Debug+</option>
-        <option value="info">Info+</option>
-        <option value="warn">Warn+</option>
-        <option value="error">Error+</option>
-      </select>
+      <Select
+        v-model="levelFilter"
+        :options="levelOptions"
+        size="sm"
+        class="level-select"
+      />
       <Button
         variant="ghost"
         size="sm"
-        :icon="autoRefresh ? 'refresh' : 'play'"
+        class="live-toggle"
+        :icon="autoRefresh ? 'pause' : 'play'"
+        :title="autoRefresh ? 'Pause live stream' : 'Resume live stream'"
+        :aria-label="autoRefresh ? 'Pause live stream' : 'Resume live stream'"
         @click="toggleAuto"
-      >
-        {{ autoRefresh ? "Live" : "Paused" }}
+      />
+      <Button variant="ghost" size="sm" icon="refresh" :loading="loading" title="Refresh" @click="load">
+        <span class="btn-label">Refresh</span>
       </Button>
-      <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        Refresh
+      <Button variant="ghost" size="sm" icon="download" title="Download logs" @click="downloadLogs">
+        <span class="btn-label">Download</span>
       </Button>
     </template>
 
@@ -115,7 +148,7 @@ onUnmounted(stopPolling);
       <p>{{ entries.length === 0 ? "No logs yet — the server just started." : "No entries at this level." }}</p>
     </div>
 
-    <div v-else class="log-stream">
+    <div v-else class="log-stream" ref="streamEl">
       <div v-for="(e, i) in filtered" :key="i" class="log-line">
         <span class="ts">{{ e.ts }}</span>
         <span class="lvl" :style="{ color: levelColor(e.level) }">{{ e.levelLabel }}</span>
@@ -166,16 +199,18 @@ onUnmounted(stopPolling);
 }
 
 .level-select {
-  height: 30px;
-  font-size: var(--text-xs);
+  width: auto;
+  min-width: 120px;
 }
 
 .log-stream {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  overflow: hidden;
+  overflow: auto;
   font-family: var(--font-mono);
+  height: calc(100dvh - 144px);
+  flex-shrink: 0;
 }
 .log-line {
   display: flex;
@@ -239,33 +274,48 @@ onUnmounted(stopPolling);
   padding: 1px 5px;
   border-radius: var(--radius-sm);
 }
-.ctrl {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text);
-  padding: 0 var(--space-2);
-}
 
-/* ---------- Mobile (≤768px) — wrap log lines ---------- */
 @media (max-width: 768px) {
-  /* Let long messages wrap instead of being clipped off-screen. The timestamp
-   * + level stay on the first line; the message flows onto the lines below. */
+  .live-toggle {
+    display: none;
+  }
+  .log-stream {
+    height: calc(100dvh - 180px);
+  }
   .log-line {
-    white-space: normal;
-    align-items: flex-start;
-    padding: var(--space-2) var(--space-3);
+    white-space: nowrap;
+    font-size: 11px;
+    padding: 5px var(--space-3);
+    width: max-content;
+    min-width: 100%;
   }
   .msg {
-    white-space: pre-wrap;
+    white-space: nowrap;
+    flex: 0 0 auto;
     overflow: visible;
-    flex: 1 1 100%;
+    text-overflow: clip;
   }
   .fields {
-    flex: 1 1 100%;
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
   }
   .foot-note {
     font-size: var(--text-xs);
+  }
+}
+</style>
+
+<!--
+  Global (unscoped) styles — needed to override the Select component's scoped
+  .select { width: 100% } which can't be pierced from a parent scoped block.
+-->
+<style>
+@media (max-width: 768px) {
+  .level-select.select {
+    width: 10px !important;
+  }
+  .level-select.select .trigger {
+    padding: 0 10px;
   }
 }
 </style>

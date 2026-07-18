@@ -28,12 +28,8 @@ describe("prompt split: /noodle stays byte-identical", () => {
 
   it("the /noodle framing block is present verbatim in the rebuilt prompt", () => {
     const p = buildRunPrompt(defaultCommandPrompt("Noodle"), issue, [], "o/r");
-    // Skill-loading lines must appear exactly once and in order.
-    expect(p).toContain("**Load both skills before starting:**");
-    expect(p).toContain("`noodle-default`");
-    expect(p).toContain("`noodle-fix`");
-    // The "final message IS the deliverable" line references the agent name.
-    expect(p).toContain("Noodle phrases that message into the comment and commits the changes");
+    expect(p).toContain("Load the `noodle-default` skill before starting.");
+    expect(p).toContain("Noodle posts the final answer as a normal text message");
     expect(p).toContain('your final message IS the deliverable.');
   });
 
@@ -43,7 +39,7 @@ describe("prompt split: /noodle stays byte-identical", () => {
     expect(p).toContain(custom);
     expect(p.startsWith("You are working on an issue in the GitHub repository `o/r`.")).toBe(true);
     // The default skill-loading block must NOT leak into a custom command's prompt.
-    expect(p).not.toContain("**Load both skills before starting:**");
+    expect(p).not.toContain("Load the `noodle-default` skill before starting.");
     // Context block is still appended.
     expect(p).toContain("## Issue");
     expect(p).toContain("Fix the login bug");

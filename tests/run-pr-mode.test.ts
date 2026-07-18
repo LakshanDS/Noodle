@@ -43,7 +43,7 @@ vi.mock("../src/engine/workspace.js", () => ({
 
 const { runJob } = await import("../src/engine/run.js");
 
-function makeConfig(profiles = { p: { provider: "openai", model: "gpt-4o-mini" } }) {
+function makeConfig(profiles = { p: { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" } }) {
   return NoodleConfigSchema.parse({
     agent_name: "Noodle",
     default_profile: "p",

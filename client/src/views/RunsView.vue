@@ -4,14 +4,14 @@
  * the run detail. Running rows show a Cancel affordance in the row; clicking it
  * cancels (marks the job failed) and refreshes the list.
  *
- * Columns: status dot · repo (#issue / cron) · profile · model · duration.
+ * Columns: status dot · repo (#issue / scheduled) · profile · model · duration.
  * Manual refresh via the top-bar action; no auto-polling yet.
  */
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { getJson, sendJson, ApiRequestError } from "../api/client.js";
+import { getJson, sendJson, ApiRequestError, isAuthError } from "../api/client.js";
 import type { RunsResponse, RunRow } from "../api/types.js";
-import { fmtTime, repoLeaf } from "../lib/format.js";
+import { fmtTime, repoLeaf, fmtDuration } from "../lib/format.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import StatusPill from "../components/ui/StatusPill.vue";
@@ -29,6 +29,7 @@ async function load(): Promise<void> {
     const body = await getJson<RunsResponse>("/api/runs");
     runs.value = body.runs ?? [];
   } catch (e) {
+    if (isAuthError(e)) return;
     loadError.value = e instanceof ApiRequestError ? e.message : "Could not load runs.";
   } finally {
     loading.value = false;
@@ -60,7 +61,7 @@ onMounted(load);
         <span class="live-dot" /> {{ liveCount }} running
       </span>
       <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        Refresh
+        <span class="btn-label">Refresh</span>
       </Button>
     </template>
 
@@ -84,6 +85,7 @@ onMounted(load);
             <th class="col-profile">Profile</th>
             <th class="col-model">Model</th>
             <th class="col-time">When</th>
+            <th class="col-dur">Duration</th>
             <th class="col-act"></th>
           </tr>
         </thead>
@@ -94,9 +96,7 @@ onMounted(load);
               <div class="repo-cell">
                 <span class="repo-name">{{ repoLeaf(r.repo) }}</span>
                 <span class="repo-meta">
-                  {{ r.repo }}
-                  <template v-if="r.issue != null">#{{ r.issue }}</template>
-                  <template v-else-if="r.cron_job_id"> · cron</template>
+                  <span class="repo-full">{{ r.repo }}</span><span class="ctx-issue" v-if="r.issue != null"> #{{ r.issue }}</span><span class="ctx-cron" v-else-if="r.cron_job_id"> · scheduled</span>
                 </span>
               </div>
             </td>
@@ -109,6 +109,7 @@ onMounted(load);
               <span v-else class="subtle">—</span>
             </td>
             <td class="col-time muted" data-label="When">{{ fmtTime(r.started_at) }}</td>
+            <td class="col-dur muted" data-label="Duration">{{ fmtDuration(r.started_at, r.finished_at) }}</td>
             <td class="col-act" data-label="">
               <Button
                 v-if="r.status === 'running'"
@@ -241,7 +242,8 @@ tbody tr:last-child td {
 }
 .col-profile,
 .col-model,
-.col-time {
+.col-time,
+.col-dur {
   white-space: nowrap;
 }
 .col-model {
@@ -252,60 +254,157 @@ tbody tr:last-child td {
   text-align: right;
 }
 
-/* ---------- Mobile (≤768px) — stacked cards ---------- */
+/* ---------- Mobile (≤768px) — card, 2 rows ----------
+   ┌──────────────────────────────────────────┐
+   │ repo leaf + #issue               ● Status │   row 1
+   │ Jul 14, 2:30 PM · 1h 12m        profile  │   row 2: time·dur (left) · profile (right)
+   └──────────────────────────────────────────┘
+   The profile shows its FULL name, right-aligned; it only ellipsizes from the
+   left if it's too long to fit. Model is hidden (on the detail page). */
 @media (max-width: 768px) {
-  .table-wrap {
-    background: transparent;
-    border: none;
-    border-radius: 0;
-  }
   .table,
-  tbody,
-  tr,
-  td {
+  tbody {
     display: block;
   }
   thead {
     display: none;
   }
+  .table-wrap {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+  }
   tr.row {
+    display: grid;
+    /* Col 1 = time·dur (auto), col 2 = duration tail (auto), col 3 = profile
+     * (grows). Row 1 spans cols 1-2 for the repo name. */
+    grid-template-columns: auto auto 1fr;
+    align-items: baseline;
+    column-gap: var(--space-2);
+    row-gap: var(--space-2);
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    padding: var(--space-2) var(--space-4);
+    padding: var(--space-3) var(--space-4);
     margin-bottom: var(--space-3);
   }
   tr.row:hover {
     background: var(--surface-3);
   }
   tbody td {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-2) 0;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-  tbody tr:last-child td {
-    border-bottom: none;
+    display: block;
+    padding: 0;
+    border: none;
   }
   td::before {
-    content: attr(data-label);
-    flex: 0 0 92px;
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-caps);
-    color: var(--text-3);
-    font-weight: var(--weight-medium);
-  }
-  /* Cells with no label (the action column) skip the label column. */
-  td[data-label=""]::before {
     content: none;
   }
-  .col-act {
-    text-align: left;
+
+  /* ---- Row 1: Repository (cols 1-2) · Status (col 3) ---- */
+  td[data-label="Repository"] {
+    grid-column: 1 / 3;
+    grid-row: 1;
+    min-width: 0;
   }
-  .col-model .ellipsis {
-    white-space: normal;
+  td[data-label="Repository"] .repo-name {
+    font-weight: var(--weight-semibold);
+  }
+  .repo-cell {
+    flex-direction: row;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .repo-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .repo-full {
+    display: none;
+  }
+  .repo-meta {
+    flex: 0 0 auto;
+    font-size: var(--text-xs);
+    color: var(--text-3);
+    white-space: nowrap;
+  }
+  td[data-label="Status"] {
+    grid-column: 3;
+    grid-row: 1;
+    justify-self: end;
+  }
+  td[data-label="Status"] :deep(.pill) {
+    padding: 3px 8px 3px 7px;
+    background: var(--surface-4);
+  }
+  td[data-label="Status"] :deep(.label) {
+    display: inline;
+  }
+  td[data-label="Status"] :deep(.dot) {
+    width: 6px;
+    height: 6px;
+  }
+
+  /* ---- Row 2: When (col 1) · Duration (col 2) · Profile (col 3) ---- */
+  td[data-label="When"] {
+    grid-column: 1;
+    grid-row: 2;
+    font-size: var(--text-xs);
+    color: var(--text-3);
+  }
+  td[data-label="Duration"] {
+    grid-column: 2;
+    grid-row: 2;
+    font-size: var(--text-xs);
+    color: var(--text-3);
+  }
+  /* Dot-separator between When and Duration. */
+  td[data-label="Duration"]::before {
+    content: "·";
+    margin-right: var(--space-2);
+    color: var(--text-3);
+  }
+  td[data-label="Profile"] {
+    grid-column: 3;
+    grid-row: 2;
+    justify-self: end;
+    text-align: right;
+    font-size: var(--text-xs);
+    min-width: 0;
+    /* Show the full name; only ellipsize from the left if it overflows. RTL
+     * direction keeps the text right-aligned and clips the leading chars. */
+    direction: rtl;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Strip the chip styling on mobile so the profile is plain text — matches the
+   * height of the time/duration cells, keeping the card's padding even top and
+   * bottom instead of the chip's extra padding skewing it. */
+  td[data-label="Profile"] .tag {
+    background: transparent;
+    padding: 0;
+    font-family: inherit;
+    color: var(--text-3);
+  }
+
+  /* Model is hidden on mobile. */
+  .col-model {
+    display: none;
+  }
+
+  /* Cancel spans the full width below the grid if the run is live. The <td>
+   * exists in the DOM even when there's no button (non-running runs), so hide
+   * it when empty — otherwise it creates a phantom grid row 3 whose row-gap
+   * shows up as extra bottom padding on every non-running card. */
+  td[data-label=""]:empty {
+    display: none;
+  }
+  td[data-label=""]:not(:empty) {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    margin-top: var(--space-1);
   }
 }
 </style>
