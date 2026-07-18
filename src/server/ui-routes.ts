@@ -78,6 +78,10 @@ export interface UiDeps {
    * is enqueued. Optional only so test harnesses can omit it.
    */
   dispatch?: () => void;
+  /** Shared map of model → original upstream base_url (before relay rewrite). Updated live on profile CRUD. */
+  originalUrls?: Map<string, string>;
+  /** The relay base URL (e.g. http://localhost:4445/v1) for rewriting relay-enabled profiles. */
+  relayBase?: string;
 }
 
 /**
@@ -418,6 +422,12 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     }
     const stored = profileStore.create(name, parsed.profile);
     // Live-sync into the in-memory config so the profile is runnable now.
+    // If use_relay is enabled, save the original base_url for the relay to
+    // forward to, then rewrite config.profiles to route through the relay.
+    if (parsed.profile.use_relay && deps.originalUrls && deps.relayBase) {
+      deps.originalUrls.set(parsed.profile.model, parsed.profile.base_url);
+      parsed.profile.base_url = deps.relayBase;
+    }
     config.profiles[name] = parsed.profile;
     // If this is the first profile, set it as the default.
     if (!settingsStore.has("default_profile")) {
@@ -571,6 +581,14 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       delete config.profiles[name];
     }
     const stored = profileStore.update(newName, parsed.profile);
+    // Relay-aware: save original base_url and rewrite to relay URL if enabled.
+    if (parsed.profile.use_relay && deps.originalUrls && deps.relayBase) {
+      deps.originalUrls.set(parsed.profile.model, parsed.profile.base_url);
+      parsed.profile.base_url = deps.relayBase;
+    } else if (!parsed.profile.use_relay && deps.originalUrls) {
+      // Toggled relay off — remove from originalUrls so the relay stops routing it.
+      deps.originalUrls.delete(parsed.profile.model);
+    }
     config.profiles[stored.name] = parsed.profile;
     return { profile: toProfileDetail(stored, "db") };
   });
@@ -579,6 +597,11 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     const name = (req.params as { name: string }).name;
     if (!profileStore.has(name)) {
       return reply.code(404).send({ error: `profile "${name}" not found` });
+    }
+    // Clean up relay originalUrls before deleting.
+    const deleted = config.profiles[name];
+    if (deleted?.model && deps.originalUrls) {
+      deps.originalUrls.delete(deleted.model);
     }
     profileStore.delete(name);
     delete config.profiles[name];

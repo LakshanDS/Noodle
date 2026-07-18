@@ -8,7 +8,7 @@ services:
       - noodle-data:/data
     environment:
       NOODLE_DB_PATH: /data/noodle.db
-      NOODLE_PORT: "3000"
+      NOODLE_PORT: "4444"
       NOODLE_HOST: "0.0.0.0"
       # Optional: override log verbosity (default: info).
       # LOG_LEVEL: info
@@ -20,7 +20,7 @@ services:
         max-size: "50m"
         max-file: "5"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:4444/health"]
       interval: 30s
       timeout: 5s
       retries: 3

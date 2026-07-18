@@ -39,12 +39,16 @@ export interface RelayOptions {
 export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {}): FastifyInstance {
   const app = Fastify({ logger: false });
 
-  const profiles = buildProfileMap(config);
-  const providerUrls = opts.originalUrls ?? resolveProviderUrls(config);
+  // Use the shared originalUrls map (live reference, not a snapshot) so
+  // profiles toggled to use_relay after boot are immediately routable.
+  const originalUrls = opts.originalUrls;
 
   // --- Routes ---
 
-  app.get("/health", async () => ({ status: "ok", profiles: Array.from(profiles.keys()) }));
+  app.get("/health", async () => {
+    const profiles = buildProfileMap(config);
+    return { status: "ok", profiles: Array.from(profiles.keys()) };
+  });
 
   // Raw body parser — we forward the original JSON untouched.
   app.addContentTypeParser(
@@ -69,9 +73,9 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
       return reply.code(400).send({ error: "missing or invalid 'model' in request body" });
     }
 
-    // 1. Rate-limit: sleep the fixed RPM interval (60000/rpm ms) so we never
-    //    exceed the provider's limit. Returns the API key for the model.
-    //    Throws if the model isn't configured.
+    // 1. Rate-limit: rebuild profile map from live config so newly toggled
+    //    use_relay profiles are picked up without a restart.
+    const profiles = buildProfileMap(config);
     let apiKey: string;
     try {
       apiKey = await acquireSlot(profiles, model);
@@ -79,8 +83,9 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
       return reply.code(400).send({ error: (e as Error).message });
     }
 
-    // 2. Resolve base URL.
-    const baseUrl = findProviderUrl(config, model, providerUrls);
+    // 2. Resolve base URL — check originalUrls map first (live reference),
+    //    then fall back to config.profiles.
+    const baseUrl = originalUrls?.get(model) ?? findProviderUrl(config, model);
     if (!baseUrl) {
       return reply.code(400).send({ error: `No base_url configured for model "${model}"` });
     }
@@ -125,7 +130,7 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
 
 // --- Helpers ---
 
-/** Build a map of model → profile config, filtered to relay-enabled profiles only. */
+/** Build a map of model → profile config from live config, filtered to relay-enabled profiles. */
 function buildProfileMap(config: NoodleConfig): Map<string, ProfileConfig> {
   const map = new Map<string, ProfileConfig>();
   for (const [name, profile] of Object.entries(config.profiles)) {
@@ -140,26 +145,8 @@ function buildProfileMap(config: NoodleConfig): Map<string, ProfileConfig> {
   return map;
 }
 
-/** Resolve provider base URLs from relay-enabled config profiles. */
-function resolveProviderUrls(config: NoodleConfig): Map<string, string> {
-  const urls = new Map<string, string>();
-  for (const profile of Object.values(config.profiles)) {
-    if (profile.use_relay && profile.base_url) {
-      urls.set(profile.model, profile.base_url);
-    }
-  }
-  return urls;
-}
-
-/** Find the base URL for a given model. */
-function findProviderUrl(
-  config: NoodleConfig,
-  model: string,
-  providerUrls: Map<string, string>,
-): string | null {
-  const direct = providerUrls.get(model);
-  if (direct) return direct;
-
+/** Find the base URL for a given model from live config.profiles. Fallback only — originalUrls map is preferred. */
+function findProviderUrl(config: NoodleConfig, model: string): string | null {
   for (const profile of Object.values(config.profiles)) {
     if (profile.use_relay && profile.model === model && profile.base_url) {
       return profile.base_url;

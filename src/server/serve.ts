@@ -99,6 +99,19 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     log.warn("no profiles configured — create one via the dashboard");
   }
 
+  // API relay: always runs on :4445. Profiles with use_relay route their API
+  // requests through it for rate limiting. originalUrls holds the real upstream
+  // base_urls (before relay rewrite) so the relay can forward. Shared with
+  // ui-routes so profile CRUD can update them live.
+  const relayPort = 4445;
+  const relayBase = `http://localhost:${relayPort}/v1`;
+  const originalUrls = new Map<string, string>();
+  for (const [, profile] of Object.entries(config.profiles)) {
+    if (profile.base_url) {
+      originalUrls.set(profile.model, profile.base_url);
+    }
+  }
+
   // Overlay behavioral settings from the DB onto the config object. These
   // override the YAML defaults. Boot-critical settings (queue) take effect at
   // boot; per-run settings (stall timeouts) are read from config at run time.
@@ -294,7 +307,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // Expose dispatch so UI routes can trigger it after enqueueing (manual cron
   // run) — new jobs start immediately instead of waiting for the 5s safety net.
   const dispatch = (): void => dispatcher.dispatch();
-  registerUiRoutes(app, { runStore, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, skillStore, config, logDir, dispatch });
+  registerUiRoutes(app, { runStore, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, skillStore, config, logDir, dispatch, originalUrls, relayBase });
   if (settingsStore.has("NOODLE_UI_PASSWORD")) {
     log.info("web UI enabled (password-protected)");
   } else {
@@ -306,36 +319,20 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // first interval, then every 60s.
   const schedulerRunner = new SchedulerRunner(buildSchedulerRunnerDeps(schedulerStore, queue, authProvider, config));
 
-  // API relay (per-profile). Profiles with `use_relay: true` route their API
-  // requests through a local rate-limiting proxy. The relay only starts if at
-  // least one profile needs it.
+  // API relay — always runs so profiles can toggle use_relay at runtime
+  // without a restart. Passes the shared originalUrls map (live reference)
+  // so the relay resolves upstream URLs for any model, even ones toggled on
+  // after boot. Rewrites relay-enabled profiles' base_url to route through it.
   let relayApp: ReturnType<typeof createRelayServer> | null = null;
-  const hasRelayProfiles = Object.values(config.profiles).some((p) => p.use_relay);
-  if (hasRelayProfiles) {
-    const relayPort = 4445;
-    const relayHost = "0.0.0.0";
+  const relayHost = "0.0.0.0";
+  relayApp = createRelayServer(config, { originalUrls });
+  await relayApp.listen({ port: relayPort, host: relayHost });
+  log.info({ port: relayPort, host: relayHost }, "API relay listening");
 
-    // Save original base URLs for relay-enabled profiles only.
-    const originalUrls = new Map<string, string>();
-    for (const [, profile] of Object.entries(config.profiles)) {
-      if (profile.use_relay && profile.base_url) {
-        originalUrls.set(profile.model, profile.base_url);
-      }
+  for (const profile of Object.values(config.profiles)) {
+    if (profile.use_relay && profile.base_url) {
+      profile.base_url = relayBase;
     }
-
-    // Create relay with access to original URLs for forwarding.
-    relayApp = createRelayServer(config, { originalUrls });
-    await relayApp.listen({ port: relayPort, host: relayHost });
-    log.info({ port: relayPort, host: relayHost }, "API relay listening");
-
-    // Rewrite only relay-enabled profiles to route through the relay.
-    const relayBase = `http://localhost:${relayPort}/v1`;
-    for (const profile of Object.values(config.profiles)) {
-      if (profile.use_relay && profile.base_url) {
-        profile.base_url = relayBase;
-      }
-    }
-    log.info({ relayBase, profiles: Object.entries(config.profiles).filter(([, p]) => p.use_relay).map(([n]) => n) }, "rewrote relay-enabled profile base_urls");
   }
 
   // --- Boot order: prune stale session dirs, start the dispatcher (drains
