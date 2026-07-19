@@ -8,8 +8,10 @@ import {
   labelsFor,
   type RunStats,
 } from "../src/engine/run.js";
+import { buildCronIssueBody, buildCronErrorBody } from "../src/engine/scheduler-run.js";
+import { buildTriggerIssueBody, buildTriggerErrorBody } from "../src/engine/trigger-run.js";
 
-const profile = { name: "claude", model: "claude-sonnet-4-20250514" };
+const profile = { name: "claude", provider: "anthropic", model: "claude-sonnet-4-20250514" };
 const changedFiles = ["src/auth.ts", "tests/auth.test.ts"];
 const agentMessage =
   "Yes, the project has a dashboard. It lives at `/jasladmin/dashboard`, " +
@@ -44,7 +46,7 @@ describe("buildFooter", () => {
 
   it("includes profile + model on the Profile line", () => {
     const f = buildFooter(profile, "Noodle-Agent", stats);
-    expect(f).toContain("Profile: claude (`claude-sonnet-4-20250514`)");
+    expect(f).toContain("Profile: claude (`anthropic/claude-sonnet-4-20250514`)");
   });
 
   it("includes duration, tool calls, and turns on the Cooked-for line", () => {
@@ -229,16 +231,14 @@ describe("labelsFor (failed label)", () => {
   it("includes a red 'got Cooked' label for errored runs", () => {
     const labels = labelsFor("Noodle");
     expect(labels.failed.name).toBe("Noodle got Cooked");
-    expect(labels.failed.color).toBe("c76b6b");
+    expect(labels.failed.color).toBe("b91c1c");
     expect(labels.failed.description).toMatch(/errored/i);
   });
 
-  it("uses the hardcoded Noodle name in the failed label", () => {
-    // agent_name is hardcoded to "Noodle" now (the setting was removed); the
-    // arg is accepted for back-compat but ignored.
+  it("uses the passed agent name in the failed label", () => {
     const labels = labelsFor("MyBot");
-    expect(labels.failed.name).toBe("Noodle got Cooked");
-    expect(labels.failed.description).toContain("Noodle");
+    expect(labels.failed.name).toBe("MyBot got Cooked");
+    expect(labels.failed.description).toContain("MyBot");
   });
 
   it("keeps the three labels distinct", () => {
@@ -246,5 +246,83 @@ describe("labelsFor (failed label)", () => {
     const names = [labels.cooking.name, labels.cooked.name, labels.failed.name];
     expect(new Set(names).size).toBe(3);
     expect(labels.failed.color).not.toBe(labels.cooked.color);
+  });
+});
+
+// --- cron / trigger output bodies -------------------------------------------
+// These mirror buildErrorComment from run.ts. Every output path — success OR
+// error — must carry the footer so a triage list sees the same stats block
+// regardless of outcome. An LLM failure (errored run) routes through the error
+// body and must still get the footer, never get phrased.
+
+const footer = buildFooter(profile, "Noodle", stats);
+
+describe("buildCronIssueBody", () => {
+  it("puts the agent message before the footer", () => {
+    const body = buildCronIssueBody(agentMessage, footer);
+    expect(body.startsWith(agentMessage)).toBe(true);
+    expect(body).toContain("---");
+    expect(body).toContain("**Noodle-Agent**");
+  });
+
+  it("falls back to a no-findings notice when the message is missing", () => {
+    const body = buildCronIssueBody(undefined, footer);
+    expect(body).toMatch(/produced no findings/i);
+    expect(body).toContain("---");
+  });
+});
+
+describe("buildCronErrorBody", () => {
+  it("posts a templated error notice quoting the actual error", () => {
+    const body = buildCronErrorBody("Noodle", "insufficient_quota: monthly limit reached", footer);
+    expect(body).toMatch(/scheduled run by Noodle errored out/i);
+    expect(body).toContain("insufficient_quota: monthly limit reached");
+    expect(body).toMatch(/No findings were produced/);
+  });
+
+  it("includes the footer with stats captured up to failure", () => {
+    const body = buildCronErrorBody("Noodle", "rate limited (429)", footer);
+    expect(body).toContain("4m 12s");
+    expect(body).toContain("48.39K total");
+  });
+
+  it("falls back to 'unknown error' for empty messages", () => {
+    const body = buildCronErrorBody("Noodle", "", footer);
+    expect(body).toContain("unknown error");
+  });
+});
+
+describe("buildTriggerIssueBody", () => {
+  it("puts the agent message before the footer", () => {
+    const body = buildTriggerIssueBody(agentMessage, footer);
+    expect(body.startsWith(agentMessage)).toBe(true);
+    expect(body).toContain("---");
+    expect(body).toContain("**Noodle-Agent**");
+  });
+
+  it("falls back to a no-findings notice when the message is missing", () => {
+    const body = buildTriggerIssueBody(undefined, footer);
+    expect(body).toMatch(/produced no findings/i);
+    expect(body).toContain("---");
+  });
+});
+
+describe("buildTriggerErrorBody", () => {
+  it("posts a templated error notice quoting the actual error", () => {
+    const body = buildTriggerErrorBody("Noodle", "insufficient_quota: monthly limit reached", footer);
+    expect(body).toMatch(/trigger run by Noodle errored out/i);
+    expect(body).toContain("insufficient_quota: monthly limit reached");
+    expect(body).toMatch(/No findings were produced/);
+  });
+
+  it("includes the footer with stats captured up to failure", () => {
+    const body = buildTriggerErrorBody("Noodle", "rate limited (429)", footer);
+    expect(body).toContain("4m 12s");
+    expect(body).toContain("48.39K total");
+  });
+
+  it("falls back to 'unknown error' for empty messages", () => {
+    const body = buildTriggerErrorBody("Noodle", "", footer);
+    expect(body).toContain("unknown error");
   });
 });

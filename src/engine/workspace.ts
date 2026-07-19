@@ -25,6 +25,27 @@ export class Workspace {
     return new Workspace(dir);
   }
 
+  /**
+   * Re-wrap an existing on-disk clone (no git activity). Used by the Chats
+   * runtime to resume a chat whose workspace was cloned in a prior server
+   * lifetime — the dir still exists, we just need a `simpleGit` handle onto it.
+   */
+  static rewrap(dir: string): Workspace {
+    return new Workspace(dir);
+  }
+
+  /**
+   * Check out a remote branch by name. Used by the Chats runtime after a fresh
+   * clone: clones leave you on the default branch, so when the user picked a
+   * different branch we fetch it from origin and switch. Creates a local
+   * tracking branch if one doesn't exist (`checkout -B`).
+   */
+  async checkoutRemote(branch: string): Promise<void> {
+    await this.git.fetch("origin", branch);
+    await this.git.checkout(["-B", branch, `origin/${branch}`]);
+    log.debug({ dir: this.path, branch }, "checked out remote branch");
+  }
+
   /** Create and checkout a new branch off the current HEAD (fresh attempt). */
   async branch(name: string): Promise<void> {
     await this.git.checkoutLocalBranch(name);

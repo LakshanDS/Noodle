@@ -11,12 +11,15 @@ import type { NewSchedulerJob, SchedulerUpdate } from "./scheduler-store.js";
 import type { TriggerStore } from "./trigger-store.js";
 import type { NewTrigger, TriggerUpdate } from "./trigger-store.js";
 import { CommandStore, normalizeTrigger, type NewCommand, type CommandUpdate } from "./command-store.js";
+import { ChatStore } from "./chat-store.js";
 import { SkillStore, type SkillInput, type SkillUpdate } from "./skill-store.js";
 import { SettingStore, SETTING_CATALOG } from "./settings-store.js";
 import { ProfileStore, validateProfileInput, type StoredProfile } from "./profile-store.js";
 import type { AuthProvider } from "../github/auth-provider.js";
 import type { NoodleConfig, Profile } from "../config/schema.js";
+import { ThinkingLevel, type ThinkingLevelT } from "../config/schema.js";
 import { labelsFor } from "../engine/run.js";
+import type { ChatRuntime, ChatStreamEvent } from "../engine/chat-runtime.js";
 import { defaultLabelSet, serializeLabelSet, parseLabelSet } from "../engine/labels.js";
 import { readSession, type ParsedMessage } from "./session-reader.js";
 import {
@@ -66,6 +69,10 @@ export interface UiDeps {
   profileStore: ProfileStore;
   /** Command store — for the /api/commands CRUD routes (DB-managed). */
   commandStore: CommandStore;
+  /** Chat store — for the /api/chats CRUD + messages routes (interactive agent UI). */
+  chatStore: ChatStore;
+  /** Live agent sessions for the Chats UI. Owns clone + pi session per chat. */
+  chatRuntime: ChatRuntime;
   /** Skill store — for the /api/skills CRUD routes (filesystem-backed). */
   skillStore: SkillStore;
   /** Resolved config — for the profile-name dropdown + default profile. */
@@ -103,9 +110,14 @@ export function seedDefaultSettings(settingsStore: SettingStore): void {
     values.system_prompt = [
       "You are an autonomous software engineer working on a GitHub repository.",
       "Work from the issue or task you're given, and the system info below.",
-      "Decide your own approach and which tools to use based on what this",
-      "machine can actually do. Make the minimal change, verify it, and report",
-      "what you did as your final message.",
+      "",
+      "Always load the `noodle-default` skill — it is the always-active engineering",
+      "mindset (minimal diff, stdlib first, no over-engineering). Other skills",
+      "(noodle-fix, noodle-review, custom) load via slash commands when relevant.",
+      "",
+      "Decide your own approach from the system info. Make the minimal change,",
+      "verify it, and post your final answer as a normal text message — it IS",
+      "the deliverable.",
       "",
       "{system}",
     ].join("\n");
@@ -119,7 +131,7 @@ export function seedDefaultSettings(settingsStore: SettingStore): void {
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, getSecret, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, skillStore, config, logDir, dispatch } = deps;
+  const { runStore, getSecret, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   // The secret is read per-request so password changes take effect without restart.
@@ -1146,6 +1158,259 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       needsRestart: touchedRestartKeys.length > 0,
       restartKeys: touchedRestartKeys,
     };
+  });
+
+  // ----------------------------------------------------------------
+  // Chats — interactive, multi-turn agent conversations driven from the UI.
+  // Each chat = one cloned repo + one long-lived pi session. See
+  // src/engine/chat-runtime.ts for the live-session manager.
+  // ----------------------------------------------------------------
+
+  /** List chats (newest-first), with status + preview for the list view. */
+  app.get("/api/chats", { preHandler: auth }, async () => {
+    return { chats: chatStore.list() };
+  });
+
+  /**
+   * Create a chat. The repo + branch are validated against GitHub (so the
+   * user can't pick a repo the installation can't see) before the row is
+   * inserted. The workspace + session are NOT cloned here — that happens
+   * lazily on the first POST /messages.
+   */
+  app.post("/api/chats", { preHandler: auth }, async (req, reply) => {
+    const body = readJsonBody(req.body);
+    if (!body) return reply.code(400).send({ error: "invalid JSON body" });
+    const repo = strField(body, "repo");
+    const branch = strField(body, "branch");
+    const title = strField(body, "title");
+    const profileRaw = body.profile;
+    if (!repo) return reply.code(400).send({ error: "repo is required" });
+    if (!branch) return reply.code(400).send({ error: "branch is required" });
+    if (profileRaw !== undefined && profileRaw !== null && typeof profileRaw !== "string") {
+      return reply.code(400).send({ error: "profile must be a string or null" });
+    }
+    const profile = typeof profileRaw === "string" ? profileRaw : null;
+
+    // Optional per-chat thinking-level override. Defaults to "medium".
+    const thinkingRaw = body.thinking_level;
+    let thinkingLevel: string = "medium";
+    if (thinkingRaw !== undefined && thinkingRaw !== null) {
+      if (typeof thinkingRaw !== "string" || !ThinkingLevel.options.includes(thinkingRaw as ThinkingLevelT)) {
+        return reply.code(400).send({ error: "thinking_level must be one of: " + ThinkingLevel.options.join(", ") });
+      }
+      thinkingLevel = thinkingRaw;
+    }
+
+    // Resolve the repo's default branch so the runtime can apply the
+    // "stay on main, switch otherwise" rule without an extra API call later.
+    let defaultBranch = branch;
+    try {
+      const { gh } = await authProvider.forRepo(repo);
+      defaultBranch = await gh.defaultBranch(repo);
+    } catch (e) {
+      log.warn({ err: e, repo }, "could not resolve default branch for new chat — assuming chosen branch");
+    }
+
+    try {
+      const chat = chatStore.create({ repo, branch, default_branch: defaultBranch, profile, thinking_level: thinkingLevel, title });
+      return { chat };
+    } catch (e) {
+      return reply.code(500).send({ error: (e as Error).message });
+    }
+  });
+
+  /** Get one chat + its full message thread (oldest-first). */
+  app.get("/api/chats/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid chat id" });
+    let chat;
+    try {
+      chat = chatStore.get(id);
+    } catch {
+      return reply.code(404).send({ error: "chat not found" });
+    }
+    const messages = chatStore.listMessages(id);
+    return { chat, messages };
+  });
+
+  /** Update a chat's editable fields (title, profile, thinking_level). */
+  app.patch("/api/chats/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid chat id" });
+    const body = readJsonBody(req.body);
+    if (!body) return reply.code(400).send({ error: "invalid JSON body" });
+    const title = strField(body, "title");
+    const profileRaw = body.profile;
+    const thinkingRaw = body.thinking_level;
+    try {
+      const update: { title?: string; profile?: string | null; thinking_level?: string } = {};
+      if (title !== undefined) update.title = title;
+      if (profileRaw !== undefined) {
+        if (profileRaw !== null && typeof profileRaw !== "string") {
+          return reply.code(400).send({ error: "profile must be a string or null" });
+        }
+        update.profile = profileRaw;
+      }
+      if (thinkingRaw !== undefined && thinkingRaw !== null) {
+        if (typeof thinkingRaw !== "string" || !ThinkingLevel.options.includes(thinkingRaw as ThinkingLevelT)) {
+          return reply.code(400).send({ error: "thinking_level must be one of: " + ThinkingLevel.options.join(", ") });
+        }
+        update.thinking_level = thinkingRaw;
+      }
+      const chat = chatStore.update(id, update);
+      return { chat };
+    } catch {
+      return reply.code(404).send({ error: "chat not found" });
+    }
+  });
+
+  /**
+   * Delete a chat. Disposes the live session + workspace (best-effort) and
+   * removes the DB row (cascade drops its messages).
+   */
+  app.delete("/api/chats/:id", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid chat id" });
+    try {
+      chatStore.get(id);
+    } catch {
+      return reply.code(404).send({ error: "chat not found" });
+    }
+    await chatRuntime.dispose(id);
+    chatStore.delete(id);
+    return reply.code(204).send();
+  });
+
+  /**
+   * Send a user prompt. Appends the user message immediately, boots the
+   * session lazily, kicks off `session.prompt()` in the background, and
+   * returns 200 right away — the assistant content streams over the SSE
+   * endpoint. 409 if a prompt is already in flight on this chat.
+   */
+  app.post("/api/chats/:id/messages", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid chat id" });
+    const body = readJsonBody(req.body);
+    const text = body ? strField(body, "text") : undefined;
+    if (!text) return reply.code(400).send({ error: "text is required" });
+
+    let chat;
+    try {
+      chat = chatStore.get(id);
+    } catch {
+      return reply.code(404).send({ error: "chat not found" });
+    }
+    if (chatRuntime.isBusy(id)) {
+      return reply.code(409).send({ error: "a prompt is already running on this chat" });
+    }
+
+    // Persist the user turn immediately so a reload mid-run shows it.
+    chatStore.appendMessage(id, { role: "user", text });
+
+    // Boot (lazy) then run. Errors are surfaced via the SSE stream + persisted
+    // as an errored assistant turn so the thread shows what went wrong.
+    void (async () => {
+      try {
+        if (!chatRuntime.isLive(id)) {
+          // First prompt — run() will auto-boot, but we also need to persist
+          // the workspace + session paths for restart resumption. Boot manually
+          // so we can capture the LiveChat and extract the paths.
+          const booted = await chatRuntime.boot(chat);
+          chatStore.update(id, {
+            workspace_path: booted.workspace.path,
+            session_dir: booted.sessionManager.getSessionDir(),
+            status: "idle",
+            last_error: null,
+          });
+        }
+        chatStore.update(id, { status: "running", last_error: null });
+        const finalText = await chatRuntime.run(id, text, chat);
+        // Persist the agent's final answer so a page reload shows the full
+        // thread without replaying the stream.
+        if (finalText.trim()) {
+          chatStore.appendMessage(id, { role: "assistant", text: finalText });
+        }
+        chatStore.update(id, { status: "idle", last_error: null });
+      } catch (e) {
+        const msg = (e as Error).message ?? String(e);
+        chatStore.update(id, { status: "errored", last_error: msg });
+        chatStore.appendMessage(id, { role: "assistant", text: `⚠️ ${msg}` });
+      }
+    })();
+
+    return { ok: true };
+  });
+
+  /** Cancel the in-flight prompt on a chat. No-op (200) if nothing is running. */
+  app.post("/api/chats/:id/cancel", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid chat id" });
+    if (!chatRuntime.isBusy(id)) {
+      return reply.code(409).send({ error: "chat is not running" });
+    }
+    await chatRuntime.abort(id);
+    chatStore.update(id, { status: "idle" });
+    return { ok: true };
+  });
+
+  /**
+   * SSE stream of agent events for a chat. The client opens this right after
+   * POSTing a message and closes it when it sees `done` or `error`. Frames:
+   *   event: turn_start / delta / tool_start / tool_end / turn_end / error / done
+   * Heartbeat comment every 15s keeps proxies from dropping the connection.
+   */
+  app.get("/api/chats/:id/stream", { preHandler: auth }, async (req, reply) => {
+    const id = parseInt((req.params as { id: string }).id, 10);
+    if (isNaN(id)) return reply.code(400).send({ error: "invalid chat id" });
+    try {
+      chatStore.get(id);
+    } catch {
+      return reply.code(404).send({ error: "chat not found" });
+    }
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    reply.raw.write("retry: 3000\n\n");
+
+    const bus = chatRuntime.events(id);
+    const onEvent = (e: ChatStreamEvent) => {
+      try {
+        reply.raw.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+      } catch {
+        /* client gone — the close handler tears down */
+      }
+    };
+    bus.on("event", onEvent);
+
+    // Heartbeat — a comment line every 15s. Keeps idle proxies alive without
+    // the client seeing spurious events.
+    const heartbeat = setInterval(() => {
+      try {
+        reply.raw.write(": heartbeat\n\n");
+      } catch { /* best-effort */ }
+    }, 15_000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      bus.off("event", onEvent);
+    };
+    req.raw.on("close", cleanup);
+
+    // If a turn is already finished (client connected after the fact), send a
+    // synthesize-done so a reconnecting client doesn't hang waiting. The
+    // normal path is: client opens stream, then POSTs the message; events
+    // arrive in real time.
+    if (!chatRuntime.isBusy(id)) {
+      reply.raw.write("event: done\ndata: " + JSON.stringify({ type: "done" }) + "\n\n");
+    }
+
+    // Hold the request open. Fastify wants the handler promise to stay
+    // pending; reply.raw is being written to directly.
+    return reply.raw;
   });
 }
 

@@ -25,21 +25,24 @@ describe("acquireSlot (relay rate spacer)", () => {
   });
 
   it("sleeps ~60000/rpm ms for a metered model", async () => {
-    // 30 RPM → 2000ms.
+    // 30 RPM → 2000ms. The rate spacer is stateful (tracks last-request per
+    // model), so the first call never sleeps. Seed the timestamp, then assert
+    // the second call actually waits.
     const local = new Map<string, ProfileConfig>([
       ["p", { model: "test-model", api_key: "sk-test", api_rpm: 30 }],
     ]);
+    await acquireSlot(local, "test-model"); // seed lastRequest
     const start = Date.now();
     await acquireSlot(local, "test-model");
     const elapsed = Date.now() - start;
     expect(elapsed).toBeGreaterThan(1500);
   });
 
-  it("sleeps every call — no first-call exemption (stateless)", async () => {
-    // The spacer is stateless: every request sleeps, including the first.
+  it("sleeps every call after the first (stateful per-model tracking)", async () => {
     const local = new Map<string, ProfileConfig>([
       ["p", { model: "fresh-model", api_key: "sk-test", api_rpm: 30 }],
     ]);
+    await acquireSlot(local, "fresh-model"); // seed lastRequest
     const start = Date.now();
     await acquireSlot(local, "fresh-model");
     expect(Date.now() - start).toBeGreaterThan(1500);

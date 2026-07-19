@@ -10,6 +10,8 @@ import { SettingStore } from "./settings-store.js";
 import { ProfileStore } from "./profile-store.js";
 import { SkillStore } from "./skill-store.js";
 import { CommandStore, seedBuiltinCommand } from "./command-store.js";
+import { ChatStore } from "./chat-store.js";
+import { ChatRuntime } from "../engine/chat-runtime.js";
 import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/auth-provider.js";
 import { runJob, pruneSessionDirs } from "../engine/run.js";
 import { runSchedulerJob } from "../engine/scheduler-run.js";
@@ -67,12 +69,22 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   const profileStore = new ProfileStore(queue.getDb());
   const skillStore = new SkillStore();
   const commandStore = new CommandStore(queue.getDb());
+  const chatStore = ChatStore.fromDb(queue.getDb());
   // Seed (or refresh) the built-in /<agent> command — the default framing every
   // agent run falls back to when no other command matched. Idempotent: updates
   // the existing row's trigger + prompt on boot so an agent_name change renames
   // the trigger; never creates a duplicate.
   seedBuiltinCommand(commandStore, config.agent_name);
   const authProvider = resolveAuthProvider(settingsStore);
+  const chatRuntime = new ChatRuntime({ config, authProvider });
+  // Any chats left 'running' from a crash get marked errored (no live session
+  // survives a restart). Best-effort — a failure here is not fatal.
+  try {
+    const stale = chatStore.resetStaleRunning();
+    if (stale > 0) log.info({ chatsReset: stale }, "reset stale running chats at boot");
+  } catch (e) {
+    log.warn({ err: e }, "could not reset stale running chats at boot");
+  }
 
   // Load profiles from the DB — the only source of profiles now. The YAML
   // config carries behavioral settings only (routing, triggers, server, etc.).
@@ -200,6 +212,15 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       // Correct the job row's profile hint once the authoritative profile is
       // known, so per-profile concurrency gating stays accurate.
       onProfileResolved: (profile) => queue.setJobProfile(job.id, profile),
+      // Operator's global system prompt — always active, expanded and prepended
+      // to sysInfo (same as scheduler/trigger runs).
+      systemPrompt: settingsStore.get("system_prompt") || undefined,
+      // Resolve slash commands from the issue body + comments so a matched
+      // command's system_prompt extends the base and its profile override
+      // applies. Newest-first scanning happens inside runJob.
+      resolveCommand: (texts) => commandStore.resolveByTrigger(texts),
+      // Issue/PR runs use the global default labels for now (no per-run override).
+      labelOverrides: null,
     });
   };
 
@@ -246,8 +267,15 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     // These are getters (not captured values) so edits in the Settings page take
     // effect without a restart: NOODLE_LOGIN / agent_name / triggers / profiles
     // are re-read on each webhook. `selfLogin` prefers an explicit NOODLE_LOGIN,
-    // then derives `<agent-slug>-agent` from the current agent_name.
-    selfLogin: () => settingsStore.get("NOODLE_LOGIN")?.trim() || (isAppMode(settingsStore) ? `${slugify(config.agent_name)}-agent` : selfLogin),
+    // then derives the App bot's real login `<app-slug>[bot]` (or falls back to
+    // the agent slug). GitHub ALWAYS emits `<app-slug>[bot]` as the sender for
+    // App-identity events, so this is what self-trigger suppression must compare
+    // against. In PAT mode the boot-time `currentUserLogin()` value is used.
+    selfLogin: () =>
+      settingsStore.get("NOODLE_LOGIN")?.trim() ||
+      (isAppMode(settingsStore)
+        ? `${settingsStore.get("GITHUB_APP_SLUG")?.trim() || slugify(config.agent_name)}[bot]`
+        : selfLogin),
     agentName: () => config.agent_name,
     // Opt-in wake filter for `issues.*` events — see src/triggers/check.ts.
     // Slash commands (`/<agent>`), assignment, and `#<profile>` tags are always
@@ -307,7 +335,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // Expose dispatch so UI routes can trigger it after enqueueing (manual cron
   // run) — new jobs start immediately instead of waiting for the 5s safety net.
   const dispatch = (): void => dispatcher.dispatch();
-  registerUiRoutes(app, { runStore, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, skillStore, config, logDir, dispatch, originalUrls, relayBase });
+  registerUiRoutes(app, { runStore, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch, originalUrls, relayBase });
   if (settingsStore.has("NOODLE_UI_PASSWORD")) {
     log.info("web UI enabled (password-protected)");
   } else {
@@ -354,6 +382,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
     await relayApp?.close().catch((e) => log.error({ err: e }, "relay close error"));
     await app.close().catch((e) => log.error({ err: e }, "http close error"));
     await dispatcher.stop(); // graceful: in-flight jobs finish before exit
+    await chatRuntime.disposeAll(); // best-effort: tear down live sessions + workspaces
     queue.close();
     closeLogFile();
     log.info("shutdown complete");
@@ -448,26 +477,36 @@ function loadSettingsIntoConfig(config: NoodleConfig, store: SettingStore): void
 
 /**
  * Resolve the agent's own login so the `assigned` webhook trigger can be scoped
- * to assignments that target the agent (not human-to-human reshuffles).
+ * to assignments that target the agent (not human-to-human reshuffles), and so
+ * self-trigger suppression (the bot's own comments/label swaps) matches against
+ * the correct identity.
  *
  * - Explicit: NOODLE_LOGIN from the settings DB always wins (also the only
  *   source in App mode, where fetching "our own login" would need an extra
  *   round-trip per event).
- * - Default: derived from `agent_name` → `<slug>-agent` (e.g. "Noodle" → "noodle-agent").
- * - PAT fallback: if no setting and not App mode, query `/user` once.
- * - App mode without NOODLE_LOGIN: returns the derived default.
+ * - App mode default: `<app-slug>[bot]` (or `<agent-slug>[bot]` if the App slug
+ *   is unset). GitHub ALWAYS emits `<app-slug>[bot]` as the sender for
+ *   App-identity events, so this is the value self-suppression must match.
+ * - PAT mode: query `/user` once, fall back to `<agent-slug>[bot]`.
  */
 async function resolveSelfLogin(authProvider: AuthProvider, agentName: string, settingsStore: SettingStore): Promise<string | undefined> {
   const fromSettings = settingsStore.get("NOODLE_LOGIN")?.trim();
   if (fromSettings) return fromSettings;
-  // Derive a sensible default from the agent name.
-  const derived = `${slugify(agentName)}-agent`;
-  if (isAppMode(settingsStore)) return derived; // App mode: use derived default.
-  // PAT mode: try to resolve from the API, fall back to derived default.
+  // App mode: the real bot login is `<app-slug>[bot]`. Warn when the App slug
+  // is missing — self-suppression then falls back to the agent slug and may not
+  // match the actual sender until the operator sets GITHUB_APP_SLUG.
+  if (isAppMode(settingsStore)) {
+    const appSlug = settingsStore.get("GITHUB_APP_SLUG")?.trim();
+    if (!appSlug) {
+      log.warn("GITHUB_APP_SLUG not set in App mode — self-trigger suppression falls back to the agent slug. Set it for reliable matching.");
+    }
+    return `${appSlug || slugify(agentName)}[bot]`;
+  }
+  // PAT mode: try to resolve from the API, fall back to a derived default.
   try {
     const { gh } = await authProvider.forRepo("__self__");
     return gh.currentUserLogin();
   } catch {
-    return derived;
+    return `${slugify(agentName)}[bot]`;
   }
 }

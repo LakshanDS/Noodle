@@ -206,19 +206,23 @@ describe("seedBuiltinCommand", () => {
 
     const noodle = store.getByTrigger("noodle");
     expect(noodle).toBeDefined();
-    expect(noodle!.system_prompt).toContain("noodle-default");
-    expect(noodle!.system_prompt).not.toContain("noodle-fix");
+    // The base /<agent> command is a no-op extension: its system_prompt is
+    // empty because the global system_prompt already says "always load
+    // noodle-default". The trigger still exists for wake detection + routing.
+    expect(noodle!.system_prompt).toBe("");
     expect(noodle!.enabled).toBe(1);
 
     const fix = store.getByTrigger("noodle-fix");
     expect(fix).toBeDefined();
-    expect(fix!.system_prompt).toContain("noodle-default");
+    // The fix command only loads noodle-fix — the base system_prompt already
+    // loads noodle-default, so the command prompt doesn't repeat it.
     expect(fix!.system_prompt).toContain("noodle-fix");
+    expect(fix!.system_prompt).not.toContain("noodle-default");
 
     const review = store.getByTrigger("noodle-review");
     expect(review).toBeDefined();
-    expect(review!.system_prompt).toContain("noodle-default");
     expect(review!.system_prompt).toContain("noodle-review");
+    expect(review!.system_prompt).not.toContain("noodle-default");
 
     // All built-ins are non-deletable.
     expect(() => store.delete(noodle!.id)).toThrow(/built-in/);

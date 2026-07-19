@@ -20,6 +20,9 @@ export const ThinkingLevel = z.enum([
   "xhigh",
 ]);
 
+/** The thinking-level string union — the TS type backing `ThinkingLevel`. */
+export type ThinkingLevelT = z.infer<typeof ThinkingLevel>;
+
 /**
  * The wire protocol a custom endpoint speaks. Pick by what the endpoint mimics:
  * - openai-completions: Ollama, vLLM, LM Studio, DeepSeek, Cerebras, NVIDIA NIM,

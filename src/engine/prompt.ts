@@ -25,32 +25,33 @@ export function defaultCommandPrompt(agentName = "Noodle"): string {
 
 /**
  * Framing prompt for the `/<agent>-fix` command (e.g. `/noodle-fix`) — the
- * fix workflow. Loads `noodle-default` + `noodle-fix`.
+ * fix workflow. Loads `noodle-fix` on top of the always-active `noodle-default`
+ * (which the base system prompt already loads). Only carries what's unique to
+ * the fix workflow — the base handles role, skill-loading, and the
+ * final-message-is-deliverable contract.
  */
-export function fixCommandPrompt(agentName = "Noodle"): string {
+export function fixCommandPrompt(): string {
   return [
-    "Load the `noodle-default` and `noodle-fix` skills before starting.",
+    "Load the `noodle-fix` skill before starting.",
     "",
-    "Investigate, make the minimal change, verify, and end by posting your final",
-    "answer as a normal text message — what you changed and why.",
-    `${agentName} phrases that message into the comment and commits the changes. Do`,
-    'not just say "done" — your final message IS the deliverable.',
+    "Investigate, make the minimal change, and verify it. Report what you changed",
+    "and why.",
   ].join("\n");
 }
 
 /**
  * Framing prompt for the `/<agent>-review` command (e.g. `/noodle-review`) —
- * the code review workflow. Loads `noodle-default` + `noodle-review`.
+ * the code review workflow. Loads `noodle-review` on top of the always-active
+ * `noodle-default` (which the base system prompt already loads). Only carries
+ * what's unique to the review workflow.
  */
-export function reviewCommandPrompt(agentName = "Noodle"): string {
+export function reviewCommandPrompt(): string {
   return [
-    "Load the `noodle-default` and `noodle-review` skills before starting.",
+    "Load the `noodle-review` skill before starting.",
     "",
     "Review the changes as a senior engineer would: call out bugs, risks, and",
     "missing tests. Be specific — reference files and lines. Keep it to the",
     "highest-signal points rather than exhaustive nitpicks.",
-    `${agentName} posts the review as a normal text message. Do not just say`,
-    '"done" — your final message IS the deliverable.',
   ].join("\n");
 }
 

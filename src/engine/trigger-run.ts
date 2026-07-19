@@ -7,7 +7,7 @@ import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { expandTags } from "./tags.js";
-import { generateIssueTitle, templateTitle } from "./title.js";
+import { generateIssueTitle, phraseOutput, templateTitle } from "./title.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
@@ -243,7 +243,12 @@ export async function runTriggerJob(
       if (deps?.systemPrompt) {
         try {
           const expanded = await expandTags(deps.systemPrompt, { sysFacts, gh, repo: input.repo });
-          if (expanded.trim()) fullSysInfo = `${expanded}\n\n---\n\n${sysInfo}`;
+          if (expanded.trim()) {
+            // If the prompt referenced {system}, the expansion already inlined
+            // sysInfo — don't append it again.
+            const referencesSystem = /\{system(\.|})/i.test(deps.systemPrompt);
+            fullSysInfo = referencesSystem ? expanded : `${expanded}\n\n---\n\n${sysInfo}`;
+          }
         } catch (e) {
           log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using sysInfo only");
         }
@@ -393,6 +398,14 @@ export async function runTriggerJob(
           log_.error({ errorMessage: stopReason.errorMessage, stopReason: stopReason.stopReason }, "trigger run ended on error");
         } else {
           agentAnswer = extractLastAssistantText(session);
+          // Clean the raw output via a relay LLM call before posting — strip
+          // thinking-token residue and tool-call chatter, PRESERVE every
+          // technical detail. Falls back to the raw message on any failure.
+          // Only reached on a successful run; an errored run (e.g. the agent's
+          // own LLM call failed) uses the error body and is never phrased.
+          if (agentAnswer) {
+            agentAnswer = await phraseOutput(agentAnswer, profile);
+          }
         }
 
         await ws.removeInternals();
@@ -405,7 +418,7 @@ export async function runTriggerJob(
         }
 
         const issueBody = errored
-          ? buildTriggerErrorBody(config.agent_name, stopReason.errorMessage ?? "agent run ended on error")
+          ? buildTriggerErrorBody(config.agent_name, stopReason.errorMessage ?? "agent run ended on error", buildFooter(profile, config.agent_name, runStats))
           : buildTriggerIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
         const issueTitle = errored
           ? templateTitle(input.prompt)
@@ -600,20 +613,20 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function buildTriggerIssueBody(agentMessage: string | undefined, footer: string): string {
+export function buildTriggerIssueBody(agentMessage: string | undefined, footer: string): string {
   const body = agentMessage?.trim() ||
     "_The agent ran but produced no findings. It may have found nothing concrete to report._";
   return `${body}\n\n---\n${footer}`;
 }
 
-function buildTriggerErrorBody(agentName: string, errorMessage: string): string {
+export function buildTriggerErrorBody(agentName: string, errorMessage: string, footer: string): string {
   const err = errorMessage.trim() || "unknown error";
   const body =
     `⚠️ **Trigger run by ${agentName} errored out before finishing.**\n\n` +
     `> \`${err}\`\n\n` +
     `No findings were produced. The run may be retried once the underlying issue ` +
     `(API quota, rate limit, provider outage, etc.) is resolved.`;
-  return body;
+  return `${body}\n\n---\n${footer}`;
 }
 
 export { buildFooter };

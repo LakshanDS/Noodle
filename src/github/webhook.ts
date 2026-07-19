@@ -31,6 +31,23 @@ export interface WebhookIntent {
   profileHint?: string;
 }
 
+/** Strip an optional GitHub-App `[bot]` suffix and lowercase a login. */
+function normalizeLogin(s: string | null | undefined): string {
+  return (s ?? "").toLowerCase().replace(/\[bot\]$/i, "").trim();
+}
+
+/**
+ * True when `senderLogin` is Noodle itself. Tolerant of the GitHub-App `[bot]`
+ * suffix — `selfLogin` may be set with or without it, and GitHub always emits
+ * `<app-slug>[bot]` as the sender for App-identity events. Comparison is
+ * case-insensitive. Returns false when either side is missing/empty.
+ */
+export function isSelfSender(senderLogin?: string | null, selfLogin?: string): boolean {
+  if (!senderLogin || !selfLogin) return false;
+  const a = normalizeLogin(senderLogin);
+  return a !== "" && a === normalizeLogin(selfLogin);
+}
+
 /**
  * Verify the `X-Hub-Signature-256` header against the raw request body.
  * `signature` is the header value (`sha256=<hex>`). Returns true on a match.
@@ -71,7 +88,12 @@ export function verifySignature(body: string, signature: string | undefined, sec
  * here — but the labeled event still must pass the wake filter to fire.
  *
  * `selfLogin` is Noodle's own login (e.g. the bot user). Required to scope the
- * `assigned` trigger; when omitted, `assigned` events are ignored.
+ * `assigned` trigger; when omitted, `assigned` events are ignored. It is also
+ * used to suppress re-entrant triggers: the bot's OWN comments and label swaps
+ * never wake it again (the answer comment can't re-trigger via its own text).
+ * Other self-originated events — `issues.opened`/`reopened`/`assigned` — are
+ * NOT suppressed, because that is how cron/trigger runs open new issues that
+ * legitimately chain into another agent run.
  */
 export function parseWebhookEvent(
   event: string,
@@ -113,12 +135,6 @@ export function parseWebhookEvent(
   // issue-only: Noodle is issue-driven, so those events on a PR are ignored.
   const isPullRequest = !!p.issue.pull_request;
 
-  // Skip events triggered by the bot itself (e.g. label swaps, comments)
-  // to prevent re-entrant triggers after a run completes.
-  if (selfLogin && p.sender?.login?.toLowerCase() === selfLogin.toLowerCase()) {
-    return null;
-  }
-
   const repo = p.repository.full_name;
   const issueNumber = p.issue.number;
   const installationId = p.installation?.id;
@@ -137,6 +153,14 @@ export function parseWebhookEvent(
     // happens via issue_comment with a slash/mention, handled below.)
     if (isPullRequest) return null;
     if (p.action === "opened" || p.action === "reopened" || p.action === "labeled") {
+      // Suppress the bot's OWN label swaps (e.g. "cooking" → "cooked" after a
+      // run completes) so they don't re-fire under `trigger_on_open`.
+      // `opened`/`reopened` are deliberately NOT suppressed — cron/trigger
+      // runs open new issues to chain into another agent run, and that path
+      // must keep working.
+      if (p.action === "labeled" && isSelfSender(p.sender?.login, selfLogin)) {
+        return null;
+      }
       // Opt-in wake filter: the issue body must carry a wake signal (mention,
       // keyword, slash, or #profile). The webhook payload carries the body but
       // NOT the comment thread, so the gate runs on body alone here; a wake
@@ -161,10 +185,23 @@ export function parseWebhookEvent(
 
   if (event === "issue_comment") {
     if (p.action !== "created") return null;
-    // A new comment wakes the agent when it explicitly invites it:
-    //   - `/<command>` slash command for any active command (e.g. /noodle, /review), OR
-    //   - `@<agent>` mention (e.g. @noodle can you look?), OR
-    //   - `#<profile>` tag (e.g. #claude rerun with claude)
+    // Suppress the bot's OWN comments — the answer comment can contain
+    // `@noodle` / `#profile` / `/command` in its text, and without this guard
+    // it would re-trigger a run the moment it's posted. A bot comment is an
+    // output, never a wake signal.
+    if (isSelfSender(p.sender?.login, selfLogin)) {
+      return null;
+    }
+    // A new comment wakes the agent when it explicitly invites it via three
+    // independent channels:
+    //   - `/<command>` — always on. Active command triggers (e.g. /noodle-fix,
+    //     /review, custom). Gating is not needed: the user explicitly typed a
+    //     command to invoke a specific workflow.
+    //   - `@<agent>` mention (e.g. @noodle) — gated by the trigger_on_mention
+    //     toggle in Settings (default on). Operators can disable @-mention wakes
+    //     without affecting /command or #profile wakes.
+    //   - `#<profile>` tag (e.g. #claude) — always on. The user explicitly
+    //     selected a profile; gating would be surprising.
     // trigger_keywords / trigger_on_open are body-level concerns handled by
     // the scheduler scan; the webhook only needs to react to explicit nudges.
     const body = (p.comment?.body ?? "").trim();
@@ -173,10 +210,13 @@ export function parseWebhookEvent(
     // backstop so `/noodle` wakes even if the built-in command row is missing
     // or disabled.
     const slug = slugify(agentName);
-    const triggers = commandTriggers.length > 0 ? commandTriggers : [slug].filter((s) => s);
-    if (slug && !triggers.includes(slug)) triggers.push(slug);
-    const isSlash = matchesCommandTrigger(body, triggers);
-    const isMention = mentionsAgent(body, agentName);
+    const cmdTriggers = commandTriggers.length > 0 ? commandTriggers : [slug].filter((s) => s);
+    if (slug && !cmdTriggers.includes(slug)) cmdTriggers.push(slug);
+    const isSlash = matchesCommandTrigger(body, cmdTriggers);
+    // @mention is gated by the trigger_on_mention setting (default on). When
+    // the setting is absent/undefined (CLI/test path), assume on — the schema
+    // default is true.
+    const isMention = triggers?.trigger_on_mention !== false && mentionsAgent(body, agentName);
     const hasProfileTag = profileNames.some(
       (name) => name && new RegExp(`(?:^|\\s)#${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(body),
     );

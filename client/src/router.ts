@@ -10,7 +10,6 @@ const routes: RouteRecordRaw[] = [
   { path: "/", redirect: "/runs" },
   { path: "/login", name: "login", component: () => import("./views/LoginView.vue") },
   { path: "/chats", name: "chats", component: () => import("./views/ChatsView.vue") },
-  { path: "/chats/new", name: "chat-new", component: () => import("./views/ChatDetailView.vue"), props: { isNew: true } },
   { path: "/chats/:id", name: "chat-detail", component: () => import("./views/ChatDetailView.vue"), props: true },
   { path: "/runs", name: "runs", component: () => import("./views/RunsView.vue") },
   { path: "/runs/:id", name: "run-detail", component: () => import("./views/RunDetailView.vue"), props: true },

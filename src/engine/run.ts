@@ -8,7 +8,9 @@ import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import type { PullRequestData } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
-import { buildPrompt } from "./prompt.js";
+import { buildRunPrompt } from "./prompt.js";
+import { expandTags } from "./tags.js";
+import { phraseOutput } from "./title.js";
 import { createCommentOnIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
@@ -24,6 +26,7 @@ import {
   DefaultResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 import type { RunStore } from "../server/run-store.js";
+import type { CommandRow } from "../server/command-store.js";
 import type { NoodleConfig } from "../config/schema.js";
 
 /** AuthStorage instance type (its constructor is private; use the factory's return type). */
@@ -164,6 +167,25 @@ export async function runJob(
      * concurrency gating. CLI runs don't set this (no queue).
      */
     onProfileResolved?: (profile: string) => void;
+    /**
+     * Operator's global system prompt (from Settings). Always active — expanded
+     * via expandTags and prepended to the sysInfo block, exactly like
+     * scheduler/trigger runs. CLI/test paths omit it (sysInfo-only prompt).
+     */
+    systemPrompt?: string;
+    /**
+     * Resolves a slash command from the issue body + comments. When a command
+     * matches, its `system_prompt` extends the global system prompt as the run's
+     * framing, and its `profile` overrides the routed/default profile. Returns
+     * null for a pure @mention (no /command) — framing slot stays empty, base
+     * system prompt alone is complete. CLI/test paths omit it.
+     */
+    resolveCommand?: (texts: string[]) => CommandRow | null;
+    /**
+     * Custom label set (JSON string) for this run's issue/PR. Null = use the
+     * global default labels. Mirrors scheduler-run's labelOverrides dep.
+     */
+    labelOverrides?: string | null;
   },
 ): Promise<RunResult> {
   const agentName = config.agent_name;
@@ -322,25 +344,35 @@ export async function runJob(
   await gh.addIssueLabel(input.repo, input.issueNumber, labels.cooking.name);
   log_.info({ label: labels.cooking.name }, "added status label");
 
-  // 2. Route to a profile. A `#<profile>` tag in body or a comment is the
-  // highest-priority selector — it wins over label/keyword/default routing.
-  // Otherwise fall back to resolveProfile (slash/label/keyword/default).
-  // Wrapped in try/catch so the cooking→failed label swap happens even when
-  // profile resolution fails (e.g. no profiles configured).
+  // 2. Resolve the slash command (if any) from the issue body + comments.
+  // Scanned newest-first (latest comment → issue body) so the most recent
+  // intent wins; resolveByTrigger handles longest-trigger-first within each
+  // segment so /agent-fix beats /agent. Resolved once here because BOTH the
+  // profile override and the prompt framing depend on it.
+  const cmdSegments = [issue.body ?? "", ...comments.map((c) => c.body ?? "")].reverse();
+  const cmd = deps?.resolveCommand?.(cmdSegments) ?? null;
+
+  // 3. Route to a profile. Priority: `#<profile>` tag > matched command's
+  // `profile` field > label/keyword/default routing. Wrapped in try/catch so
+  // the cooking→failed label swap happens even when profile resolution fails
+  // (e.g. no profiles configured).
   const profileNames = Object.keys(config.profiles);
   let tagProfile: string | null = null;
   try {
     tagProfile = extractProfileTag(issue.body ?? "", profileNames)
       ?? comments.map((c) => extractProfileTag(c.body ?? "", profileNames)).find((p) => p !== null)
       ?? null;
+    const cmdProfile = cmd?.profile && config.profiles[cmd.profile] ? cmd.profile : null;
     profile = tagProfile && config.profiles[tagProfile]
       ? { name: tagProfile, ...config.profiles[tagProfile] }
-      : resolveProfile(config, {
-          title: issue.title,
-          body: issue.body,
-          labels: issue.labels,
-          comments: comments.map((c) => c.body),
-        });
+      : cmdProfile
+        ? { name: cmdProfile, ...config.profiles[cmdProfile] }
+        : resolveProfile(config, {
+            title: issue.title,
+            body: issue.body,
+            labels: issue.labels,
+            comments: comments.map((c) => c.body),
+          });
   } catch (resolveErr) {
     try {
       await swapLabel(gh, input.repo, input.issueNumber, labels, "failed", log_);
@@ -349,7 +381,8 @@ export async function runJob(
     }
     throw resolveErr;
   }
-  log_.info({ profile: profile.name, model: profile.model, via: tagProfile ? "#tag" : "routing" }, "routed profile");
+  const profileVia = tagProfile ? "#tag" : (cmd?.profile && config.profiles[cmd.profile] ? "command" : "routing");
+  log_.info({ profile: profile.name, model: profile.model, via: profileVia, command: cmd?.trigger ?? null }, "routed profile");
   if (runStore) {
     runStore.updateRun(jobId, { profile: profile.name, model: profile.model });
   }
@@ -433,7 +466,38 @@ export async function runJob(
     // often can't, and a "let me run the build" attempt will hang or crash.
     const sysFacts = collectSysFacts();
     log_.debug({ sysFacts }, "probed system info for agent prompt");
-    const prompt = buildPrompt(issue, comments, input.repo, agentName, buildSysInfoGuidance(sysFacts), isPR);
+
+    // Build the prompt. The operator's global system_prompt (Settings) is
+    // always active — expanded via expandTags and prepended to the sysInfo
+    // block. The matched command's system_prompt extends it as framing (also
+    // tag-expanded); a pure @mention (no /command) leaves the framing slot
+    // empty — the base system prompt alone is complete.
+    const sysInfo = buildSysInfoGuidance(sysFacts);
+    let fullSysInfo = sysInfo;
+    if (deps?.systemPrompt) {
+      try {
+        const expanded = await expandTags(deps.systemPrompt, { sysFacts, gh, repo: input.repo });
+        if (expanded.trim()) {
+          // If the prompt referenced {system} (or a {system.*} sub-tag), the
+          // expansion already inlined the sysInfo block — don't append it
+          // again. Otherwise prepend sysInfo so the agent still sees it.
+          const referencesSystem = /\{system(\.|})/i.test(deps.systemPrompt);
+          fullSysInfo = referencesSystem ? expanded : `${expanded}\n\n---\n\n${sysInfo}`;
+        }
+      } catch (e) {
+        log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using sysInfo only");
+      }
+    }
+    // Expand tags in the command's framing too (e.g. {system.tier}, {pr}).
+    let framing = cmd?.system_prompt?.trim() ? cmd.system_prompt : "";
+    if (framing) {
+      try {
+        framing = await expandTags(framing, { sysFacts, gh, repo: input.repo });
+      } catch (e) {
+        log_.warn({ err: (e as Error).message }, "failed to expand command framing tags — using raw framing");
+      }
+    }
+    const prompt = buildRunPrompt(framing, issue, comments, input.repo, fullSysInfo, isPR);
     // Optional per-profile rate-limit throttle (e.g. NVIDIA NIM's 40 rpm).
     const throttle = throttleForRpm(profile.api_rpm);
     // pi retry settings tuned from the profile config so 429 retries don't cascade.
@@ -632,12 +696,21 @@ export async function runJob(
         const errMsg = stopReason.errorMessage ?? "unknown error";
         log_.error({ errorMessage: errMsg, stopReason: stopReason.stopReason }, "agent run ended on error");
       } else {
-        // Capture the agent's final message — its actual answer. Posted verbatim
-        // as the issue comment / PR body (with a signature footer), so the
-        // agent's own words reach the reader.
+        // Capture the agent's final message — its actual answer. Posted as the
+        // issue comment / PR body (with a signature footer), so the agent's
+        // own words reach the reader.
         agentAnswer = extractLastAssistantText(session);
         if (!agentAnswer) {
           log_.warn("agent produced no final assistant message; comment will use the generic template");
+        } else {
+          // Clean the raw output via a single relay LLM call before posting:
+          // strip thinking-token residue, tool-call chatter, fix headings —
+          // but PRESERVE every technical detail (no summarising). Falls back
+          // to the raw message on any failure, so this can never block a run.
+          // Only reached on a successful run; an errored run (e.g. the agent's
+          // own LLM call failed) takes the error-comment branch above and is
+          // never routed through phrasing.
+          agentAnswer = await phraseOutput(agentAnswer, profile);
         }
       }
 

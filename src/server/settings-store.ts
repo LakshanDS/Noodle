@@ -59,7 +59,7 @@ export const SETTING_CATALOG: readonly SettingMeta[] = [
   // --- Internal: GitHub App setup state (CSRF token for manifest flow) ---
   { key: "GITHUB_APP_SETUP_STATE", label: "Setup state", restartRequired: false, secret: true, hint: "Temporary CSRF token for GitHub App creation flow." },
   { key: "NOODLE_UI_PASSWORD", label: "Dashboard password", restartRequired: false, secret: true, hint: "Also signs the auth cookie. Setting this enables the web UI. Changing it logs out all existing sessions." },
-  { key: "NOODLE_LOGIN", label: "Agent login", restartRequired: false, secret: false, hint: "The agent's GitHub username (scopes assignment triggers). Defaults to <agent>-agent." },
+  { key: "NOODLE_LOGIN", label: "Agent login", restartRequired: false, secret: false, hint: "The agent's GitHub username (scopes assignment triggers + self-trigger suppression). In App mode this is `<app-slug>[bot]` — leave unset and set GITHUB_APP_SLUG instead. The [bot] suffix is optional; matching tolerates it." },
   // --- GitHub labels (the 3 status labels applied to issues during a run).
   // Rendered by a custom UI block in SettingsView (3 name+color rows), not the
   // generic field loop. Stored as a JSON string; null = hardcoded defaults. ---
@@ -70,7 +70,7 @@ export const SETTING_CATALOG: readonly SettingMeta[] = [
   // --- Triggers (wake filters for issues — re-overlayed live on save). The two
   // booleans render side-by-side on one row (see SettingsView grouping). ---
   { key: "trigger_keywords", label: "Trigger keywords", restartRequired: false, secret: false, hint: 'JSON array of extra substrings that fire the agent (e.g. ["agent-fix"]).' },
-  { key: "trigger_on_mention", label: "Trigger on @mention", restartRequired: false, secret: false, hint: 'Fire Agent when body/comments contains "@Noodle" or /Noodle.' },
+  { key: "trigger_on_mention", label: "Trigger on @mention", restartRequired: false, secret: false, hint: 'Fire Agent when body/comments contains "@Noodle". Slash commands (/command) and profile tags (#profile) always wake independently.' },
   { key: "trigger_on_open", label: "Trigger on open", restartRequired: false, secret: false, hint: "Fire Agent on any new/reopened/labeled issue or Pull Request." },
   // --- Routing rules (re-overlayed live on save) ---
   { key: "routing", label: "Routing rules", restartRequired: false, secret: false, hint: 'JSON array of {kind, match, profile} objects (e.g. [{"kind":"slash","match":"/claude","profile":"claude"}]).' },

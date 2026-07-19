@@ -34,12 +34,14 @@ async function postWebhook(opts: {
   sig?: string;
   selfLogin?: string;
   triggers?: TriggerConfig;
+  profileNames?: string[];
   enqueue: (i: { kind: string; repo: string; issueNumber: number; installationId?: number }) => Promise<void> | void;
 }) {
   const app = createWebhookApp(() => SECRET, {
     enqueue: opts.enqueue,
     selfLogin: () => opts.selfLogin,
     triggers: () => opts.triggers,
+    profileNames: () => opts.profileNames ?? ["test-profile"],
   });
   apps.add(app);
   return app.inject({

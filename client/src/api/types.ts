@@ -410,3 +410,68 @@ export interface TestModelResponse {
   status?: number;
   error?: string;
 }
+
+/* ----- Chats (interactive agent conversations) ----- */
+
+export type ChatStatus = "idle" | "running" | "errored" | "disposed";
+
+export interface ChatRow {
+  id: number;
+  title: string;
+  repo: string;
+  branch: string;
+  default_branch: string;
+  profile: string | null;
+  /** Per-chat thinking-level override (off|minimal|low|medium|high|xhigh). */
+  thinking_level: ThinkingLevel;
+  workspace_path: string | null;
+  session_dir: string | null;
+  status: ChatStatus;
+  last_error: string | null;
+  preview: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One turn in a chat thread (user / assistant / tool). */
+export interface ChatMessageRow {
+  id: number;
+  chat_id: number;
+  role: "user" | "assistant" | "tool";
+  text: string;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  created_at: string;
+}
+
+export interface ChatsResponse {
+  chats: ChatRow[];
+}
+export interface ChatDetailResponse {
+  chat: ChatRow;
+  messages: ChatMessageRow[];
+}
+export interface ChatMutationResponse {
+  chat: ChatRow;
+}
+export interface NewChatInput {
+  repo: string;
+  branch: string;
+  profile?: string | null;
+  thinking_level?: ThinkingLevel;
+  title?: string;
+}
+
+/**
+ * SSE event frame from `/api/chats/:id/stream`. The `type` discriminant
+ * selects the shape; the `data` envelope wraps the same object (the server
+ * emits `event: {type}\ndata: {JSON}\n\n`).
+ */
+export type ChatStreamEvent =
+  | { type: "turn_start" }
+  | { type: "delta"; text: string }
+  | { type: "tool_start"; name: string; args: Record<string, unknown> }
+  | { type: "tool_end"; name: string; ok: boolean; text: string }
+  | { type: "turn_end"; text: string }
+  | { type: "error"; message: string }
+  | { type: "done" };

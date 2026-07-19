@@ -40,9 +40,7 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { name: "runs", label: "Runs", icon: "runs", target: { name: "runs" }, activeOn: ["runs", "run-detail"] },
-  // Chats hidden — still mock-only (backed by in-memory array, no DB store).
-  // Uncomment when the chat backend lands.
-  // { name: "chats", label: "Chats", icon: "message", target: { name: "chats" }, activeOn: ["chats", "chat-detail", "chat-new"], create: { name: "chat-new", label: "New chat" } },
+  { name: "chats", label: "Chats", icon: "message", target: { name: "chats" }, activeOn: ["chats", "chat-detail"], create: { name: "chats", label: "New chat" } },
   { name: "skills", label: "Skills", icon: "book", target: { name: "skills" }, activeOn: ["skills", "skill-detail", "skill-new"], create: { name: "skill-new", label: "New skill" } },
   { name: "profiles", label: "Profiles", icon: "key", target: { name: "profiles" }, activeOn: ["profiles", "profile-detail", "profile-new"], create: { name: "profile-new", label: "New profile" } },
   { name: "triggers", label: "Triggers", icon: "zap", target: { name: "triggers" }, activeOn: ["triggers", "trigger-detail", "trigger-new"], create: { name: "trigger-new", label: "New trigger" } },

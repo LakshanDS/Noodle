@@ -160,6 +160,15 @@ describe("GitHubClient.findOpenPRForIssue", () => {
           },
         },
       },
+      // paginate.iterator is used by findOpenPRForIssue to page through open PRs.
+      paginate: {
+        iterator: (method: Function, params: unknown) => ({
+          async *[Symbol.asyncIterator]() {
+            const result = await method(params);
+            yield { data: result.data };
+          },
+        }),
+      },
     } as unknown as import("octokit").Octokit);
     return { client, calls };
   }

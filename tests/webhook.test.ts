@@ -146,6 +146,28 @@ describe("parseWebhookEvent", () => {
     expect(parseWebhookEvent("issue_comment", payload)?.kind).toBe("comment");
   });
 
+  it("does NOT wake on @mention in a comment when trigger_on_mention is off", () => {
+    const payload = {
+      action: "created",
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "@noodle can you look at this?" },
+    };
+    const noMention: TriggerConfig = { trigger_on_mention: false, trigger_keywords: [], trigger_on_open: false };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle", noMention)).toBeNull();
+  });
+
+  it("still wakes on /command in a comment when trigger_on_mention is off", () => {
+    const payload = {
+      action: "created",
+      repository: { full_name: "owner/name" },
+      issue: { number: 7 },
+      comment: { body: "/noodle-fix fix the login bug" },
+    };
+    const noMention: TriggerConfig = { trigger_on_mention: false, trigger_keywords: [], trigger_on_open: false };
+    expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle", noMention, [], ["noodle-fix"])?.kind).toBe("comment");
+  });
+
   it("wakes on a #profile tag in a comment", () => {
     const payload = {
       action: "created",
@@ -319,6 +341,136 @@ describe("parseWebhookEvent", () => {
       repo: "owner/name",
       issueNumber: 7,
       installationId: 42,
+    });
+  });
+
+  // --- self-event suppression (re-entrant trigger guard) -----------------
+  // The bot's OWN comments and label swaps must never wake it again — the
+  // answer comment can carry @noodle / #profile / /command in its text, and
+  // label swaps (cooking→cooked) shouldn't re-fire under trigger_on_open.
+  // Other self-originated events (issues.opened/reopened) are NOT suppressed:
+  // that's how cron/trigger runs open new issues that chain into another run.
+  describe("self-event suppression", () => {
+    it("suppresses the bot's own @mention comment", () => {
+      const payload = {
+        action: "created",
+        installation: { id: 42 },
+        repository: { full_name: "owner/name" },
+        issue: { number: 7 },
+        comment: { body: "@noodle can you also look at X?" },
+        sender: { login: "noodle[bot]" },
+      };
+      // Without selfLogin the guard is inert (matches historical behaviour).
+      expect(parseWebhookEvent("issue_comment", payload, undefined, "Noodle")).not.toBeNull();
+      // With the App-mode selfLogin it's suppressed.
+      expect(parseWebhookEvent("issue_comment", payload, "noodle[bot]", "Noodle")).toBeNull();
+    });
+
+    it("suppresses the bot's own /noodle command comment", () => {
+      const payload = {
+        action: "created",
+        repository: { full_name: "owner/name" },
+        issue: { number: 7 },
+        comment: { body: "/noodle rerun this" },
+        sender: { login: "noodle[bot]" },
+      };
+      expect(parseWebhookEvent("issue_comment", payload, "noodle[bot]", "Noodle")).toBeNull();
+    });
+
+    it("suppresses the bot's own #profile tag comment", () => {
+      const payload = {
+        action: "created",
+        repository: { full_name: "owner/name" },
+        issue: { number: 7 },
+        comment: { body: "#claude rerun with claude" },
+        sender: { login: "noodle[bot]" },
+      };
+      expect(
+        parseWebhookEvent("issue_comment", payload, "noodle[bot]", "Noodle", optIn, ["claude"]),
+      ).toBeNull();
+    });
+
+    it("suppresses the bot's own label swap under trigger_on_open", () => {
+      const payload = {
+        action: "labeled",
+        installation: { id: 42 },
+        repository: { full_name: "owner/name" },
+        issue: { number: 7, body: "@noodle please", labels: [] },
+        sender: { login: "noodle[bot]" },
+      };
+      // A human adding a label still wakes (under trigger_on_open).
+      const human = { ...payload, sender: { login: "alice" } };
+      expect(parseWebhookEvent("issues", human, "noodle[bot]", "Noodle", openAll)?.kind).toBe("issue");
+      // The bot's own label swap does not.
+      expect(parseWebhookEvent("issues", payload, "noodle[bot]", "Noodle", openAll)).toBeNull();
+    });
+
+    it("still wakes on a human comment (no regression)", () => {
+      const payload = {
+        action: "created",
+        installation: { id: 42 },
+        repository: { full_name: "owner/name" },
+        issue: { number: 7 },
+        comment: { body: "@noodle one more thing" },
+        sender: { login: "alice" },
+      };
+      expect(parseWebhookEvent("issue_comment", payload, "noodle[bot]", "Noodle")).toEqual({
+        kind: "comment",
+        repo: "owner/name",
+        issueNumber: 7,
+        installationId: 42,
+      });
+    });
+
+    it("does NOT suppress the bot's own issues.opened (cron/trigger chaining)", () => {
+      // Cron/trigger runs open new issues to chain into another agent run —
+      // that path must keep working even when the sender is the bot itself.
+      const payload = {
+        action: "opened",
+        installation: { id: 42 },
+        repository: { full_name: "owner/name" },
+        issue: { number: 7, body: "@noodle found a bug", labels: [] },
+        sender: { login: "noodle[bot]" },
+      };
+      expect(parseWebhookEvent("issues", payload, "noodle[bot]", "Noodle", optIn)?.kind).toBe("issue");
+    });
+
+    it("does NOT suppress the bot's own issues.reopened", () => {
+      const payload = {
+        action: "reopened",
+        repository: { full_name: "owner/name" },
+        issue: { number: 7, body: "@noodle retry", labels: [] },
+        sender: { login: "noodle[bot]" },
+      };
+      expect(parseWebhookEvent("issues", payload, "noodle[bot]", "Noodle", optIn)?.kind).toBe("issue");
+    });
+
+    it("tolerates the [bot] suffix on either side (and is case-insensitive)", () => {
+      // selfLogin without suffix, sender with suffix → suppressed.
+      const payload = {
+        action: "created",
+        repository: { full_name: "owner/name" },
+        issue: { number: 7 },
+        comment: { body: "@noodle go" },
+        sender: { login: "noodle[bot]" },
+      };
+      expect(parseWebhookEvent("issue_comment", payload, "noodle", "Noodle")).toBeNull();
+      // selfLogin with suffix, sender without (unusual but tolerated) → suppressed.
+      expect(
+        parseWebhookEvent("issue_comment", { ...payload, sender: { login: "Noodle" } }, "noodle[bot]", "Noodle"),
+      ).toBeNull();
+    });
+
+    it("fires on issues.assigned to the App bot in App mode (regression)", () => {
+      // Previously broken: App-mode selfLogin was `noodle-agent`, so assigning
+      // to the real `noodle[bot]` never matched. Now the derivation is correct.
+      const payload = {
+        ...basePayload,
+        action: "assigned",
+        assignee: { login: "noodle[bot]" },
+        sender: { login: "someone" },
+      };
+      expect(parseWebhookEvent("issues", payload, "noodle[bot]")?.kind).toBe("issue");
     });
   });
 });

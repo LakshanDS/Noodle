@@ -21,7 +21,7 @@ describe("collectSysFacts", () => {
 });
 
 describe("buildSysInfoGuidance", () => {
-  it("states the facts and forbids builds on a constrained box", () => {
+  it("states the facts and flags a constrained box with a one-liner", () => {
     const facts: SysFacts = {
       cpus: 2,
       totalMemoryMb: 1024,
@@ -36,12 +36,9 @@ describe("buildSysInfoGuidance", () => {
     expect(g).toContain("CPU cores visible: 2");
     expect(g).toContain("Memory: 1024 MB available (cgroup limit)");
     expect(g).toContain("Environment: container (linux x64)");
-    // The load-bearing guidance
-    expect(g).toMatch(/resource-constrained/i);
-    expect(g).toMatch(/do ?\*\*not\*\* ?run build/i);
-    expect(g).toContain("npm run build");
-    expect(g).toContain("pytest");
-    expect(g).toMatch(/verify by .{0,40}reason/i);
+    // One-liner capability hint — the agent infers the rest from the raw numbers.
+    expect(g).toMatch(/Resource-constrained/i);
+    expect(g).toMatch(/skip builds\/tests/i);
   });
 
   it("uses host total when no cgroup limit is known", () => {
@@ -59,7 +56,7 @@ describe("buildSysInfoGuidance", () => {
     expect(g).toContain("Environment: host");
   });
 
-  it("keeps the capable branch short and allows light verification", () => {
+  it("flags a capable box with a one-liner allowing light verification", () => {
     const facts: SysFacts = {
       cpus: 8,
       totalMemoryMb: 16384,
@@ -71,10 +68,10 @@ describe("buildSysInfoGuidance", () => {
     const g = buildSysInfoGuidance(facts);
     expect(g).toContain("CPU cores visible: 8");
     expect(g).toContain("Memory: 16384 MB available");
-    expect(g).toMatch(/looks capable/i);
-    expect(g).toMatch(/light/i);
-    // Does NOT contain the hard forbid from the constrained branch.
-    expect(g).not.toMatch(/do ?\*\*not\*\* ?run build/i);
+    expect(g).toMatch(/Capable box/i);
+    expect(g).toMatch(/light verification OK/i);
+    // Does NOT contain the constrained one-liner.
+    expect(g).not.toMatch(/Resource-constrained/i);
   });
 });
 

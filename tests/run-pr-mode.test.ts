@@ -20,13 +20,17 @@ vi.mock("../src/util/paths.js", () => ({
 
 // Track the branch name handed to checkoutOrReuse + push so tests can assert
 // the PR's head branch was used (not a fresh `<agent>/issue-<n>` branch).
-const wsCalls: { checkoutOrReuse?: string; push?: string; pushReuse?: boolean } = {};
+const wsCalls: { checkoutOrReuse?: string; branchFrom?: { newBranch: string; fromBranch: string }; push?: string; pushReuse?: boolean } = {};
 vi.mock("../src/engine/workspace.js", () => ({
   Workspace: {
     clone: vi.fn().mockResolvedValue({
       path: mkdtempSync(join(tmpdir(), "noodle-pr-")),
       branch: vi.fn(),
+      branchFrom: vi.fn((newBranch: string, fromBranch: string) => {
+        wsCalls.branchFrom = { newBranch, fromBranch };
+      }),
       checkoutOrReuse: vi.fn((branch: string) => { wsCalls.checkoutOrReuse = branch; }),
+      checkoutRemote: vi.fn(),
       removeInternals: vi.fn(),
       // commitAll returns true so the commit/push path (step 8) is exercised.
       commitAll: vi.fn().mockResolvedValue(true),
@@ -70,6 +74,7 @@ describe("runJob PR mode", () => {
     // The workspace mock captures calls into module-level state; reset between
     // tests so assertions don't see the previous test's branch name.
     delete wsCalls.checkoutOrReuse;
+    delete wsCalls.branchFrom;
     delete wsCalls.push;
     delete wsCalls.pushReuse;
   });
@@ -103,14 +108,13 @@ describe("runJob PR mode", () => {
       tokenProvider: async () => "fake-token",
     });
 
-    // The PR's head branch was checked out — NOT a fresh `noodle/issue-3`.
-    expect(wsCalls.checkoutOrReuse).toBe("feature/thing");
-    // Pushed back to the same PR branch with reuse (force-with-lease).
-    expect(wsCalls.push).toBe("feature/thing");
-    expect(wsCalls.pushReuse).toBe(true);
-    // No new PR was created — the existing PR was updated in place.
-    expect(createdPR).toBe(false);
-    expect(result.prUrl).toBe("https://x/pull/3");
+    // The PR's head branch was used as the base via branchFrom (stacked PR).
+    expect(wsCalls.branchFrom?.fromBranch).toBe("feature/thing");
+    // Pushed the new agent branch (fresh, not reused — stacked on top of the PR).
+    expect(wsCalls.pushReuse).toBe(false);
+    // A new stacked PR was created targeting the existing PR's branch.
+    expect(createdPR).toBe(true);
+    expect(result.prUrl).toBe("https://x/p/3");
   });
 
   it("bails with a comment on a fork PR (can't push to the head repo)", async () => {

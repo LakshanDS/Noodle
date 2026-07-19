@@ -1,5 +1,5 @@
 import type { Database as Db } from "better-sqlite3";
-import { defaultCommandPrompt, fixCommandPrompt, reviewCommandPrompt } from "../engine/prompt.js";
+import { fixCommandPrompt, reviewCommandPrompt } from "../engine/prompt.js";
 import { slugify } from "../util/slugify.js";
 import { stripCodeBlocks } from "../commands/match.js";
 
@@ -312,18 +312,24 @@ export function seedBuiltinCommand(store: CommandStore, agentName: string): void
   const specs = [
     {
       trigger: base,
-      prompt: defaultCommandPrompt(agentName),
-      description: `The built-in /${base} command — loads the noodle-default skill. Non-deletable.`,
+      // The base /<agent> command is a no-op extension: the global system_prompt
+      // already says "always load noodle-default + final message IS the
+      // deliverable", so /<agent> resolves to "run the default workflow" with no
+      // additional framing. The trigger still needs to exist so wake detection
+      // and routing recognise it; an empty system_prompt means the framing slot
+      // stays empty (same as a pure @mention).
+      prompt: "",
+      description: `The built-in /${base} command — runs the default workflow (noodle-default skill). Non-deletable.`,
     },
     {
       trigger: `${base}-fix`,
-      prompt: fixCommandPrompt(agentName),
-      description: `The built-in /${base}-fix command — loads noodle-default + noodle-fix skills and runs the fix workflow. Non-deletable.`,
+      prompt: fixCommandPrompt(),
+      description: `The built-in /${base}-fix command — loads the noodle-fix skill (on top of always-active noodle-default) and runs the fix workflow. Non-deletable.`,
     },
     {
       trigger: `${base}-review`,
-      prompt: reviewCommandPrompt(agentName),
-      description: `The built-in /${base}-review command — loads noodle-default + noodle-review skills and runs the code review workflow. Non-deletable.`,
+      prompt: reviewCommandPrompt(),
+      description: `The built-in /${base}-review command — loads the noodle-review skill (on top of always-active noodle-default) and runs the code review workflow. Non-deletable.`,
     },
   ];
   // Remove stale built-ins whose triggers no longer match (e.g. agent renamed

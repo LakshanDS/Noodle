@@ -136,14 +136,11 @@ function detectContainer(): boolean {
 }
 
 /**
- * Render the facts into a short, agent-facing system-info block plus the
- * behavioral guidance that follows from them. This is what gets prepended to the
- * user prompt.
- *
- * The "constrained" branch is the load-bearing one: it explicitly forbids
- * running builds / test suites / heavy commands and steers the agent toward
- * verification by reasoning, reading, and static checks. The "capable" branch is
- * shorter — build/test is allowed but the agent should keep it light.
+ * Render the facts into a short, agent-facing system-info block: the raw
+ * numbers (CPU, RAM, environment) plus a one-line capability hint. This is what
+ * gets prepended to the user prompt (after the operator's expanded system
+ * prompt). The raw numbers + the one-liner let the agent infer what it can and
+ * can't do without a verbose explanation — keeps the token count down.
  */
 export function buildSysInfoGuidance(facts: SysFacts): string {
   const mem = facts.memoryLimitMb ?? facts.totalMemoryMb;
@@ -157,23 +154,9 @@ export function buildSysInfoGuidance(facts: SysFacts): string {
   ];
 
   if (facts.tier === "constrained") {
-    lines.push(
-      "**This box is resource-constrained.** It does NOT have enough CPU or RAM to",
-      "run builds, compile, or execute test suites — attempting to will hang or",
-      "crash the run. So:",
-      "- Do **NOT** run build/test commands (`npm run build`, `tsc`, `cargo build`,",
-      "  `pytest`, `go test`, full suites, etc.) to verify your change.",
-      "- Verify by **reasoning** about the code, reading the relevant files,",
-      "  tracing types/callers, and checking diffs — not by executing.",
-      "- Light, fast checks (a single `--version`, `ls`, `cat` of a config) are",
-      "  fine. Anything that compiles, links, or spawns a runtime is not.",
-    );
+    lines.push("Resource-constrained — skip builds/tests; verify by reading and reasoning.");
   } else {
-    lines.push(
-      "This box looks capable enough for **light** verification. If you run a",
-      "build or test, keep it minimal (one targeted command, not the whole",
-      "suite). Skip it if you can verify by reading and reasoning.",
-    );
+    lines.push("Capable box — light verification OK; skip heavy full-suite runs.");
   }
 
   return lines.join("\n");

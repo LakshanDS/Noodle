@@ -5,13 +5,17 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CommandRow } from "../src/server/command-store.js";
-import { defaultCommandPrompt } from "../src/engine/prompt.js";
 
 /**
- * Verifies that a resolved slash command's `system_prompt` becomes the run's
- * framing (replacing the built-in default), and that template tags inside it
- * are expanded. Also checks the fallback: when no command matches, the default
- * framing is used byte-identically.
+ * Verifies the issue/PR prompt composition contract:
+ *
+ *  - The operator's global `systemPrompt` dep is always active (expanded and
+ *    prepended to sysInfo), regardless of whether a command matched.
+ *  - A matched command's `system_prompt` extends it as the framing slot.
+ *  - A pure @mention (resolveCommand returns null, or not provided) leaves the
+ *    framing slot EMPTY — the base system prompt alone is complete. No legacy
+ *    default framing is injected.
+ *  - Template tags ({system.tier}, etc.) inside both prompts are expanded.
  *
  * Mirrors run-thinking.test.ts: git/skill side mocked, createAgentSession
  * stubbed so it captures the prompt and aborts cheaply.
@@ -79,6 +83,15 @@ function fakeCommand(overrides: Partial<CommandRow> = {}): CommandRow {
   };
 }
 
+/** A base system prompt matching the shape of the Settings default seed. */
+const BASE_SYSTEM_PROMPT = [
+  "You are an autonomous software engineer working on a GitHub repository.",
+  "Always load the `noodle-default` skill.",
+  "Post your final answer as a normal text message — it IS the deliverable.",
+  "",
+  "{system}",
+].join("\n");
+
 /** Stub createAgentSession that captures the prompt string passed to session.prompt(). */
 function capturePromptStub(): { stub: any; getPrompt: () => string | undefined } {
   let capturedPrompt: string | undefined;
@@ -96,8 +109,8 @@ function capturePromptStub(): { stub: any; getPrompt: () => string | undefined }
   return { stub, getPrompt: () => capturedPrompt };
 }
 
-describe("runJob command framing", () => {
-  it("uses the resolved command's system_prompt as framing (not the default)", async () => {
+describe("runJob prompt composition", () => {
+  it("uses the resolved command's system_prompt as framing, on top of the base", async () => {
     const config = makeConfig();
     const { stub, getPrompt } = capturePromptStub();
     const cmd = fakeCommand();
@@ -106,6 +119,7 @@ describe("runJob command framing", () => {
       authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
+      systemPrompt: BASE_SYSTEM_PROMPT,
       resolveCommand: () => cmd,
     });
 
@@ -114,8 +128,10 @@ describe("runJob command framing", () => {
     expect(prompt).toContain("You are reviewing code on a");
     // …the {system.tier} tag was expanded (not left literal)…
     expect(prompt).not.toContain("{system.tier}");
-    // …and the default framing is NOT present.
-    expect(prompt).not.toContain(defaultCommandPrompt("TestBot").split("\n")[0]);
+    // …the base system prompt is also present (always active)…
+    expect(prompt).toContain("Always load the `noodle-default` skill.");
+    // …and the issue context block is appended.
+    expect(prompt).toContain("You are working on an issue in the GitHub repository `o/r`");
   });
 
   it("expands {system.tier} to constrained or capable", async () => {
@@ -126,6 +142,7 @@ describe("runJob command framing", () => {
       authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
+      systemPrompt: BASE_SYSTEM_PROMPT,
       resolveCommand: () => fakeCommand(),
     });
 
@@ -133,7 +150,7 @@ describe("runJob command framing", () => {
     expect(prompt).toMatch(/(constrained|capable)/);
   });
 
-  it("falls back to defaultCommandPrompt when resolveCommand returns null", async () => {
+  it("leaves the framing slot empty on a pure @mention (resolveCommand returns null)", async () => {
     const config = makeConfig();
     const { stub, getPrompt } = capturePromptStub();
 
@@ -141,15 +158,21 @@ describe("runJob command framing", () => {
       authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
+      systemPrompt: BASE_SYSTEM_PROMPT,
       resolveCommand: () => null,
     });
 
     const prompt = getPrompt()!;
-    // The default framing's first line ("**Load both skills before starting:**") is present.
-    expect(prompt).toContain(defaultCommandPrompt("TestBot"));
+    // Base system prompt is present (always active)…
+    expect(prompt).toContain("Always load the `noodle-default` skill.");
+    // …issue context is appended…
+    expect(prompt).toContain("You are working on an issue in the GitHub repository `o/r`");
+    expect(prompt).toContain("Issue URL: https://x/1");
+    // …and NO command framing leaked in (the review command's text is absent).
+    expect(prompt).not.toContain("You are reviewing code");
   });
 
-  it("falls back to default when resolveCommand is not provided (CLI/test path)", async () => {
+  it("falls back to empty framing when resolveCommand is not provided (CLI/test path)", async () => {
     const config = makeConfig();
     const { stub, getPrompt } = capturePromptStub();
 
@@ -157,9 +180,13 @@ describe("runJob command framing", () => {
       authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
+      systemPrompt: BASE_SYSTEM_PROMPT,
       // No resolveCommand dep — same as the CLI path.
     });
 
-    expect(getPrompt()).toContain(defaultCommandPrompt("TestBot"));
+    const prompt = getPrompt()!;
+    expect(prompt).toContain("Always load the `noodle-default` skill.");
+    expect(prompt).toContain("You are working on an issue in the GitHub repository `o/r`");
+    expect(prompt).not.toContain("You are reviewing code");
   });
 });

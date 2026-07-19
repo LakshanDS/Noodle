@@ -8,7 +8,7 @@ import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildSchedulerPrompt } from "./prompt.js";
 import { expandTags } from "./tags.js";
-import { generateIssueTitle, templateTitle } from "./title.js";
+import { generateIssueTitle, phraseOutput, templateTitle } from "./title.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
@@ -198,13 +198,17 @@ export async function runSchedulerJob(
     const sysFacts = collectSysFacts();
     log_.debug({ sysFacts }, "probed system info for scheduler prompt");
 
-    // Expand the custom system prompt's template tags, then prepend to sysInfo.
+    // Expand the custom system prompt's template tags, then prepend to sysInfo
+    // (unless the prompt already inlined sysInfo via a {system} tag).
     const sysInfo = buildSysInfoGuidance(sysFacts);
     let fullSysInfo = sysInfo;
     if (deps?.systemPrompt) {
       try {
         const expanded = await expandTags(deps.systemPrompt, { sysFacts, gh, repo: input.repo });
-        if (expanded.trim()) fullSysInfo = `${expanded}\n\n---\n\n${sysInfo}`;
+        if (expanded.trim()) {
+          const referencesSystem = /\{system(\.|})/i.test(deps.systemPrompt);
+          fullSysInfo = referencesSystem ? expanded : `${expanded}\n\n---\n\n${sysInfo}`;
+        }
       } catch (e) {
         log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using sysInfo only");
       }
@@ -377,6 +381,14 @@ export async function runSchedulerJob(
         log_.error({ errorMessage: stopReason.errorMessage, stopReason: stopReason.stopReason }, "scheduler run ended on error");
       } else {
         agentAnswer = extractLastAssistantText(session);
+        // Clean the raw output via a relay LLM call before posting — strip
+        // thinking-token residue and tool-call chatter, PRESERVE every
+        // technical detail. Falls back to the raw message on any failure.
+        // Only reached on a successful run; an errored run (e.g. the agent's
+        // own LLM call failed) uses the error body and is never phrased.
+        if (agentAnswer) {
+          agentAnswer = await phraseOutput(agentAnswer, profile);
+        }
       }
 
       // Commit + push the branch (traceability). No PR — the issue below is the output.
@@ -395,7 +407,7 @@ export async function runSchedulerJob(
       // is just an opening utterance, not a real answer. The title is derived
       // from the task so the issue is identifiable in a triage list.
       const issueBody = errored
-        ? buildCronErrorBody(config.agent_name, stopReason.errorMessage ?? "agent run ended on error")
+        ? buildCronErrorBody(config.agent_name, stopReason.errorMessage ?? "agent run ended on error", buildFooter(profile, config.agent_name, runStats))
         : buildCronIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
       // Generate a clean title from the agent's findings via a separate model
       // call (falls back to a template on any failure). Only on success — an
@@ -631,7 +643,7 @@ function nowIso(): string {
  * footer. A blank/missing agent message still produces a useful issue body so
  * the run is never silent (the team sees the agent ran but had nothing to say).
  */
-function buildCronIssueBody(agentMessage: string | undefined, footer: string): string {
+export function buildCronIssueBody(agentMessage: string | undefined, footer: string): string {
   const body = agentMessage?.trim() ||
     "_The agent ran but produced no findings. It may have found nothing concrete to report._";
   return `${body}\n\n---\n${footer}`;
@@ -640,16 +652,17 @@ function buildCronIssueBody(agentMessage: string | undefined, footer: string): s
 /**
  * Build the cron output issue body for an errored run. Honest notice that the
  * run failed, with the error text quoted so the cause is visible, plus the
- * footer. Mirrors `buildErrorComment` from run.ts but for the cron (no-issue) path.
+ * footer (consistent with the success path and `buildErrorComment` in run.ts).
+ * Mirrors `buildErrorComment` from run.ts but for the cron (no-issue) path.
  */
-function buildCronErrorBody(agentName: string, errorMessage: string): string {
+export function buildCronErrorBody(agentName: string, errorMessage: string, footer: string): string {
   const err = errorMessage.trim() || "unknown error";
   const body =
     `⚠️ **Scheduled run by ${agentName} errored out before finishing.**\n\n` +
     `> \`${err}\`\n\n` +
     `No findings were produced. The run may be retried once the underlying issue ` +
     `(API quota, rate limit, provider outage, etc.) is resolved.`;
-  return body;
+  return `${body}\n\n---\n${footer}`;
 }
 
 // Re-export buildFooter for callers (UI / summary rendering) that want the
