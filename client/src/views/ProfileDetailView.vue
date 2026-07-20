@@ -471,6 +471,7 @@ async function fetchModels(): Promise<FetchModelsResponse | null> {
   if (!canVerify.value) return null;
   return sendJson<FetchModelsResponse>("/api/profiles/fetch-models", "POST", {
     base_url: form.value.base_url.trim(),
+    api: form.value.api,
     api_key: form.value.api_key?.trim() || undefined,
     model: form.value.model?.trim() || undefined,
   });

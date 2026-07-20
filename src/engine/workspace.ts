@@ -133,6 +133,80 @@ export class Workspace {
   }
 
   /**
+   * Merge the repo's base (default) branch into the current branch. Used by
+   * scheduler runs to sync a long-lived trunk branch with `main` before each
+   * run, so the trunk never drifts into an unmergeable state.
+   *
+   * Fetches `baseBranch` first — a `--depth 50` shallow clone may not have it
+   * if it isn't the default branch the clone landed on. Then runs
+   * `git merge origin/<baseBranch>` and inspects the result:
+   *  - clean merge / already up to date → `{ conflicted: false, files: [] }`
+   *  - conflict → `{ conflicted: true, files: [...] }` (caller must resolve or
+   *    abort; the worktree is left with conflict markers in the index)
+   *
+   * `freshCloneUrl` (optional) embeds a re-minted token and is used to fetch,
+   * avoiding a 401 on long runs where the clone-time token has expired.
+   *
+   * simple-git notes: when `git merge` exits non-zero with conflicts, the
+   * simple-git promise REJECTS (does not resolve) — the conflict list lives on
+   * `err.git.conflicts` as `[{ reason, file }, ...]`. We catch that and turn it
+   * into the return shape; any other throw (network, auth) is re-thrown.
+   */
+  async mergeMain(
+    baseBranch: string,
+    freshCloneUrl?: string,
+  ): Promise<{ conflicted: boolean; files: string[] }> {
+    if (freshCloneUrl) {
+      await this.git.remote(["set-url", "origin", freshCloneUrl]);
+    }
+    await this.git.fetch("origin", baseBranch);
+    try {
+      // Pass the ref as a single token (`origin/<base>`) — simple-git forwards
+      // the array elements as separate argv, and `git merge origin main` would
+      // be misread as merging two unrelated refs.
+      await this.git.merge([`origin/${baseBranch}`]);
+      log.debug({ dir: this.path, baseBranch }, "merged base branch into current branch");
+      return { conflicted: false, files: [] };
+    } catch (e) {
+      const conflictList = (e as { git?: { conflicts?: { file?: string; reason?: string }[] } }).git?.conflicts;
+      if (conflictList && conflictList.length > 0) {
+        const files = conflictList.map((c) => c.file).filter((f): f is string => !!f);
+        log.warn({ dir: this.path, baseBranch, files }, "merge produced conflicts");
+        return { conflicted: true, files };
+      }
+      // Not a conflict — a real error (network, auth, malformed merge). Re-throw
+      // so the caller surfaces it instead of silently treating it as a conflict.
+      throw e;
+    }
+  }
+
+  /**
+   * Abort an in-progress merge, restoring the worktree to its pre-merge state.
+   * Used when a merge conflict can't be resolved — the caller aborts rather than
+   * leaving the trunk in a broken conflicted state. No-op when no merge is in
+   * progress (git itself silently succeeds).
+   */
+  async abortMerge(): Promise<void> {
+    await this.git.merge(["--abort"]);
+    log.debug({ dir: this.path }, "aborted in-progress merge");
+  }
+
+  /**
+   * Check whether the index still has unmerged paths after a conflict-resolver
+   * agent pass. Used to verify the resolver actually cleared every conflict
+   * before the caller commits and pushes the trunk.
+   *
+   * Uses `git status`'s `conflicted` list (the canonical git signal for
+   * "unresolved conflict"). `git diff --check` is NOT reliable here: it only
+   * reports whitespace/trailing-space errors on staged content, and exits clean
+   * on a tree that still has the standard `<<<<<<<` markers in unmerged paths.
+   */
+  async hasConflictMarkers(): Promise<boolean> {
+    const status = await this.git.status();
+    return !!status.conflicted && status.conflicted.length > 0;
+  }
+
+  /**
    * Push the current branch to origin. If `freshCloneUrl` is given, the origin
    * remote is re-pointed first — used on long agent runs where the token baked
    * into the clone-time URL has since expired.

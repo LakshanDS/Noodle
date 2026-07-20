@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { RunStore } from "./run-store.js";
+import type { LiveRunRegistry } from "../engine/live-runs.js";
 import type { JobQueue } from "./queue.js";
 import { SchedulerStore } from "./scheduler-store.js";
 import type { NewSchedulerJob, SchedulerUpdate } from "./scheduler-store.js";
@@ -19,9 +20,11 @@ import type { AuthProvider } from "../github/auth-provider.js";
 import type { NoodleConfig, Profile } from "../config/schema.js";
 import { ThinkingLevel, type ThinkingLevelT } from "../config/schema.js";
 import { labelsFor } from "../engine/run.js";
+import { DEFAULT_SYSTEM_PROMPT } from "../engine/prompt.js";
 import type { ChatRuntime, ChatStreamEvent } from "../engine/chat-runtime.js";
 import { defaultLabelSet, serializeLabelSet, parseLabelSet } from "../engine/labels.js";
 import { readSession, type ParsedMessage } from "./session-reader.js";
+import { originOf, relayBaseUrl, upstreamBase } from "../util/slugify.js";
 import {
   clearCookieValue,
   loginCookieValue,
@@ -55,6 +58,8 @@ const LEVEL_ORDER: Record<string, number> = {
 
 export interface UiDeps {
   runStore: RunStore;
+  /** Live registry of in-flight run sessions — the cancel endpoint aborts via this. */
+  liveRuns: LiveRunRegistry;
   /** Getter for the operator password (NOODLE_UI_PASSWORD). Also the token-signing secret. Read per-request so password changes take effect without restart. */
   getSecret: () => string;
   queue: JobQueue;
@@ -85,10 +90,10 @@ export interface UiDeps {
    * is enqueued. Optional only so test harnesses can omit it.
    */
   dispatch?: () => void;
-  /** Shared map of model → original upstream base_url (before relay rewrite). Updated live on profile CRUD. */
+  /** Shared map of model → upstream origin (scheme://host, before relay rewrite). Updated live on profile CRUD. */
   originalUrls?: Map<string, string>;
-  /** The relay base URL (e.g. http://localhost:4445/v1) for rewriting relay-enabled profiles. */
-  relayBase?: string;
+  /** The relay origin (e.g. http://localhost:4445) for rewriting relay-enabled profiles. */
+  relayOrigin?: string;
 }
 
 /**
@@ -107,20 +112,7 @@ export interface UiDeps {
 export function seedDefaultSettings(settingsStore: SettingStore): void {
   const values: Record<string, string> = {};
   if (!settingsStore.has("system_prompt")) {
-    values.system_prompt = [
-      "You are an autonomous software engineer working on a GitHub repository.",
-      "Work from the issue or task you're given, and the system info below.",
-      "",
-      "Always load the `noodle-default` skill — it is the always-active engineering",
-      "mindset (minimal diff, stdlib first, no over-engineering). Other skills",
-      "(noodle-fix, noodle-review, custom) load via slash commands when relevant.",
-      "",
-      "Decide your own approach from the system info. Make the minimal change,",
-      "verify it, and post your final answer as a normal text message — it IS",
-      "the deliverable.",
-      "",
-      "{system}",
-    ].join("\n");
+    values.system_prompt = DEFAULT_SYSTEM_PROMPT;
   }
   if (!settingsStore.has("run_stall_timeout_minutes")) values.run_stall_timeout_minutes = "30";
   if (!settingsStore.has("run_tool_stall_minutes")) values.run_tool_stall_minutes = "60";
@@ -131,7 +123,7 @@ export function seedDefaultSettings(settingsStore: SettingStore): void {
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, getSecret, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch } = deps;
+  const { runStore, liveRuns, getSecret, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   // The secret is read per-request so password changes take effect without restart.
@@ -192,8 +184,9 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     return { run, messages };
   });
 
-  // --- Cancel a running job. Marks the queue job as failed, updates the run
-  // store, and best-effort removes the "cooking" label from the issue. ---
+  // --- Cancel a running job. Aborts the live pi session (actually stops the
+  // agent), marks the queue job as failed, updates the run store, and
+  // best-effort removes the "cooking" label from the issue. ---
   app.post("/api/runs/:id/cancel", { preHandler: auth }, async (req, reply) => {
     const { id } = req.params as { id: string }; // e.g. "job-19"
     let run;
@@ -205,6 +198,12 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     if (run.status !== "running") {
       return reply.code(409).send({ error: "run is not running", status: run.status });
     }
+    // Abort the in-flight prompt FIRST — this is what actually stops the agent.
+    // Without it, the DB rows flip to "failed" but the agent keeps running to
+    // completion. Best-effort: if no live session is registered (the run is in
+    // a pre-session phase like cloning), this is a no-op and we just mark the
+    // job so it won't continue once the current phase finishes.
+    const aborted = await liveRuns.abort(id);
     // Parse numeric job id from "job-19" → 19.
     const numericId = parseInt(id.replace(/^job-/, ""), 10);
     if (isNaN(numericId)) {
@@ -248,7 +247,7 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     } catch (e) {
       log.warn({ err: e, jobId: id }, "could not remove cooking label after cancel");
     }
-    return { ok: true };
+    return { ok: true, aborted };
   });
 
   // --- System log (in-memory ring buffer; mirrors `docker logs`). Auth-guarded. ---
@@ -343,11 +342,12 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     }
     const stored = profileStore.create(name, parsed.profile);
     // Live-sync into the in-memory config so the profile is runnable now.
-    // If use_relay is enabled, save the original base_url for the relay to
-    // forward to, then rewrite config.profiles to route through the relay.
-    if (parsed.profile.use_relay && deps.originalUrls && deps.relayBase) {
-      deps.originalUrls.set(parsed.profile.model, parsed.profile.base_url);
-      parsed.profile.base_url = deps.relayBase;
+    // If use_relay is enabled, save the upstream origin (scheme://host) for the
+    // relay to forward to, then rewrite config.profiles' base_url to the
+    // relay-facing URL that mirrors the upstream's path shape.
+    if (parsed.profile.use_relay && deps.originalUrls && deps.relayOrigin) {
+      deps.originalUrls.set(parsed.profile.model, originOf(parsed.profile.base_url));
+      parsed.profile.base_url = relayBaseUrl(parsed.profile.base_url, deps.relayOrigin, parsed.profile.api);
     }
     config.profiles[name] = parsed.profile;
     // If this is the first profile, set it as the default.
@@ -359,14 +359,16 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
   });
 
   /**
-   * Fetch the model list an endpoint exposes — the OpenAI/NVIDIA-compatible
-   * `GET {base_url}/models`. Used by the profile form to (a) populate the Model
-   * dropdown and (b) verify a typed model id is one the endpoint actually
-   * serves (the form's verify button turns green when `verified` is true).
+   * Fetch the model list an endpoint exposes. Used by the profile form to
+   * (a) populate the Model dropdown and (b) verify a typed model id is one the
+   * endpoint actually serves (the form's verify button turns green when
+   * `verified` is true).
    *
-   * Takes base_url + api_key in the body so it works during profile creation,
-   * before a profile is saved under a name. The api_key is optional — local
-   * no-auth endpoints (Ollama) need no Bearer header.
+   * Takes base_url + api + api_key in the body so it works during profile
+   * creation, before a profile is saved under a name. The api field selects the
+   * transport — each SDK hardcodes a different list path and auth convention
+   * (see buildListModelsRequest). The api_key is optional — local no-auth
+   * endpoints (Ollama) need no Bearer header.
    */
   app.post("/api/profiles/fetch-models", { preHandler: auth }, async (req, reply) => {
     const body = readJsonBody(req.body);
@@ -375,12 +377,11 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     if (!baseUrl) return reply.code(400).send({ error: "base_url is required" });
     const apiKey = typeof body.api_key === "string" ? body.api_key.trim() : "";
     const model = typeof body.model === "string" ? body.model.trim() : "";
+    const api = typeof body.api === "string" ? body.api.trim() : "";
 
-    // The base_url should include any path prefix (e.g. /v1) — we just append
-    // /models to list available models.
-    const url = `${baseUrl.replace(/\/+$/, "")}/models`;
-    const headers: Record<string, string> = { Accept: "application/json" };
-    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    // Per-transport list URL + auth. Each SDK hardcodes a different list path
+    // and auth convention — see buildListModelsRequest below for the matrix.
+    const { url, headers } = buildListModelsRequest(api, baseUrl, apiKey);
 
     let res: Response;
     try {
@@ -415,7 +416,8 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       });
     }
 
-    // OpenAI/NVIDIA shape: { data: [{ id }, ...] }. Fall back to { models: [{ id }] }.
+    // OpenAI/Mistral/Anthropic shape: { data: [{ id }] } or { models: [{ id }] }.
+    // Google shape: { models: [{ name: "models/X" }] } — strip the models/ prefix.
     const ids = extractModelIds(json);
     if (ids == null) {
       return reply.code(400).send({
@@ -504,10 +506,11 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       delete config.profiles[name];
     }
     const stored = profileStore.update(newName, parsed.profile);
-    // Relay-aware: save original base_url and rewrite to relay URL if enabled.
-    if (parsed.profile.use_relay && deps.originalUrls && deps.relayBase) {
-      deps.originalUrls.set(parsed.profile.model, parsed.profile.base_url);
-      parsed.profile.base_url = deps.relayBase;
+    // Relay-aware: save upstream origin and rewrite base_url to the relay-facing
+    // URL (mirrors upstream path shape) if enabled.
+    if (parsed.profile.use_relay && deps.originalUrls && deps.relayOrigin) {
+      deps.originalUrls.set(parsed.profile.model, originOf(parsed.profile.base_url));
+      parsed.profile.base_url = relayBaseUrl(parsed.profile.base_url, deps.relayOrigin, parsed.profile.api);
     } else if (!parsed.profile.use_relay && deps.originalUrls) {
       // Toggled relay off — remove from originalUrls so the relay stops routing it.
       deps.originalUrls.delete(parsed.profile.model);
@@ -870,9 +873,11 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
         GITHUB_PRIVATE_KEY: data.pem,
         GITHUB_WEBHOOK_SECRET: data.webhook_secret,
         NOODLE_LOGIN: `${data.slug}[bot]`,
-        // Clear any PAT — App mode takes precedence.
-        GITHUB_TOKEN: "",
       });
+      // NOTE: we intentionally do NOT clear GITHUB_TOKEN here. The auth provider
+      // tries App first and falls back to the PAT when App throws, so letting a
+      // pre-existing PAT survive makes it a usable backup credential. App still
+      // takes precedence, so this is a no-op for the common (App-only) case.
 
       log.info({ appId: data.id, slug: data.slug }, "GitHub App created via manifest flow");
       // Redirect to the GitHub App install page so the user can install it on
@@ -921,6 +926,32 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
 </div>
 </body></html>`);
     }
+  });
+
+  /**
+   * Remove the stored GitHub App credentials so Noodle stops using App mode.
+   * Used by the "Delete" button next to "Reconfigure" on the Settings page — the
+   * operator's escape hatch for switching back to a PAT (or to a different App).
+   *
+   * Deletes only the App-owned keys (ID, slug, private key, webhook secret, and
+   * the leftover setup state). The PAT (`GITHUB_TOKEN`) and `NOODLE_LOGIN` are
+   * preserved: the PAT becomes the active credential once App creds are gone, and
+   * NOODLE_LOGIN may have been set independently for PAT-mode self-trigger
+   * suppression. The App itself stays registered on GitHub — revoke it there.
+   *
+   * Because `LazyAuthProvider` re-reads these on every call, the change takes
+   * effect immediately (no restart).
+   */
+  app.delete("/api/github/app", { preHandler: auth }, async () => {
+    settingsStore.setMany({
+      GITHUB_APP_ID: "",
+      GITHUB_APP_SLUG: "",
+      GITHUB_PRIVATE_KEY: "",
+      GITHUB_WEBHOOK_SECRET: "",
+      GITHUB_APP_SETUP_STATE: "",
+    });
+    log.info("GitHub App credentials removed via Settings");
+    return { ok: true };
   });
 
   app.get("/api/schedulers", { preHandler: auth }, async () => {
@@ -1448,8 +1479,13 @@ function extractModelIds(json: unknown): string[] | null {
     if (typeof entry === "string") {
       if (entry) ids.push(entry);
     } else if (entry && typeof entry === "object") {
-      const id = (entry as Record<string, unknown>).id;
-      if (typeof id === "string" && id) ids.push(id);
+      const rec = entry as Record<string, unknown>;
+      // OpenAI/Mistral/Anthropic use `id`. Google uses `name: "models/X"` —
+      // strip the models/ prefix so the id matches what the SDK expects.
+      const id = typeof rec.id === "string" ? rec.id
+        : typeof rec.name === "string" ? rec.name.replace(/^models\//, "")
+        : "";
+      if (id) ids.push(id);
     }
   }
   return ids;
@@ -1471,21 +1507,79 @@ interface TestRequest {
 }
 
 /**
+ * Build a GET model-list request for a transport. Uses upstreamBase() to
+ * normalize the user-entered URL per transport (preserving proxy prefixes,
+ * handling version segments), then appends the transport-specific list path +
+ * auth. This mirrors the relay's path handling so verify/list matches what the
+ * agent will actually send through the relay.
+ *
+ *   openai-completions / openai-responses — GET {base}/models, Bearer auth.
+ *     upstreamBase keeps the user's /v1 (SDK appends /models only).
+ *   mistral-conversations — GET {base}/v1/models, Bearer auth. upstreamBase
+ *     strips a user-entered /v1 (SDK appends /v1/models), keeps proxy prefixes.
+ *   anthropic-messages — GET {base}/v1/models, x-api-key + anthropic-version.
+ *     Same as Mistral — upstreamBase normalizes the path, SDK appends /v1/models.
+ *   google-generative-ai — GET {base}/models?key=K. upstreamBase ensures
+ *     /v1beta is in the base (pi-ai sets apiVersion="").
+ */
+function buildListModelsRequest(api: string, baseUrl: string, apiKey: string): { url: string; headers: Record<string, string> } {
+  const base = upstreamBase(baseUrl, api);
+  const headers: Record<string, string> = { Accept: "application/json" };
+
+  switch (api as WireApi) {
+    case "google-generative-ai":
+      // base already has /v1beta (from upstreamBase). Key as query param —
+      // Google rejects Bearer auth on this endpoint.
+      return {
+        url: `${base}/models${apiKey ? `?key=${encodeURIComponent(apiKey)}` : ""}`,
+        headers,
+      };
+    case "anthropic-messages":
+      // base has proxy prefix but no /v1 (upstreamBase stripped it). SDK appends
+      // /v1/models. Auth via x-api-key + anthropic-version headers.
+      return {
+        url: `${base}/v1/models`,
+        headers: {
+          ...headers,
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+      };
+    case "mistral-conversations":
+      // base has proxy prefix but no /v1. SDK appends /v1/models. Bearer auth.
+      return {
+        url: `${base}/v1/models`,
+        headers: { ...headers, Authorization: `Bearer ${apiKey}` },
+      };
+    case "openai-responses":
+    case "openai-completions":
+    default:
+      // base has the user's /v1 (upstreamBase mirrors it). SDK appends /models.
+      return {
+        url: `${base}/models`,
+        headers: { ...headers, Authorization: `Bearer ${apiKey}` },
+      };
+  }
+}
+
+/**
  * Build a minimal "does this model work" completion request for a protocol.
  * Each uses the smallest possible payload (max_tokens 1, a trivial prompt) so
  * the ping costs ~1 token and returns fast. Unknown protocols fall back to the
  * OpenAI-compatible shape, which is the most common.
+ *
+ * URL semantics mirror buildListModelsRequest + the relay: upstreamBase()
+ * normalizes the user-entered URL per transport (proxy prefixes preserved,
+ * version segments handled), then we append the transport's endpoint path.
  */
 function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: string): TestRequest {
-  // The base_url should include any path prefix (e.g. /v1) — we just append
-  // the endpoint path. The user enters e.g. "https://api.openai.com/v1" and
-  // we hit "https://api.openai.com/v1/chat/completions".
-  const root = baseUrl.replace(/\/+$/, "");
+  const base = upstreamBase(baseUrl, api);
 
   switch (api as WireApi) {
     case "openai-responses":
+      // base has the user's /v1 (upstreamBase mirrors it). SDK appends /responses.
       return {
-        url: `${root}/responses`,
+        url: `${base}/responses`,
         headers: {
           "Content-Type": "application/json",
           ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -1493,8 +1587,10 @@ function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: s
         body: { model, input: "hi", max_output_tokens: 1 },
       };
     case "anthropic-messages":
+      // base has proxy prefix but no /v1 (upstreamBase stripped it). SDK appends
+      // /v1/messages. Auth via x-api-key + anthropic-version.
       return {
-        url: `${root}/messages`,
+        url: `${base}/v1/messages`,
         headers: {
           "Content-Type": "application/json",
           "x-api-key": apiKey,
@@ -1503,16 +1599,29 @@ function buildTestRequest(api: string, baseUrl: string, model: string, apiKey: s
         body: { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] },
       };
     case "google-generative-ai":
+      // base already has /v1beta (from upstreamBase). Model endpoint is
+      // {base}/models/X:generateContent. Key as query param (Google rejects
+      // Bearer on this endpoint).
       return {
-        url: `${root}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        url: `${base}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
         headers: { "Content-Type": "application/json" },
         body: { contents: [{ role: "user", parts: [{ text: "hi" }] }], generationConfig: { maxOutputTokens: 1 } },
       };
     case "mistral-conversations":
+      // base has proxy prefix but no /v1. SDK appends /v1/chat/completions.
+      return {
+        url: `${base}/v1/chat/completions`,
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] },
+      };
     case "openai-completions":
     default:
+      // base has the user's /v1. SDK appends /chat/completions.
       return {
-        url: `${root}/chat/completions`,
+        url: `${base}/chat/completions`,
         headers: {
           "Content-Type": "application/json",
           ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -1529,7 +1638,10 @@ function parseTriggerInput(body: Record<string, unknown> | null): NewTrigger | {
   const repo = strField(body, "repo");
   const event_type = strField(body, "event_type");
   const prompt = strField(body, "prompt");
-  const branch_name = strField(body, "branch_name") || "noodle/trigger";
+  // branch_name is no longer user-configurable — it's derived at runtime from
+  // the trigger's name (noodle/trigger-<slug>). The DB column is kept (SQLite
+  // column drops are migration pain), so persist the default placeholder.
+  const branch_name = "noodle/trigger";
   if (!name || !repo || !event_type || !prompt) {
     return { error: "name, repo, event_type, and prompt are required" };
   }
@@ -1551,7 +1663,8 @@ function parseTriggerInput(body: Record<string, unknown> | null): NewTrigger | {
 function parseTriggerUpdate(body: Record<string, unknown> | null): TriggerUpdate | { error: string } {
   if (!body) return { error: "missing body" };
   const out: TriggerUpdate = {};
-  for (const key of ["name", "repo", "event_type", "event_action", "branch_pattern", "prompt", "profile", "branch_name", "label"] as const) {
+  // branch_name is derived at runtime now — not accepted on update.
+  for (const key of ["name", "repo", "event_type", "event_action", "branch_pattern", "prompt", "profile", "label"] as const) {
     const v = strField(body, key);
     if (v !== undefined) (out as Record<string, unknown>)[key] = v;
   }
@@ -1572,10 +1685,13 @@ function parseSchedulerInput(body: Record<string, unknown> | null): NewScheduler
   const name = strField(body, "name");
   const repo = strField(body, "repo");
   const prompt = strField(body, "prompt");
-  const branch_name = strField(body, "branch_name") || strField(body, "branch");
+  // branch_name is no longer user-configurable — it's derived at runtime from
+  // the schedule's name (noodle/schedule-<slug>). The DB column is kept (SQLite
+  // column drops are migration pain), so persist an empty string placeholder.
+  const branch_name = "";
   const cron_expression = strField(body, "cron_expression") || strField(body, "schedule");
-  if (!name || !repo || !prompt || !branch_name || !cron_expression) {
-    return { error: "name, repo, prompt, branch_name, and cron_expression are required" };
+  if (!name || !repo || !prompt || !cron_expression) {
+    return { error: "name, repo, prompt, and cron_expression are required" };
   }
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
     return { error: `repo "${repo}" is not a valid "owner/name"` };
@@ -1589,8 +1705,9 @@ function parseSchedulerInput(body: Record<string, unknown> | null): NewScheduler
 function parseSchedulerUpdate(body: Record<string, unknown> | null): SchedulerUpdate | { error: string } {
   if (!body) return { error: "missing body" };
   const out: SchedulerUpdate = {};
-  for (const key of ["name", "repo", "prompt", "branch_name", "cron_expression", "profile"] as const) {
-    const v = strField(body, key === "branch_name" ? "branch_name" : key);
+  // branch_name is derived at runtime now — not accepted on update.
+  for (const key of ["name", "repo", "prompt", "cron_expression", "profile"] as const) {
+    const v = strField(body, key);
     if (v !== undefined) (out as Record<string, unknown>)[key] = v;
   }
   if (body.labels !== undefined) {

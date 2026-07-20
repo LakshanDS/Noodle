@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { collectSysFacts, buildSysInfoGuidance, type SysFacts } from "../src/util/sysinfo.js";
-import { buildPrompt } from "../src/engine/prompt.js";
+import { buildPrompt, DEFAULT_SYSTEM_PROMPT } from "../src/engine/prompt.js";
 
 describe("collectSysFacts", () => {
   it("returns real, sane numbers on the host running the tests", () => {
@@ -84,22 +84,19 @@ describe("buildPrompt sysInfo wiring", () => {
     html_url: "https://x/issues/42",
   } as const;
 
-  it("prepends the sysInfo block when supplied", () => {
-    const sysInfo =
-      "## System info (this machine, probed at run time)\n\n- CPU cores visible: 1\n- Memory: 512 MB";
-    const p = buildPrompt(issue, [], "o/r", "Noodle", sysInfo);
-    // sysInfo block is at the top, followed by a separator, then the rest.
-    expect(p.indexOf("System info")).toBeLessThan(p.indexOf("working on an issue"));
-    expect(p).toContain("---");
-    expect(p).toContain(sysInfo);
-    // Existing prompt content is still present.
-    expect(p).toContain("You are working on an issue in the GitHub repository `o/r`");
+  it("includes the system prompt as the base and the issue context after it", () => {
+    const p = buildPrompt(DEFAULT_SYSTEM_PROMPT, issue, []);
+    expect(p.startsWith(DEFAULT_SYSTEM_PROMPT)).toBe(true);
+    expect(p).toContain("The issue you have been given");
     expect(p).toContain("Fix the thing");
+    expect(p).toContain("## Issue");
+    expect(p).toContain("Issue URL: https://x/issues/42");
   });
 
-  it("is unchanged when no sysInfo is supplied (back-compat)", () => {
-    const p = buildPrompt(issue, [], "o/r", "Noodle");
-    expect(p.startsWith("You are working on an issue")).toBe(true);
-    expect(p).not.toContain("System info");
+  it("does not embed the repo or system info inline (handled by tags)", () => {
+    const p = buildPrompt(DEFAULT_SYSTEM_PROMPT, issue, []);
+    // The system prompt contains {repository} and {system} tags (not yet expanded)
+    expect(DEFAULT_SYSTEM_PROMPT).toContain("{repository}");
+    expect(DEFAULT_SYSTEM_PROMPT).toContain("{system}");
   });
 });

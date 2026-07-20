@@ -1,5 +1,9 @@
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai/compat";
+// pi's own classifier: returns false on errors that won't recover on retry
+// (404 Not Found, 401/403 auth, quota exhaustion, context overflow). Reusing it
+// keeps our fail-fast list in sync with pi's retryable list.
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { join, resolve } from "node:path";
 import { existsSync, mkdirSync, readdirSync, statSync, rmSync } from "node:fs";
 import { log, runLogger } from "../util/log.js";
@@ -8,15 +12,16 @@ import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import type { PullRequestData } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
-import { buildRunPrompt } from "./prompt.js";
+import { buildRunPrompt, DEFAULT_SYSTEM_PROMPT } from "./prompt.js";
 import { expandTags } from "./tags.js";
 import { phraseOutput } from "./title.js";
 import { createCommentOnIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
-import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
+import { collectSysFacts } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
 import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
+import type { LiveRunRegistry } from "./live-runs.js";
 import { slugify } from "../util/slugify.js";
 import { extractProfileTag } from "../triggers/check.js";
 import {
@@ -149,6 +154,12 @@ export async function runJob(
     authStorage?: AuthStorageInstance;
     /** Optional run store — when set, the run is recorded in the `runs` table. */
     runStore?: RunStore;
+    /**
+     * Live run registry — when set, the run registers its pi session here so
+     * the cancel endpoint (POST /api/runs/:id/cancel) can abort it mid-flight.
+     * Without this, cancel only flips the DB row; the agent runs to completion.
+     */
+    liveRuns?: LiveRunRegistry;
     /** Override for tests. Defaults to pi's createAgentSession. */
     createAgentSessionFn?: typeof createAgentSession;
     /**
@@ -468,27 +479,17 @@ export async function runJob(
     log_.debug({ sysFacts }, "probed system info for agent prompt");
 
     // Build the prompt. The operator's global system_prompt (Settings) is
-    // always active — expanded via expandTags and prepended to the sysInfo
-    // block. The matched command's system_prompt extends it as framing (also
-    // tag-expanded); a pure @mention (no /command) leaves the framing slot
-    // empty — the base system prompt alone is complete.
-    const sysInfo = buildSysInfoGuidance(sysFacts);
-    let fullSysInfo = sysInfo;
-    if (deps?.systemPrompt) {
-      try {
-        const expanded = await expandTags(deps.systemPrompt, { sysFacts, gh, repo: input.repo });
-        if (expanded.trim()) {
-          // If the prompt referenced {system} (or a {system.*} sub-tag), the
-          // expansion already inlined the sysInfo block — don't append it
-          // again. Otherwise prepend sysInfo so the agent still sees it.
-          const referencesSystem = /\{system(\.|})/i.test(deps.systemPrompt);
-          fullSysInfo = referencesSystem ? expanded : `${expanded}\n\n---\n\n${sysInfo}`;
-        }
-      } catch (e) {
-        log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using sysInfo only");
-      }
-    }
-    // Expand tags in the command's framing too (e.g. {system.tier}, {pr}).
+    // always active — expanded via expandTags and combined with sysInfo for
+    // the prompt builder. The matched command's system_prompt extends it as
+    // framing (also tag-expanded); a pure @mention (no /command) leaves the
+    // framing slot empty — the base system prompt alone is complete.
+    const expandedSystemPrompt = await expandTags(
+      deps?.systemPrompt?.trim() ? deps.systemPrompt : DEFAULT_SYSTEM_PROMPT,
+      { sysFacts, gh, repo: input.repo },
+    ).catch((e) => {
+      log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using default");
+      return DEFAULT_SYSTEM_PROMPT;
+    });
     let framing = cmd?.system_prompt?.trim() ? cmd.system_prompt : "";
     if (framing) {
       try {
@@ -497,7 +498,8 @@ export async function runJob(
         log_.warn({ err: (e as Error).message }, "failed to expand command framing tags — using raw framing");
       }
     }
-    const prompt = buildRunPrompt(framing, issue, comments, input.repo, fullSysInfo, isPR);
+    const prompt = buildRunPrompt(expandedSystemPrompt, framing, issue, comments, isPR);
+
     // Optional per-profile rate-limit throttle (e.g. NVIDIA NIM's 40 rpm).
     const throttle = throttleForRpm(profile.api_rpm);
     // pi retry settings tuned from the profile config so 429 retries don't cascade.
@@ -552,6 +554,9 @@ export async function runJob(
       subscribeForLogging(session, log_);
       const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
       const unsubStall = watcher.attach();
+      // Register the live session so the cancel endpoint can abort it. Updated
+      // on every restart so the registry always holds the current session.
+      deps?.liveRuns?.set(jobId, session);
       return { session, sessionManager, watcher, unsubStall };
     };
 
@@ -608,6 +613,28 @@ export async function runJob(
       // Failure — dispose, optionally restart.
       watcher.dispose();
       unsubStall?.();
+
+      // Fail fast on non-retryable errors (404, auth, quota, context overflow).
+      // These never recover on retry — but pi still counts the errored assistant
+      // turn, which the "made progress" branch below misreads as real work and
+      // uses to reset the restart budget forever. So we'd loop until the hard
+      // cap, burning the 2-minute backoff each time, for a config error that a
+      // single attempt already proved fatal. Break now and surface the error.
+      const failFastStop = lastAssistantStopReason(session);
+      if (
+        failFastStop.stopReason === "error" &&
+        failFastStop.errorMessage &&
+        // isRetryableAssistantError only reads stopReason + errorMessage, so a
+        // minimal shape is enough — cast through unknown to satisfy its full
+        // AssistantMessage parameter type without fabricating the other fields.
+        !isRetryableAssistantError({ stopReason: "error", errorMessage: failFastStop.errorMessage } as unknown as Parameters<typeof isRetryableAssistantError>[0])
+      ) {
+        log_.warn(
+          { err: failFastStop.errorMessage },
+          "non-retryable error — stopping restart loop (will not recover on retry)",
+        );
+        break;
+      }
 
       // If the agent completed new turns before failing, it made real progress.
       // Reset the restart counter so a run that's actively working always gets
@@ -834,6 +861,9 @@ export async function runJob(
     }
     throw e;
   } finally {
+    // Remove from the live registry so a late cancel is a clean no-op rather
+    // than aborting a session whose run loop has already exited.
+    deps?.liveRuns?.delete(jobId);
     await ws.dispose();
   }
 }

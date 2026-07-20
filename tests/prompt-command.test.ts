@@ -3,6 +3,7 @@ import {
   buildPrompt,
   buildRunPrompt,
   defaultCommandPrompt,
+  DEFAULT_SYSTEM_PROMPT,
 } from "../src/engine/prompt.js";
 import type { IssueData } from "../src/github/client.js";
 
@@ -14,33 +15,36 @@ const issue: IssueData = {
   html_url: "https://github.com/o/r/issues/7",
 } as IssueData;
 
+const sysPrompt = DEFAULT_SYSTEM_PROMPT;
+
 describe("prompt split: /noodle stays byte-identical", () => {
   it("buildPrompt equals buildRunPrompt(defaultCommandPrompt(...))", () => {
-    const legacy = buildPrompt(issue, [], "o/r", "Noodle");
+    const legacy = buildPrompt(sysPrompt, issue, []);
     const rebuilt = buildRunPrompt(
-      defaultCommandPrompt("Noodle"),
+      sysPrompt,
+      defaultCommandPrompt(),
       issue,
       [],
-      "o/r",
     );
     expect(rebuilt).toBe(legacy);
   });
 
-  it("the /noodle framing block is present verbatim in the rebuilt prompt", () => {
-    const p = buildRunPrompt(defaultCommandPrompt("Noodle"), issue, [], "o/r");
-    expect(p).toContain("Load the `noodle-default` skill before starting.");
-    expect(p).toContain("Noodle posts the final answer as a normal text message");
-    expect(p).toContain('your final message IS the deliverable.');
+  it("the system prompt is always at the top", () => {
+    const p = buildRunPrompt(sysPrompt, defaultCommandPrompt(), issue, []);
+    expect(p.startsWith(sysPrompt)).toBe(true);
   });
 
-  it("a custom command's framing replaces the default block but keeps the context", () => {
+  it("includes 'The issue you have been given' context header for issue mode", () => {
+    const p = buildRunPrompt(sysPrompt, defaultCommandPrompt(), issue, []);
+    expect(p).toContain("The issue you have been given");
+  });
+
+  it("a custom command's framing appears after the context header", () => {
     const custom = "You are answering a question. Keep it to two sentences.";
-    const p = buildRunPrompt(custom, issue, [], "o/r");
+    const p = buildRunPrompt(sysPrompt, custom, issue, []);
+    expect(p).toContain("The issue you have been given");
     expect(p).toContain(custom);
-    expect(p.startsWith("You are working on an issue in the GitHub repository `o/r`.")).toBe(true);
-    // The default skill-loading block must NOT leak into a custom command's prompt.
-    expect(p).not.toContain("Load the `noodle-default` skill before starting.");
-    // Context block is still appended.
+    // Context block is still appended after the framing.
     expect(p).toContain("## Issue");
     expect(p).toContain("Fix the login bug");
     expect(p).toContain("Issue URL: https://github.com/o/r/issues/7");
@@ -48,19 +52,20 @@ describe("prompt split: /noodle stays byte-identical", () => {
 });
 
 describe("prompt PR mode", () => {
-  it("framing switches to 'pull request' when isPR is true", () => {
-    const p = buildRunPrompt(defaultCommandPrompt("Noodle"), issue, [], "o/r", undefined, true);
-    expect(p).toContain("You are working on a pull request in the GitHub repository `o/r`.");
+  it("framing switches to 'The comments on this PR' when isPR is true", () => {
+    const p = buildRunPrompt(sysPrompt, defaultCommandPrompt(), issue, [], true);
+    expect(p.startsWith(sysPrompt)).toBe(true);
+    expect(p).toContain("The comments on this PR");
     expect(p).toContain("## Pull Request");
     expect(p).toContain("PR URL: https://github.com/o/r/issues/7");
     // The issue-mode wording must NOT appear.
-    expect(p).not.toContain("You are working on an issue");
+    expect(p).not.toContain("The issue you have been given");
     expect(p).not.toContain("## Issue");
   });
 
   it("buildPrompt forwards isPR to buildRunPrompt", () => {
-    const direct = buildRunPrompt(defaultCommandPrompt("Noodle"), issue, [], "o/r", undefined, true);
-    const viaLegacy = buildPrompt(issue, [], "o/r", "Noodle", undefined, true);
+    const direct = buildRunPrompt(sysPrompt, defaultCommandPrompt(), issue, [], true);
+    const viaLegacy = buildPrompt(sysPrompt, issue, [], true);
     expect(viaLegacy).toBe(direct);
   });
 });

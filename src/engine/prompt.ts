@@ -2,25 +2,37 @@ import type { IssueData } from "../github/client.js";
 import type { CommentData } from "../github/client.js";
 
 /**
- * The framing prompt for the built-in `/<agent>` command (e.g. `/noodle`) —
- * the general-purpose default. Loads only `noodle-default` (the engineering
- * mindset). For issue-specific workflows, use `/<agent>-fix` or
- * `/<agent>-review` instead.
- *
- * Also used as the fallback framing when no command matched the issue text.
- *
- * `agentName` is interpolated because the framing references it directly.
+ * Default system prompt — the authoritative base seeded into the Settings DB
+ * on first boot and used as a fallback whenever the operator hasn't set a
+ * custom one. Uses {repository} and {system} tags which are expanded at run
+ * time by `expandTags()`.
  */
-export function defaultCommandPrompt(agentName = "Noodle"): string {
-  return [
-    "Load the `noodle-default` skill before starting.",
-    "",
-    "If the issue is a **question** (not a bug or feature request), just answer it",
-    "— a few sentences at most. Don't restate the problem, don't walk through the",
-    "codebase architecture, don't pad.",
-    `${agentName} posts the final answer as a normal text message. Do not just say`,
-    '"done" — your final message IS the deliverable.',
-  ].join("\n");
+export const DEFAULT_SYSTEM_PROMPT = [
+  "You are an autonomous software engineer working in the GitHub repository `{repository}`.",
+  "Always load the `noodle-default` skill — it is the always-active engineering mindset.",
+  "",
+  "Investigate or fix issues, answer questions, and write up your findings as your `final message`",
+  "(normal text, in Markdown). Be concrete: for each finding, say what's wrong and where to find it",
+  "(file + line). Don't pad with architecture walkthroughs or restate the task. If you have",
+  "nothing concrete to report, say so plainly.",
+  "",
+  "Decide your own approach from the system info. Make the minimal change, verify it, and",
+  "post your final answer as a normal text message — it IS the deliverable.",
+  "",
+  "{system}",
+].join("\n");
+
+/**
+ * The framing prompt for the built-in `/<agent>` command (e.g. `/noodle`) — the
+ * general-purpose default. Since the base system prompt already loads
+ * `noodle-default` and sets the deliverable contract, this is empty for the
+ * built-in `/noodle` case.
+ *
+ * Also used as the fallback framing when no command matched the issue text —
+ * the system prompt is complete on its own.
+ */
+export function defaultCommandPrompt(_agentName = "Noodle"): string {
+  return "";
 }
 
 /**
@@ -56,31 +68,30 @@ export function reviewCommandPrompt(): string {
 }
 
 /**
- * Build the user prompt pi receives for an issue→PR run, using a command's
- * framing text. The structure is:
+ * Build the user prompt for an issue→PR run. The structure is:
  *
- *   [sysInfo block]
- *   You are working on an [issue|pull request] in the GitHub repository `<repo>`.
- *   <blank>
+ *   <expandedSystemPrompt>
+ *
+ *   The issue you have been given  (or "The comments on this PR")
+ *
  *   <framing — the command's system_prompt>
- *   <blank>
- *   ## Issue|Pull Request / ## Discussion / Issue|PR URL
  *
- * For the built-in `/noodle` command, `framing = defaultCommandPrompt(agentName)`
- * and the output is byte-identical to the legacy `buildPrompt()`.
+ *   ## Issue | ## Pull Request / ## Discussion / Issue|PR URL
  *
- * `isPR` switches the framing from "you are working on an issue" to "you are
- * working on a pull request" and adjusts the section headers. The PR's body
- * (its description) stands in for the issue body, and the comments carry the
- * actual request (e.g. "/noodle change line 302 to …"). The agent's edits land
- * on the PR's own branch and are force-pushed back to the same PR.
+ * For the built-in `/noodle` command, `framing` is empty and the system prompt
+ * alone carries the role + skill-loading + deliverable contract.
+ *
+ * `isPR` switches the context header to "The comments on this PR" and adjusts
+ * the section headers. The PR's body (its description) stands in for the issue
+ * body, and the comments carry the actual request (e.g. "/noodle change line 302
+ * to …"). The agent's edits land on the PR's own branch and are force-pushed
+ * back to the same PR.
  */
 export function buildRunPrompt(
+  expandedSystemPrompt: string,
   framing: string,
   issue: IssueData,
   comments: CommentData[],
-  repo: string,
-  sysInfo?: string,
   isPR = false,
 ): string {
   const commentBlock =
@@ -90,20 +101,17 @@ export function buildRunPrompt(
           .join("\n\n")
       : "_(no comments)_";
 
-  // "an issue" vs "a pull request" — the article differs, so assemble the
-  // phrase directly instead of templating a single noun in.
-  const subject = isPR ? "a pull request" : "an issue";
+  const contextHeader = isPR
+    ? "The comments on this PR"
+    : "The issue you have been given";
   const header = isPR ? "## Pull Request" : "## Issue";
   const urlLabel = isPR ? "PR URL" : "Issue URL";
 
-  const lines: string[] = [];
-  if (sysInfo) {
-    lines.push(sysInfo, "", "---", "");
+  const lines: string[] = [expandedSystemPrompt, "", contextHeader];
+  if (framing) {
+    lines.push("", framing);
   }
   lines.push(
-    `You are working on ${subject} in the GitHub repository \`${repo}\`.`,
-    "",
-    framing,
     "",
     header,
     "",
@@ -122,66 +130,39 @@ export function buildRunPrompt(
 
 /**
  * Legacy entry point — equivalent to `buildRunPrompt(defaultCommandPrompt(...), ...)`.
- * Kept so existing callers (and the byte-identical regression test) keep working;
- * new code should call `buildRunPrompt` with the resolved command's framing.
+ * Updated to the new signature where `expandedSystemPrompt` is prepended rather
+ * than separate `repo` + `sysInfo` params.
  */
 export function buildPrompt(
+  expandedSystemPrompt: string,
   issue: IssueData,
   comments: CommentData[],
-  repo: string,
-  agentName = "Noodle",
-  sysInfo?: string,
   isPR = false,
 ): string {
-  return buildRunPrompt(defaultCommandPrompt(agentName), issue, comments, repo, sysInfo, isPR);
+  return buildRunPrompt(expandedSystemPrompt, defaultCommandPrompt(), issue, comments, isPR);
 }
 
 /**
- * Build the user prompt for a scheduled run. Unlike `buildRunPrompt`, there
- * is no source issue — the agent is given a freeform task (e.g. "find bugs and
- * open issues") and works the repo. Its deliverable is a final text message:
- * its findings, written up clearly. Noodle opens a single issue in the repo
- * with that message as the body (plus a footer), mirroring how an issue→PR run
- * turns the agent's final message into the issue comment + PR body.
+ * Build the user prompt for a scheduled (cron) run. The system prompt is the
+ * authoritative base; this builder appends the run-type-specific extension
+ * below it with the task instructions.
  *
- * Only `noodle-default` is loaded: scheduler runs are investigative/sweeps, not the
- * fix workflow (which assumes a single issue to resolve). `noodle-fix` would
- * push the agent toward opening a PR, which is the wrong output shape here.
+ *   <expandedSystemPrompt>
  *
- * `sysInfo` (host hardware + verification guidance) is prepended when supplied,
- * same as `buildRunPrompt`.
+ *   Your scheduled task instructions
+ *
+ *   <task>
  */
 export function buildSchedulerPrompt(
+  expandedSystemPrompt: string,
   task: string,
-  repo: string,
-  agentName = "Noodle",
-  sysInfo?: string,
 ): string {
-  const lines: string[] = [];
-  if (sysInfo) {
-    lines.push(sysInfo, "", "---", "");
-  }
-  lines.push(
-    `You are running a scheduled task in the GitHub repository \`${repo}\`.`,
+  const lines: string[] = [
+    expandedSystemPrompt,
     "",
-    "**Load the skill before starting:**",
-    "- `noodle-default` — the always-active engineering mindset (lazy senior dev:",
-    "  minimal diff, stdlib first, no over-engineering). It governs how you reason",
-    "  about the code you inspect.",
-    "",
-    "This is a **scheduled run** — there is no issue to fix. Investigate the task, then",
-    "write up your findings as your **final message** (normal text, in Markdown).",
-    "Be concrete: for each finding, say what's wrong and where to find it (file +",
-    "line). Don't pad with architecture walkthroughs or restate the task. If you",
-    "have nothing concrete to report, say so plainly.",
-    "",
-    `${agentName} opens a single GitHub issue with your final message as the body,`,
-    "and commits any exploratory changes to the scheduler's branch (for traceability).",
-    "No pull request is opened — your final message IS the deliverable.",
-    "",
-    "## Task",
+    "Your scheduled task instructions",
     "",
     task.trim() || "_(no task specified)_",
-  );
+  ];
   return lines.join("\n");
 }

@@ -9,6 +9,7 @@
  *   {system.ram}   — "Memory: N MB total, N MB free (limit: N MB)"
  *   {system.os}    — platform string (e.g. "linux x64")
  *   {system.tier}  — "constrained" or "capable"
+ *   {repository}   — the "owner/name" string for the repo the agent is working in
  *   {pr}           — all open PRs (one per line)
  *   {pr.0}         — first open PR (0-indexed)
  *   {issue}        — all open issues (one per line)
@@ -95,6 +96,9 @@ async function resolveTag(
   switch (tag) {
     case "system":
       return resolveSystemTag(sub, ctx.sysFacts);
+
+    case "repository":
+      return ctx.repo;
 
     case "pr":
       return resolveListTag(sub, getPRs, formatPR);
