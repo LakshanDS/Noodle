@@ -14,6 +14,12 @@ import { log } from "../util/log.js";
  *
  * It reads Retry-After when the provider sends it; otherwise uses an
  * exponential backoff (5s, 10s, 20s, 40s, 60s capped).
+ *
+ * Verbatim forwarding: callers pass the SDK's ORIGINAL headers + raw body. The
+ * relay never synthesizes auth (each transport's SDK already sent the correct
+ * header — Bearer for OpenAI/Mistral, x-goog-api-key for Google, x-api-key for
+ * Anthropic) and never re-serializes the body. This keeps the relay a true
+ * transparent proxy across all transports.
  */
 
 const RETRY_429_DELAYS_MS = [5_000, 10_000, 20_000, 40_000, 60_000];
@@ -22,14 +28,6 @@ export interface ForwardResult {
   status: number;
   headers: Record<string, string>;
   body: unknown;
-}
-
-/** Headers we send on every forwarded request. */
-function authHeaders(apiKey: string): Record<string, string> {
-  return {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-  };
 }
 
 /** Collect response headers into a plain object. */
@@ -71,82 +69,81 @@ function sleep(ms: number): Promise<void> {
 /**
  * Forward a non-streaming request. Retries on 429 (up to 5 times with backoff)
  * so the agent never sees transient platform rate-limiting. Other errors pass
- * straight through.
+ * straight through. Headers + body are the SDK's originals, forwarded verbatim.
  */
 export async function forwardRequest(
-  baseUrl: string,
-  apiKey: string,
-  body: unknown,
+  url: string,
+  headers: Record<string, string>,
+  rawBody: string,
 ): Promise<ForwardResult> {
-  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 
   for (let attempt = 0; attempt <= RETRY_429_DELAYS_MS.length; attempt++) {
     const response = await fetch(url, {
       method: "POST",
-      headers: authHeaders(apiKey),
-      body: JSON.stringify(body),
+      headers,
+      body: rawBody,
     });
-    const headers = collectHeaders(response);
+    const respHeaders = collectHeaders(response);
 
     if (response.status === 429 && attempt < RETRY_429_DELAYS_MS.length) {
-      await waitFor429Retry(headers, attempt);
+      await waitFor429Retry(respHeaders, attempt);
       continue;
     }
 
     const responseBody = response.status < 400 ? await response.json() : await response.text().catch(() => "");
-    return { status: response.status, headers, body: responseBody };
+    return { status: response.status, headers: respHeaders, body: responseBody };
   }
 
   // Exhausted all 429 retries — return the last 429 so the agent can react.
   const response = await fetch(url, {
     method: "POST",
-    headers: authHeaders(apiKey),
-    body: JSON.stringify(body),
+    headers,
+    body: rawBody,
   });
-  const headers = collectHeaders(response);
+  const respHeaders = collectHeaders(response);
   const errorBody = await response.text().catch(() => "");
-  return { status: response.status, headers, body: errorBody };
+  return { status: response.status, headers: respHeaders, body: errorBody };
 }
 
 /**
  * Forward a streaming request. Retries on 429 (up to 5 times with backoff)
  * BEFORE opening the SSE pipe — once streaming starts we can't retry without
- * sending partial output. Other errors throw.
+ * sending partial output. Other errors throw. Headers + body are the SDK's
+ * originals, forwarded verbatim.
  */
 export async function forwardRequestStream(
-  baseUrl: string,
-  apiKey: string,
-  body: unknown,
+  url: string,
+  headers: Record<string, string>,
+  rawBody: string,
 ): Promise<{ status: number; headers: Record<string, string>; stream: ReadableStream }> {
-  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 
   for (let attempt = 0; attempt <= RETRY_429_DELAYS_MS.length; attempt++) {
     const response = await fetch(url, {
       method: "POST",
-      headers: authHeaders(apiKey),
-      body: JSON.stringify(body),
+      headers,
+      body: rawBody,
     });
 
     if (response.status === 429 && attempt < RETRY_429_DELAYS_MS.length) {
-      const headers = collectHeaders(response);
+      const respHeaders = collectHeaders(response);
       await response.body?.cancel().catch(() => {});
-      await waitFor429Retry(headers, attempt);
+      await waitFor429Retry(respHeaders, attempt);
       continue;
     }
 
-    const headers = collectHeaders(response);
+    const respHeaders = collectHeaders(response);
     if (response.status >= 400 || !response.body) {
       const errorBody = await response.text().catch(() => "");
       throw new Error(`Upstream ${response.status}: ${errorBody || response.statusText}`);
     }
-    return { status: response.status, headers, stream: response.body };
+    return { status: response.status, headers: respHeaders, stream: response.body };
   }
 
   // Exhausted all 429 retries — throw so the agent sees the error.
   const response = await fetch(url, {
     method: "POST",
-    headers: authHeaders(apiKey),
-    body: JSON.stringify(body),
+    headers,
+    body: rawBody,
   });
   const errorBody = await response.text().catch(() => "");
   throw new Error(`Upstream 429: ${errorBody || "Too Many Requests (after relay retries exhausted)"}`);

@@ -153,19 +153,22 @@ export interface ApiError {
   error: string;
 }
 
-/** Payload for creating a scheduler job. Mirrors parseSchedulerInput in ui-routes.ts. */
+/** Payload for creating a scheduler job. Mirrors parseSchedulerInput in ui-routes.ts.
+ *  Note: branch_name is intentionally absent — it's derived at runtime from the
+ *  schedule's name (`noodle/schedule-<slug(name)>`), so the client no longer sends it. */
 export interface SchedulerInput {
   name: string;
   repo: string;
   prompt: string;
-  branch_name: string;
   cron_expression: string;
   profile: string | null;
   /** JSON label-set string, or null to use the global defaults. */
   labels?: string | null;
 }
 
-/** Payload for creating a trigger. Mirrors parseTriggerInput in ui-routes.ts. */
+/** Payload for creating a trigger. Mirrors parseTriggerInput in ui-routes.ts.
+ *  Note: branch_name is intentionally absent — it's derived at runtime from the
+ *  trigger's name (`noodle/trigger-<slug(name)>`), same as schedules. */
 export interface TriggerInput {
   name: string;
   repo: string;
@@ -174,7 +177,6 @@ export interface TriggerInput {
   branch_pattern: string | null;
   prompt: string;
   profile: string | null;
-  branch_name: string;
   label: string | null;
 }
 
@@ -375,12 +377,15 @@ export interface ProfileInput {
 
 /**
  * Body for POST /api/profiles/fetch-models — asks the server to query an
- * endpoint's OpenAI-compatible `/models` route. `api_key` is optional (local
- * no-auth endpoints). `model` is the id currently typed in the form, sent so
- * the server can report whether it's in the returned list.
+ * endpoint's model-list route. `api` selects the transport — each SDK has a
+ * different list path + auth convention (e.g. Google uses /v1beta/models with
+ * the key as a query param, not Bearer). `api_key` is optional (local no-auth
+ * endpoints). `model` is the id currently typed in the form, sent so the
+ * server can report whether it's in the returned list.
  */
 export interface FetchModelsInput {
   base_url: string;
+  api?: string;
   api_key?: string;
   model?: string;
 }

@@ -252,6 +252,38 @@ export class GitHubClient {
   }
 
   /**
+   * Find an open PR whose head branch exactly matches `branch`. Used by
+   * scheduler runs to detect whether a trunk branch (e.g.
+   * `noodle/schedule-bug-hunt`) already has a pending PR — if so, the next run
+   * stacks onto a fresh branch derived from it; if not, the run works on the
+   * trunk directly and opens a new PR against the default branch.
+   *
+   * Paginates through all open PRs (same pattern as findOpenPRForIssue) so a
+   * repo with >100 open PRs still finds the match. Returns null when no PR has
+   * `branch` as its head.
+   */
+  async findOpenPRByBranch(
+    repo: string,
+    branch: string,
+  ): Promise<{ number: number; html_url: string } | null> {
+    const [owner, name] = parseRepo(repo);
+    for await (const response of this.octokit.paginate.iterator(this.octokit.rest.pulls.list, {
+      owner,
+      repo: name,
+      state: "open",
+      per_page: 100,
+    })) {
+      const match = response.data.find(
+        (pr) => typeof pr.head?.ref === "string" && pr.head.ref === branch,
+      );
+      if (match) {
+        return { number: match.number, html_url: match.html_url };
+      }
+    }
+    return null;
+  }
+
+  /**
    * Fetch a single pull request by number. Returns the head + base branches and
    * whether the PR originates from a fork. Used by runJob in PR mode to clone
    * the PR's head branch and push back to it — fork PRs (different head repo)

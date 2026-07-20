@@ -48,6 +48,18 @@ export function registerCustomProviders(
               cacheRead: profile.cache_read_price,
               cacheWrite: profile.cache_write_price,
             },
+            // For the generic openai-completions transport, pi-ai auto-detects
+            // field-name conventions (max_tokens vs max_completion_tokens, store,
+            // developer role, reasoning format) by SNIFFING the baseUrl. But when
+            // use_relay is on, the agent's baseUrl is http://localhost:4445/v1 —
+            // no provider pattern matches, so it falls back to stock OpenAI
+            // defaults that non-OpenAI upstreams reject with 422. Set safe
+            // defaults explicitly so the agent builds a provider-safe body itself,
+            // regardless of which URL it points at. Dedicated transports
+            // (mistral/anthropic/google/openai-responses) ignore `compat` — their
+            // bodies are protocol-native by construction. See "API relay" in
+            // AGENTS.md.
+            ...(profile.api === "openai-completions" ? { compat: openaiCompatDefaults } : {}),
           },
         ],
       });
@@ -74,6 +86,27 @@ export function registerCustomProviders(
 
   return providerKeyMap;
 }
+
+/**
+ * Safe compat defaults for the generic openai-completions transport. These are
+ * the intersection that the widest range of OpenAI-compatible endpoints accept:
+ *   - max_tokens (not max_completion_tokens — the newer field 422s on many)
+ *   - no store field (Mistral etc. reject unknown params)
+ *   - system role only (no developer role)
+ *   - no reasoning_effort / strict mode (provider-specific)
+ *
+ * Users targeting a specific known-compatible upstream can still override per
+ * model by extending the profile schema; this is the conservative baseline that
+ * never produces a 422 from an OpenAI-compatible endpoint.
+ */
+const openaiCompatDefaults = {
+  maxTokensField: "max_tokens" as const,
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  supportsReasoningEffort: false,
+  supportsStrictMode: false,
+  thinkingFormat: "openai" as const,
+};
 
 /**
  * Resolve the API key for an endpoint. Reads it directly from the profile's

@@ -12,6 +12,7 @@ import type { SettingsResponse, SettingsPutResponse, SettingMeta, CreateAppRespo
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import Card from "../components/ui/Card.vue";
+import ConfirmDialog from "../components/ui/ConfirmDialog.vue";
 import Field from "../components/ui/Field.vue";
 import Icon from "../components/ui/Icon.vue";
 import LabelEditor from "../components/LabelEditor.vue";
@@ -37,6 +38,10 @@ const showAppForm = ref(false);
 const botName = ref("");
 const creating = ref(false);
 const appError = ref<string | null>(null);
+
+// GitHub App deletion flow (the escape hatch back to PAT mode).
+const showDeleteAppConfirm = ref(false);
+const deletingApp = ref(false);
 
 /** Keys that store multi-line text (JSON arrays, long prompts, PEM keys) — render as textareas. */
 const JSON_FIELDS = new Set(["routing", "trigger_keywords", "system_prompt", "GITHUB_PRIVATE_KEY"]);
@@ -233,6 +238,23 @@ const hasGitHubApp = computed(() => {
   return f && f.value && f.value !== "" && !f.value.startsWith("••••");
 });
 
+/** Whether a PAT is configured alongside the App (both-set → App first, PAT backup). */
+const hasPat = computed(() => {
+  const f = fields["GITHUB_TOKEN"];
+  return !!f && f.value !== "" && !f.value.startsWith("••••");
+});
+
+/**
+ * The configured App's GitHub management URL. GitHub has no API to delete an App
+ * registration, so the Delete flow clears Noodle's stored config and points the
+ * operator here to delete the App itself in one click. Built from the stored
+ * slug; undefined when no slug is set (the dialog then omits the link).
+ */
+const appSettingsUrl = computed(() => {
+  const slug = fields["GITHUB_APP_SLUG"]?.value?.trim();
+  return slug ? `https://github.com/apps/${slug}` : undefined;
+});
+
 /** Fields to hide from the normal catalog rendering (handled by the GitHub App section). */
 const GITHUB_APP_KEYS = new Set(["GITHUB_APP_ID", "GITHUB_APP_SLUG", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "GITHUB_APP_SETUP_STATE", "NOODLE_LOGIN"]);
 
@@ -290,6 +312,28 @@ async function createApp(): Promise<void> {
   }
 }
 
+/**
+ * Delete the stored GitHub App credentials via `DELETE /api/github/app`. The PAT
+ * (if set) is preserved server-side, so after this Noodle runs in PAT mode.
+ * The App itself stays registered on GitHub — the operator revokes it there.
+ */
+async function confirmDeleteApp(): Promise<void> {
+  deletingApp.value = true;
+  banner.value = null;
+  try {
+    await sendJson("/api/github/app", "DELETE");
+    showDeleteAppConfirm.value = false;
+    showAppForm.value = false;
+    banner.value = { kind: "ok", text: "GitHub App removed. Noodle now uses the PAT below." };
+    await load();
+  } catch (e) {
+    if (isAuthError(e)) return;
+    banner.value = { kind: "err", text: e instanceof ApiRequestError ? e.message : "Could not remove the GitHub App." };
+  } finally {
+    deletingApp.value = false;
+  }
+}
+
 onMounted(load);
 </script>
 
@@ -324,13 +368,22 @@ onMounted(load);
           <!-- GitHub App status / creation -->
           <div class="app-section">
             <div v-if="hasGitHubApp" class="app-status">
-              <div class="app-connected">
-                <Icon name="check" :size="14" />
-                <span>GitHub App connected (ID: {{ fields['GITHUB_APP_ID']?.value }})</span>
+              <div class="app-status-info">
+                <div class="app-connected">
+                  <Icon name="check" :size="14" />
+                  <span>GitHub App connected (ID: {{ fields['GITHUB_APP_ID']?.value }})</span>
+                </div>
+                <p v-if="hasPat" class="app-hint warn app-status-hint">
+                  <Icon name="alert" :size="12" />
+                  Both App and PAT are set — the App is used first and the PAT is the fallback if it fails. Remove the App to switch to PAT-only.
+                </p>
               </div>
               <div class="app-status-actions">
                 <Button variant="ghost" size="sm" @click="showAppForm = !showAppForm">
                   {{ showAppForm ? 'Cancel' : 'Reconfigure' }}
+                </Button>
+                <Button variant="danger" size="sm" icon="trash" @click="showDeleteAppConfirm = true">
+                  Delete
                 </Button>
               </div>
             </div>
@@ -487,6 +540,17 @@ onMounted(load);
       </Card>
 
     </div>
+
+    <ConfirmDialog
+      v-model:open="showDeleteAppConfirm"
+      title="Remove GitHub App?"
+      message="Noodle will stop using this App and fall back to the PAT below (if set). The App itself stays registered on GitHub — GitHub offers no API to delete it, so use the link below to remove the registration. This cannot be undone."
+      danger
+      confirm-label="Remove App"
+      :loading="deletingApp"
+      :link="appSettingsUrl ? { href: appSettingsUrl, label: 'Manage / delete the App on GitHub', external: true } : undefined"
+      @confirm="confirmDeleteApp"
+    />
   </AppShell>
 </template>
 
@@ -683,6 +747,15 @@ onMounted(load);
   background: var(--success-weak);
   border-radius: var(--radius-md);
   border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
+}
+.app-status-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.app-status-hint {
+  margin: 0;
 }
 .app-connected {
   display: flex;

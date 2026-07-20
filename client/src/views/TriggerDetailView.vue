@@ -17,7 +17,7 @@ import type {
   ReposResponse,
   RepoData,
 } from "../api/types.js";
-import { fmtTime, repoLeaf } from "../lib/format.js";
+import { fmtTime, repoLeaf, slugify } from "../lib/format.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import Card from "../components/ui/Card.vue";
@@ -34,13 +34,14 @@ const props = defineProps<{ id?: string; isNew?: boolean }>();
 const router = useRouter();
 
 const EVENT_TYPES: SelectOption[] = [
+  { value: "push", label: "Push" },
   { value: "issues", label: "Issues" },
   { value: "pull_request", label: "Pull Requests" },
-  { value: "push", label: "Push" },
   { value: "issue_comment", label: "Issue Comments" },
 ];
 
 const EVENT_ACTIONS: Record<string, SelectOption[]> = {
+  push: [],
   issues: [
     { value: "", label: "Any action" },
     { value: "opened", label: "opened" },
@@ -60,7 +61,6 @@ const EVENT_ACTIONS: Record<string, SelectOption[]> = {
     { value: "assigned", label: "assigned" },
     { value: "review_requested", label: "review_requested" },
   ],
-  push: [],
   issue_comment: [
     { value: "", label: "Any action" },
     { value: "created", label: "created" },
@@ -77,7 +77,6 @@ const form = ref({
   branch_pattern: "",
   profile: "",
   prompt: "",
-  branch_name: "noodle/trigger",
   enabled: 1,
 });
 const profiles = ref<string[]>([]);
@@ -115,8 +114,17 @@ const profileOptions = computed<SelectOption[]>(() => [
 ]);
 const eventTypeOptions = computed(() => EVENT_TYPES);
 const eventActionOptions = computed(() => EVENT_ACTIONS[form.value.event_type] ?? []);
-const showBranchPattern = computed(() => form.value.event_type === "push");
+// Right grid cell: Action dropdown for action-events (issues/PRs/issue_comment),
+// Branch pattern input for push. The cell is always present so switching event
+// types never reshapes the form.
 const showEventAction = computed(() => (EVENT_ACTIONS[form.value.event_type] ?? []).length > 0);
+
+/**
+ * Derived trunk branch name, mirroring serve.ts's
+ * `noodle/trigger-${slugify(name)}`. Read-only in the UI so the operator sees
+ * what branch this trigger will commit to without it being a writable field.
+ */
+const derivedBranch = computed(() => `noodle/trigger-${slugify(form.value.name || "untitled")}`);
 
 const eventPreview = computed(() => {
   const type = form.value.event_type;
@@ -140,7 +148,6 @@ function emptyForm() {
     branch_pattern: "",
     profile: "",
     prompt: "",
-    branch_name: "noodle/trigger",
     enabled: 1,
   };
 }
@@ -173,7 +180,6 @@ async function loadTrigger(): Promise<void> {
       branch_pattern: t.branch_pattern ?? "",
       profile: t.profile ?? "",
       prompt: t.prompt,
-      branch_name: t.branch_name,
       enabled: t.enabled,
     };
     // Parse the trigger's custom labels. If set, populate the 3 fields + turn the
@@ -216,7 +222,6 @@ function payload(): TriggerInput {
     branch_pattern: form.value.branch_pattern || null,
     profile: form.value.profile || null,
     prompt: form.value.prompt,
-    branch_name: form.value.branch_name.trim(),
     label: useCustomLabels.value
       ? JSON.stringify({ cooking: { name: cooking.name, color: cooking.color }, cooked: { name: cooked.name, color: cooked.color }, failed: { name: failed.name, color: failed.color } })
       : null,
@@ -409,27 +414,36 @@ onMounted(async () => {
               </div>
             </Field>
             <Field label="Agent branch">
-              <input v-model="form.branch_name" class="ctrl mono" type="text" placeholder="noodle/trigger" />
+              <div class="ctrl mono readonly-branch">
+                <code>{{ derivedBranch }}</code>
+              </div>
             </Field>
           </div>
 
-          <!-- Event type + action row -->
+          <!-- Event type + (action OR branch-pattern) row. The right cell is
+               always present so switching event types doesn't reshape the form:
+               action-events show an Action dropdown, push shows a Branch pattern
+               input — same grid slot, no layout shift. -->
           <div class="event-row">
             <div class="ev-field">
               <Field label="Event type">
                 <Select v-model="form.event_type" :options="eventTypeOptions" />
               </Field>
             </div>
-            <div v-if="showEventAction" class="ev-field">
-              <Field label="Action">
+            <div class="ev-field">
+              <Field v-if="showEventAction" label="Action">
                 <Select v-model="form.event_action" :options="eventActionOptions" />
+              </Field>
+              <Field v-else label="Branch pattern">
+                <input
+                  v-model="form.branch_pattern"
+                  class="ctrl mono"
+                  type="text"
+                  placeholder="e.g. main, feature/*. Empty match all branches."
+                />
               </Field>
             </div>
           </div>
-
-          <Field v-if="showBranchPattern" label="Branch pattern" hint="Optional. e.g. main, feature/*. Leave empty to match all branches.">
-            <input v-model="form.branch_pattern" class="ctrl mono" type="text" placeholder="e.g. main" />
-          </Field>
 
           <Field label="Profile" hint="Which model the trigger runs on.">
             <Select v-model="form.profile" :options="profileOptions" />
@@ -493,7 +507,7 @@ onMounted(async () => {
             When a <code class="inline mono">{{ eventPreview }}</code> event fires on
             <code class="inline mono">{{ form.repo || "owner/name" }}</code>,
             Noodle clones the repo, checks out the
-            <code class="inline mono">{{ form.branch_name || "branch" }}</code> branch,
+            <code class="inline mono">{{ derivedBranch }}</code> branch,
             runs the agent with your prompt, and commits + pushes.
           </p>
           <p class="hint-text">
@@ -556,6 +570,25 @@ onMounted(async () => {
   text-align: center;
   color: var(--text-3);
   font-size: var(--text-sm);
+}
+/* Read-only derived branch preview: shows the computed `noodle/trigger-<slug>`
+ * value so the operator can see it without editing. Updates live as Name changes. */
+.readonly-branch {
+  display: flex;
+  align-items: center;
+  min-height: var(--input-h, 36px);
+  padding: 0 12px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  cursor: default;
+  user-select: all;
+}
+.readonly-branch code {
+  font-family: inherit;
+  color: inherit;
 }
 .event-row,
 .repo-row {

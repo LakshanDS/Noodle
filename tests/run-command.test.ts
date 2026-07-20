@@ -10,11 +10,10 @@ import type { CommandRow } from "../src/server/command-store.js";
  * Verifies the issue/PR prompt composition contract:
  *
  *  - The operator's global `systemPrompt` dep is always active (expanded and
- *    prepended to sysInfo), regardless of whether a command matched.
- *  - A matched command's `system_prompt` extends it as the framing slot.
+ *    used as the base), regardless of whether a command matched.
+ *  - A matched command's `system_prompt` extends below the base as the framing slot.
  *  - A pure @mention (resolveCommand returns null, or not provided) leaves the
- *    framing slot EMPTY — the base system prompt alone is complete. No legacy
- *    default framing is injected.
+ *    framing slot EMPTY — the base system prompt alone is complete.
  *  - Template tags ({system.tier}, etc.) inside both prompts are expanded.
  *
  * Mirrors run-thinking.test.ts: git/skill side mocked, createAgentSession
@@ -130,8 +129,9 @@ describe("runJob prompt composition", () => {
     expect(prompt).not.toContain("{system.tier}");
     // …the base system prompt is also present (always active)…
     expect(prompt).toContain("Always load the `noodle-default` skill.");
-    // …and the issue context block is appended.
-    expect(prompt).toContain("You are working on an issue in the GitHub repository `o/r`");
+    // …and the issue context block is appended (base + context header).
+    expect(prompt).toContain("The issue you have been given");
+    expect(prompt).toContain("## Issue");
   });
 
   it("expands {system.tier} to constrained or capable", async () => {
@@ -165,8 +165,8 @@ describe("runJob prompt composition", () => {
     const prompt = getPrompt()!;
     // Base system prompt is present (always active)…
     expect(prompt).toContain("Always load the `noodle-default` skill.");
-    // …issue context is appended…
-    expect(prompt).toContain("You are working on an issue in the GitHub repository `o/r`");
+    // …issue context is appended with the new context header…
+    expect(prompt).toContain("The issue you have been given");
     expect(prompt).toContain("Issue URL: https://x/1");
     // …and NO command framing leaked in (the review command's text is absent).
     expect(prompt).not.toContain("You are reviewing code");
@@ -186,7 +186,7 @@ describe("runJob prompt composition", () => {
 
     const prompt = getPrompt()!;
     expect(prompt).toContain("Always load the `noodle-default` skill.");
-    expect(prompt).toContain("You are working on an issue in the GitHub repository `o/r`");
+    expect(prompt).toContain("The issue you have been given");
     expect(prompt).not.toContain("You are reviewing code");
   });
 });

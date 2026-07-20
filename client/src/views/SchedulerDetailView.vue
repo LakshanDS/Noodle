@@ -17,7 +17,7 @@ import type {
   ReposResponse,
   RepoData,
 } from "../api/types.js";
-import { cronScheduleText, fmtTime, repoLeaf } from "../lib/format.js";
+import { cronScheduleText, fmtTime, repoLeaf, slugify } from "../lib/format.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
 import Card from "../components/ui/Card.vue";
@@ -36,7 +36,6 @@ const router = useRouter();
 const form = ref({
   name: "",
   repo: "",
-  branch_name: "noodle/schedules",
   cron_expression: "0 0 * * *",
   profile: "",
   prompt: "",
@@ -55,6 +54,14 @@ const repos = ref<RepoData[]>([]);
 
 const editing = computed(() => !props.isNew && props.id != null);
 const schedulePreview = computed(() => cronScheduleText(form.value.cron_expression));
+
+/**
+ * Derived trunk branch name, mirroring serve.ts's
+ * `noodle/schedule-${slugify(name)}`. Shown read-only in the UI so the operator
+ * sees what branch this schedule will commit to — without it being a writable
+ * field (the runtime derives it from the schedule name).
+ */
+const derivedBranch = computed(() => `noodle/schedule-${slugify(form.value.name || "untitled")}`);
 
 // Custom-labels toggle + 3 label fields. When off, the schedule uses the global
 // default labels (Settings → GitHub labels). When on, these 3 override them
@@ -79,7 +86,7 @@ const profileOptions = computed<SelectOption[]>(() => [
 ]);
 
 function emptyForm() {
-  return { name: "", repo: "", branch_name: "noodle/schedules", cron_expression: "0 0 * * *", profile: "", prompt: "", enabled: 1 };
+  return { name: "", repo: "", cron_expression: "0 0 * * *", profile: "", prompt: "", enabled: 1 };
 }
 
 async function ensureProfiles(): Promise<void> {
@@ -105,7 +112,6 @@ async function loadScheduler(): Promise<void> {
     form.value = {
       name: s.name,
       repo: s.repo,
-      branch_name: s.branch_name,
       cron_expression: s.cron_expression,
       profile: s.profile ?? "",
       prompt: s.prompt,
@@ -146,7 +152,6 @@ function payload(): SchedulerInput {
   return {
     name: form.value.name.trim(),
     repo: form.value.repo.trim(),
-    branch_name: form.value.branch_name.trim(),
     cron_expression: form.value.cron_expression.trim(),
     profile: form.value.profile || null,
     prompt: form.value.prompt,
@@ -361,13 +366,9 @@ onMounted(async () => {
             </div>
             <div class="rb-field">
               <label class="rb-label">Agent branch</label>
-              <input
-                v-model="form.branch_name"
-                class="ctrl mono"
-                type="text"
-                placeholder="noodle/schedules"
-                autocomplete="off"
-              />
+              <div class="ctrl mono readonly-branch">
+                <code>{{ derivedBranch }}</code>
+              </div>
             </div>
           </div>
           <Field label="Schedule (cron expression)">
@@ -432,7 +433,7 @@ onMounted(async () => {
           <p class="hint-text">
             {{ schedulePreview }} — the agent wakes up at this time, clones
             <code class="inline mono">{{ form.repo || "owner/name" }}</code>, checks out the
-            <code class="inline mono">{{ form.branch_name || "branch" }}</code> branch, follows your prompt,
+            <code class="inline mono">{{ derivedBranch }}</code> branch, follows your prompt,
             commits to that branch, and opens a pull request.
           </p>
           <p class="hint-text">
@@ -520,6 +521,26 @@ onMounted(async () => {
   letter-spacing: var(--tracking-caps);
   color: var(--text-3);
   font-weight: var(--weight-medium);
+}
+/* Read-only derived branch preview: looks like a disabled input but holds the
+ * computed `noodle/schedule-<slug>` value so the operator can see it without
+ * editing. Updates live as the Name field changes. */
+.readonly-branch {
+  display: flex;
+  align-items: center;
+  min-height: var(--input-h, 36px);
+  padding: 0 12px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  cursor: default;
+  user-select: all;
+}
+.readonly-branch code {
+  font-family: inherit;
+  color: inherit;
 }
 /* Custom autocomplete dropdown — styled like a native <select>: solid opaque
  * card spanning the full input width, flush items edge-to-edge. */

@@ -27,12 +27,20 @@ const props = withDefaults(
     icon?: IconName;
     /** When true, loading is driven by the parent via the `open` binding lifecycle. */
     loading?: boolean;
+    /**
+     * Optional link rendered below the message as a real anchor (escapes the
+     * plain-text `message`, so callers can surface a clickable URL — e.g. to the
+     * GitHub page where an App registration can be deleted). `external` opens in
+     * a new tab with noopener/noreferrer.
+     */
+    link?: { href: string; label: string; external?: boolean };
   }>(),
   {
     confirmLabel: "Confirm",
     cancelLabel: "Cancel",
     danger: false,
     loading: false,
+    link: undefined,
   },
 );
 
@@ -94,6 +102,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           </div>
 
           <p v-if="message" class="message">{{ message }}</p>
+
+          <a
+            v-if="link"
+            class="link"
+            :href="link.href"
+            :target="link.external ? '_blank' : undefined"
+            :rel="link.external ? 'noopener noreferrer' : undefined"
+          >
+            <Icon v-if="link.external" name="external" :size="12" />
+            {{ link.label }}
+          </a>
 
           <div class="actions">
             <Button
@@ -177,6 +196,19 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
   color: var(--text-2);
   line-height: var(--leading-normal);
   margin: 0 0 var(--space-5);
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--accent);
+  text-decoration: none;
+  margin: calc(-1 * var(--space-3)) 0 var(--space-5);
+}
+.link:hover {
+  text-decoration: underline;
 }
 
 .actions {

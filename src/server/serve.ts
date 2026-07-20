@@ -16,11 +16,12 @@ import { resolveAuthProvider, isAppMode, type AuthProvider } from "../github/aut
 import { runJob, pruneSessionDirs } from "../engine/run.js";
 import { runSchedulerJob } from "../engine/scheduler-run.js";
 import { runTriggerJob } from "../engine/trigger-run.js";
+import { LiveRunRegistry } from "../engine/live-runs.js";
 import { loadConfig, ConfigError } from "../config/load.js";
 import { NoodleConfigSchema } from "../config/schema.js";
 import { createRelayServer } from "../relay/server.js";
 import { log, initLogFile, closeLogFile } from "../util/log.js";
-import { slugify } from "../util/slugify.js";
+import { slugify, originOf, relayBaseUrl } from "../util/slugify.js";
 import type { NoodleConfig } from "../config/schema.js";
 
 /**
@@ -63,6 +64,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // server starts listening).
   const queue = new JobQueue(config.storage.sqlite_path);
   const runStore = new RunStore(queue.getDb());
+  // Live registry of in-flight run sessions — the cancel endpoint aborts via
+  // this. Without it, cancel only flips the DB row; the agent runs to completion.
+  const liveRuns = new LiveRunRegistry();
   const schedulerStore = new SchedulerStore(queue.getDb());
   const triggerStore = new TriggerStore(queue.getDb());
   const settingsStore = new SettingStore(queue.getDb());
@@ -113,14 +117,27 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
 
   // API relay: always runs on :4445. Profiles with use_relay route their API
   // requests through it for rate limiting. originalUrls holds the real upstream
-  // base_urls (before relay rewrite) so the relay can forward. Shared with
+  // ORIGIN (scheme://host) per model — the relay forwards by swapping the relay
+  // origin back to this, keeping the request path verbatim. Shared with
   // ui-routes so profile CRUD can update them live.
+  //
+  // The agent-facing base_url mirrors the upstream's path shape (see
+  // relayBaseUrl in slugify.ts): if the user enters https://api.openai.com/v1
+  // the agent sees http://localhost:4445/v1; if they enter https://api.mistral.ai
+  // (bare host) the agent sees http://localhost:4445. Each transport SDK then
+  // does its own path math and produces a path correct for its protocol. See
+  // "API relay (rate-limiting proxy)" in AGENTS.md.
   const relayPort = 4445;
-  const relayBase = `http://localhost:${relayPort}/v1`;
+  const relayOrigin = `http://localhost:${relayPort}`;
+  // originalUrls stores the upstream ORIGIN (scheme://host) per model. The relay
+  // forwards by pure origin-swap: forwardUrl = origin + req.url. The path prefix
+  // (e.g. /api/anthropic for a proxy) comes from req.url itself — the agent was
+  // told a relay-facing URL with the same prefix (relayBaseUrl), the SDK appended
+  // its version path, so req.url already carries the full correct path.
   const originalUrls = new Map<string, string>();
   for (const [, profile] of Object.entries(config.profiles)) {
     if (profile.base_url) {
-      originalUrls.set(profile.model, profile.base_url);
+      originalUrls.set(profile.model, originOf(profile.base_url));
     }
   }
 
@@ -155,12 +172,17 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       await runSchedulerJob(config, initial.gh, {
         repo: job.repo,
         prompt: scheduler.prompt,
-        branchName: scheduler.branch_name,
+        // Derive the trunk branch from the schedule's name (slugified) so the
+        // branch is stable per-schedule without a redundant freeform field. The
+        // trunk is long-lived: run 1 creates it, later runs sync + stack on it.
+        branchName: `noodle/schedule-${slugify(scheduler.name)}`,
+        scheduleName: scheduler.name,
         profile: scheduler.profile,
         jobId: `job-${job.id}`,
         token: initial.token,
       }, {
         runStore,
+        liveRuns,
         tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
         systemPrompt: settingsStore.get("system_prompt") || undefined,
         // Apply this cron's custom labels to its output issue; falls back to the
@@ -184,16 +206,24 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       await runTriggerJob(config, initial.gh, {
         repo: job.repo,
         prompt: trigger.prompt,
-        branchName: trigger.branch_name,
+        // Derive the trunk branch from the trigger's name (slugified) — mirrors
+        // the scheduler's branch derivation. The trunk is long-lived: run 1
+        // creates it, later runs sync + stack on it.
+        branchName: `noodle/trigger-${slugify(trigger.name)}`,
         profile: trigger.profile,
         jobId: `job-${job.id}`,
         token: initial.token,
         eventType: trigger.event_type,
         eventAction: trigger.event_action,
+        // Display name for PR titles + manual-sync issues.
+        triggerLabel: trigger.name,
       }, {
         runStore,
+        liveRuns,
         tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
         systemPrompt: settingsStore.get("system_prompt") || undefined,
+        // Triggers have no per-row label-set override (just a single display
+        // `label` column); they use the global default label set.
         triggerStore,
         triggerId: trigger.id,
       });
@@ -207,6 +237,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       token: initial.token,
     }, {
       runStore,
+      liveRuns,
       tokenProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.token),
       ghProvider: () => authProvider.forRepo(job.repo, instId).then((r) => r.gh),
       // Correct the job row's profile hint once the authoritative profile is
@@ -335,7 +366,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // Expose dispatch so UI routes can trigger it after enqueueing (manual cron
   // run) — new jobs start immediately instead of waiting for the 5s safety net.
   const dispatch = (): void => dispatcher.dispatch();
-  registerUiRoutes(app, { runStore, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch, originalUrls, relayBase });
+  registerUiRoutes(app, { runStore, liveRuns, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch, originalUrls, relayOrigin });
   if (settingsStore.has("NOODLE_UI_PASSWORD")) {
     log.info("web UI enabled (password-protected)");
   } else {
@@ -359,7 +390,7 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
 
   for (const profile of Object.values(config.profiles)) {
     if (profile.use_relay && profile.base_url) {
-      profile.base_url = relayBase;
+      profile.base_url = relayBaseUrl(profile.base_url, relayOrigin, profile.api);
     }
   }
 

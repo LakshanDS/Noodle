@@ -45,6 +45,7 @@ Noodle is a self-hosted GitHub bot that uses AI coding agents to automate bug fi
 - **Concurrency control**: a `cooking` label prevents duplicate runs on the same issue/PR
 - **Profile routing**: `#profile` tag > matched command's `profile` field > label match > keyword regex > default profile
 - **Self-hosted**: runs on your own infrastructure, connects to your GitHub App or PAT, uses your chosen AI provider
+- **Invisible relay**: the API relay (port 4445) is a dumb rate-limiting pipe. The agent points at a relay-facing `base_url` (e.g. `http://localhost:4445/v1` for OpenAI-compatible, `http://localhost:4445` for Mistral/Anthropic/Google — it mirrors the upstream's path shape) and believes that *is* the provider. The relay does two things and only two things: (1) swap the origin back to the real upstream's scheme+host, (2) sleep for the RPM interval. It forwards the request byte-for-byte. See [API relay (rate-limiting proxy)](#api-relay-rate-limiting-proxy) below.
 
 ### Prompting (input shaping)
 
@@ -133,3 +134,66 @@ In Cron and Trigger mode, the agent's output is a **new issue** (`gh.createIssue
 - matches a stored **Trigger** rule (`push`, `issues`, `pull_request`, etc.)
 
 Either path can enqueue another agent run. This is intentional — it lets a cron run surface a finding and have it picked up by a downstream agent. The self-trigger suppression rule above is deliberately **narrowed to comments and label swaps** so this chaining path keeps working: `issues.opened`/`reopened` from the bot itself are never suppressed.
+
+### API relay (rate-limiting proxy)
+
+The relay (`src/relay/server.ts` + `src/relay/forwarder.ts` + `src/relay/rate-limiter.ts`, always on `:4445`) is an **invisible dumb pipe** between the agent and the real AI provider. It exists for one reason: to enforce per-model RPM by sleeping before each forwarded request, so the provider never sends a 429.
+
+**The invariant — the relay must be transparent to the agent.**
+
+The agent is told a relay-facing `base_url` and believes that *is* the provider. It builds a request for whatever protocol the profile's `api` field declares and POSTs it. The relay's entire job is:
+
+1. model → look up the upstream **origin** (scheme://host) from the `originalUrls` map (populated by `serve.ts`, updated live by profile CRUD in `ui-routes.ts`)
+2. sleep for the RPM interval (`acquireSlot` in `rate-limiter.ts`)
+3. **forward by origin-swap**: replace the relay origin with the upstream origin, keep the request path + body verbatim
+
+The relay **does not** mutate the request body. It does not rewrite roles. It does not strip fields. It does not know or care which protocol is in use. The request is correct the moment the agent builds it, because the agent built it for the right `api` protocol. The relay is a wire with a timer on it.
+
+**Why the relay never mutates the body.** Correctness lives in the **agent layer**, not the relay. pi-ai has 5 transports, picked by the profile's `api` field:
+
+| `api` value | Transport | Body shape |
+|-------------|-----------|------------|
+| `mistral-conversations` | dedicated Mistral | Mistral-native (no `store`, no `developer` role, `max_tokens`) |
+| `anthropic-messages` | dedicated Anthropic | Anthropic-native |
+| `google-generative-ai` | dedicated Google | Google-native |
+| `openai-responses` | OpenAI Responses API | OpenAI-native |
+| `openai-completions` | generic OpenAI-compatible | OpenAI Chat Completions |
+
+The 4 dedicated transports build a protocol-correct body regardless of which URL they're pointed at — so relaying them is trivially correct: pipe through. The generic `openai-completions` transport is the only one that does URL-sniffing (`detectCompat`) to guess field names (`max_tokens` vs `max_completion_tokens`, `store:false`, `developer` role). If a profile using that transport is aimed at a picky non-OpenAI upstream, compat must be set explicitly at registration (`registerCustomProviders` in `src/profiles/custom-providers.ts`) so pi-ai generates provider-safe fields itself — **never** patched by the relay after the fact.
+
+**Why forward by origin-swap, not path-rebuild.** Each transport's SDK concatenates `baseURL + hardcoded-path` differently, and each hardcodes a different path:
+
+| Transport | SDK | SDK default base | Hardcoded path | Upstream `base_url` shape |
+|-----------|-----|------------------|----------------|---------------------------|
+| `openai-completions` | OpenAI SDK | `…/v1` | `/chat/completions` | **with `/v1`** |
+| `openai-responses` | OpenAI SDK | `…/v1` | `/responses` | **with `/v1`** |
+| `anthropic-messages` | Anthropic SDK | bare host | `/v1/messages` | **bare host** |
+| `mistral-conversations` | Mistral SDK | bare host | `/v1/chat/completions` | **bare host** |
+| `google-generative-ai` | Google SDK | bare host | varies | **bare host** |
+
+So the relay-facing `base_url` for each profile mirrors its upstream's path shape: `relayBaseUrl(upstream, origin)` = `http://localhost:4445` + `pathOf(upstream)`. If the user enters `https://api.openai.com/v1`, the agent sees `http://localhost:4445/v1` and the OpenAI SDK appends `/chat/completions`. If the user enters `https://api.mistral.ai` (bare host), the agent sees `http://localhost:4445` and the Mistral SDK appends `/v1/chat/completions`. In both cases the path that lands on the relay is correct for that protocol's upstream — so the relay just swaps the origin and forwards. No per-transport logic in the relay, ever. Helpers in `src/util/slugify.ts`: `originOf`, `pathOf`, `relayBaseUrl`, `relayForwardUrl`.
+
+**Routing anatomy.**
+
+```mermaid
+sequenceDiagram
+    participant Agent as agent (pi-ai)
+    participant Relay as relay (:4445)
+    participant Upstream as real upstream
+    Agent->>Relay: POST /v1/chat/completions<br/>Host: localhost:4445<br/>body: correct for `api` protocol
+    Note over Relay: model → lookup originalUrls[model] (origin)
+    Note over Relay: sleep RPM interval (acquireSlot)
+    Relay->>Upstream: POST {upstream-origin}/v1/chat/completions<br/>verbatim body
+    Upstream-->>Relay: response (verbatim)
+    Relay-->>Agent: response (verbatim)
+```
+
+The `originalUrls` map (`Map<model, originOf(base_url)>`) holds the upstream **origin** per model. It is populated at boot in `serve.ts` and kept live by profile create/update in `ui-routes.ts`. When `use_relay` is on, the profile's `base_url` is rewritten to the relay-facing URL (`relayBaseUrl(...)`) for the agent to see; the upstream origin is retained in `originalUrls` for the relay to forward to. The agent never sees the real URL; the relay never tells the agent anything.
+
+**Internal LLM calls (phrasing, titles) use the same path.** `phraseOutput` and `generateIssueTitle` (`src/engine/title.ts`) POST to `http://localhost:4445/v1/chat/completions` using the run's resolved profile. The relay does its origin-swap and forwards. Same relay, same model lookup, same rate-limiting. The only difference is they use a tiny non-streaming request with a tight `max_tokens` cap.
+
+**Common failure modes (and why they're fixed at the agent layer, not the relay):**
+
+- **404 "no Route matched" from upstream** → the relay forwarded a path the upstream doesn't have. Root cause is ALWAYS a `base_url` shape mismatch between what the user entered and what the transport's SDK expects. The relay-facing URL must mirror the upstream's path shape (`relayBaseUrl(upstream, origin)`), and the relay must forward by pure origin-swap (`upstream-origin + req.url`). The earlier `ensureV1Suffix` approach forced `/v1` onto every upstream — wrong for Mistral/Anthropic/Google (their SDKs hardcode `/v1` themselves → double `/v1` → 404). Never add per-transport path logic to the relay.
+- **422 `extra_forbidden` / unknown field** → the `openai-completions` transport generated an OpenAI-default field the upstream rejects (`max_completion_tokens`, `store`, `developer` role). Root cause: profile's `api` is `openai-completions` but pointed at a picky non-OpenAI upstream, and compat wasn't set explicitly. Fix `registerCustomProviders` to set safe compat for the generic case — do not strip fields in the relay.
+- **429** → handled by `forwarder.ts` retry loop (Retry-After-aware, exponential backoff). Should be rare because the relay's RPM spacing prevents it; the retry is a safety net for transient platform 429s (e.g. shared NVIDIA NIM free tier).

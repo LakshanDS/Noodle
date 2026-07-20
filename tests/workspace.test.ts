@@ -18,6 +18,7 @@ const spies = vi.hoisted(() => ({
   fetch: vi.fn(),
   raw: vi.fn(),
   checkout: vi.fn(),
+  merge: vi.fn(),
 }));
 
 vi.mock("simple-git", () => ({
@@ -102,5 +103,115 @@ describe("Workspace.checkoutOrReuse", () => {
       spies.checkout.mock.invocationCallOrder[0],
     );
     expect(spies.raw).not.toHaveBeenCalled();
+  });
+});
+
+describe("Workspace.mergeMain", () => {
+  beforeEach(() => {
+    Object.values(spies).forEach((s) => s.mockReset());
+    spies.clone.mockResolvedValue(undefined);
+    spies.remote.mockResolvedValue(undefined);
+    spies.fetch.mockResolvedValue(undefined);
+    spies.merge.mockResolvedValue(undefined);
+  });
+
+  it("fetches the base branch and merges origin/<base> (single token, not two args)", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    const fresh = "https://x-access-token:FRESH@github.com/o/r.git";
+    const r = await ws.mergeMain("main", fresh);
+
+    // Re-point origin to the fresh URL before fetching (token refresh).
+    expect(spies.remote).toHaveBeenCalledWith(["set-url", "origin", fresh]);
+    expect(spies.fetch).toHaveBeenCalledWith("origin", "main");
+    // CRITICAL: the ref must be a single `origin/main` token, NOT two args.
+    // `git merge origin main` would be misread as merging two unrelated refs
+    // (this bug was caught while building the scheduler trunk-sync flow).
+    expect(spies.merge).toHaveBeenCalledWith(["origin/main"]);
+    expect(r).toEqual({ conflicted: false, files: [] });
+  });
+
+  it("detects conflicts when simple-git rejects with err.git.conflicts", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    // simple-git REJECTS the merge promise when git exits non-zero with
+    // conflicts; the conflict list lives on err.git.conflicts as [{file,reason}].
+    spies.merge.mockRejectedValue({
+      message: "CONFLICTS: f.txt:content",
+      git: { conflicts: [{ file: "f.txt", reason: "content" }] },
+    });
+    const r = await ws.mergeMain("main");
+    expect(r).toEqual({ conflicted: true, files: ["f.txt"] });
+  });
+
+  it("re-throws non-conflict errors (network/auth) instead of swallowing them", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    spies.merge.mockRejectedValue(new Error("fatal: unable to access 'https://...': Could not resolve host"));
+    await expect(ws.mergeMain("main")).rejects.toThrow(/Could not resolve host/);
+  });
+});
+
+describe("Workspace.hasConflictMarkers + abortMerge", () => {
+  beforeEach(() => {
+    Object.values(spies).forEach((s) => s.mockReset());
+    spies.clone.mockResolvedValue(undefined);
+    spies.merge.mockResolvedValue(undefined);
+  });
+
+  it("returns true when git status reports conflicted paths", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    spies.status.mockResolvedValue({ conflicted: ["src/a.ts", "src/b.ts"] });
+    expect(await ws.hasConflictMarkers()).toBe(true);
+  });
+
+  it("returns false when conflicted list is empty", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    spies.status.mockResolvedValue({ conflicted: [] });
+    expect(await ws.hasConflictMarkers()).toBe(false);
+  });
+
+  it("forwards to git merge --abort", async () => {
+    const ws = await Workspace.clone("https://example.com/repo.git", "job-test");
+    await ws.abortMerge();
+    expect(spies.merge).toHaveBeenCalledWith(["--abort"]);
+  });
+});
+
+/**
+ * Regression test for the production cron/trigger bug: `tryFetchBranch`'s
+ * "branch does not exist" detector must match git's actual error message
+ * (`fatal: couldn't find remote ref <name>`). The original regex
+ * `/ fatal:/i` required a LEADING SPACE before `fatal:`, which git does NOT
+ * emit — so every first cron run on a fresh branch failed all 5 retries.
+ *
+ * This test documents the exact regex used by scheduler-run.ts:493 and
+ * trigger-run.ts:495 so a future edit can't silently re-break it. It mirrors
+ * the inline pattern rather than importing the private function (the function
+ * also does git I/O, which is covered by the workspace tests above).
+ */
+describe("tryFetchBranch 'branch not found' regex (production cron bug regression)", () => {
+  // MUST stay byte-identical to the regex in scheduler-run.ts:493 and
+  // trigger-run.ts:495. If either changes, update both call sites + this test.
+  // Note: we deliberately do NOT use a bare `fatal:` alternative — git's
+  // network errors also start with `fatal:` (e.g. "fatal: unable to access"),
+  // and matching those would silently treat a network blip as "branch missing"
+  // and break the timeline. The `fatal:.*remote ref` form only matches the
+  // actual missing-ref error.
+  const BRANCH_NOT_FOUND_RE = /not found|doesn't exist|couldn't find|could not find|does not exist|fatal:.*remote ref/i;
+
+  it.each([
+    ["fatal: couldn't find remote ref noodle/master", "git's actual missing-branch error (the production case)"],
+    ["fatal: couldn't find remote ref noodle/schedules", "the schedule branch from the production logs"],
+    ["fatal: could not find remote ref foo", "long-form 'could not find'"],
+    ["error: branch 'foo' not found", "alternative 'not found' phrasing"],
+    ["refs/heads/foo does not exist", "'does not exist' phrasing"],
+  ])("matches %s (%s)", (msg) => {
+    expect(BRANCH_NOT_FOUND_RE.test(msg)).toBe(true);
+  });
+
+  it.each([
+    ["fatal: unable to access 'https://...': Could not resolve host", "network error — must re-throw, not treat as missing branch"],
+    ["error: pathspec 'foo' did not match any file(s) known to git", "pathspec error — unrelated to branch existence"],
+    ["remote: Invalid username or token", "auth error — must surface, not silently create a fresh branch"],
+  ])("does NOT match %s (%s)", (msg) => {
+    expect(BRANCH_NOT_FOUND_RE.test(msg)).toBe(false);
   });
 });

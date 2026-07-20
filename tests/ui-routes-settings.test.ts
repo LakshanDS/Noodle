@@ -231,3 +231,49 @@ describe("UI settings routes — PUT", () => {
     }
   });
 });
+
+describe("UI routes — DELETE /api/github/app", () => {
+  it("returns 401 without a cookie", async () => {
+    const app = makeApp();
+    try {
+      const res = await app.inject({ method: "DELETE", url: "/api/github/app" });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("removes App creds but preserves the PAT and NOODLE_LOGIN", async () => {
+    settingsStore.setMany({
+      GITHUB_APP_ID: "123456",
+      GITHUB_APP_SLUG: "my-bot",
+      GITHUB_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+      GITHUB_WEBHOOK_SECRET: "whsecret",
+      GITHUB_APP_SETUP_STATE: "csrf-state",
+      GITHUB_TOKEN: "ghp_patfallback",
+      NOODLE_LOGIN: "my-bot[bot]",
+    });
+    const app = makeApp();
+    try {
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/api/github/app",
+        headers: { cookie: authCookie() },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true });
+      // All App-owned keys are gone.
+      expect(settingsStore.get("GITHUB_APP_ID")).toBeUndefined();
+      expect(settingsStore.get("GITHUB_APP_SLUG")).toBeUndefined();
+      expect(settingsStore.get("GITHUB_PRIVATE_KEY")).toBeUndefined();
+      expect(settingsStore.get("GITHUB_WEBHOOK_SECRET")).toBeUndefined();
+      expect(settingsStore.get("GITHUB_APP_SETUP_STATE")).toBeUndefined();
+      // The PAT survives so Noodle can fall back to it.
+      expect(settingsStore.get("GITHUB_TOKEN")).toBe("ghp_patfallback");
+      // NOODLE_LOGIN is left alone (may have been set for PAT mode).
+      expect(settingsStore.get("NOODLE_LOGIN")).toBe("my-bot[bot]");
+    } finally {
+      await app.close();
+    }
+  });
+});

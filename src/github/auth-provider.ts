@@ -2,6 +2,7 @@ import { Octokit } from "octokit";
 import { GithubAppAuth } from "./app-auth.js";
 import { GitHubClient } from "./client.js";
 import type { SettingStore } from "../server/settings-store.js";
+import { log } from "../util/log.js";
 
 /**
  * The GitHub REST API version to target (silences the deprecation warning from
@@ -87,6 +88,19 @@ export class GithubAppAuthProvider implements AuthProvider {
  * re-evaluated each call against the current DB state, so switching modes (e.g.
  * adding a PAT after the App creds are cleared) also works live.
  *
+ * Precedence — App first, PAT fallback:
+ *   When App creds are present (GITHUB_APP_ID + GITHUB_PRIVATE_KEY or a
+ *   GITHUB_PRIVATE_KEY_FILE), we try the App provider first. If it throws (App
+ *   uninstalled on the repo, revoked, key rotated, etc.) AND a PAT is also
+ *   configured, we fall back to the PAT so a run isn't lost. If no PAT is
+ *   configured, the original App error is re-thrown so the operator sees the
+ *   real cause. When only a PAT is present, PAT is used directly. When neither
+ *   is present, the Noop provider throws the setup prompt.
+ *
+ *   This lets an operator keep both configured at once: App as the primary, PAT
+ *   as the backup. The App is always preferred on the happy path, so the common
+ *   (App-only) case has zero extra calls.
+ *
  * App-mode caching: `GithubAppAuth` caches installation tokens + repo→installation
  * mappings as INSTANCE fields (one instance per process is the documented usage).
  * To preserve that caching while still picking up credential changes, we hold a
@@ -98,23 +112,58 @@ export class GithubAppAuthProvider implements AuthProvider {
  * request) and never held as a long-lived snapshot, so re-resolving here is safe.
  */
 class LazyAuthProvider implements AuthProvider {
-  constructor(private readonly store: SettingStore) {}
+  /**
+   * @param store Settings DB (re-queried every call for hot reload).
+   * @param appProviderFactory Builds the App provider from resolved creds.
+   *   Defaults to the real `GithubAppAuth` + `GithubAppAuthProvider`; injectable
+   *   for tests so the App-throws → PAT-fallback path can be exercised without
+   *   real keys or network.
+   */
+  constructor(
+    private readonly store: SettingStore,
+    private readonly appProviderFactory: (appId: string, privateKey: string | undefined) => AuthProvider = (appId, privateKey) =>
+      new GithubAppAuthProvider(new GithubAppAuth({ appId, privateKey })),
+  ) {}
   /** Cached App provider + the credential fingerprint it was built from. */
-  private appCache: { fingerprint: string; provider: GithubAppAuthProvider } | null = null;
+  private appCache: { fingerprint: string; provider: AuthProvider } | null = null;
 
-  async forRepo(repo: string, installationId?: number): Promise<{ gh: GitHubClient; token: string }> {
+  /**
+   * Resolve the cached App provider for the current DB creds, rebuilding it only
+   * when the (appId|privateKey) fingerprint changes. Returns null when App creds
+   * are absent — callers then drop the cache and fall through to PAT/Noop.
+   */
+  private resolveAppProvider(): AuthProvider | null {
     const appId = this.store.get("GITHUB_APP_ID");
     const privateKey = this.store.get("GITHUB_PRIVATE_KEY");
-    if (appId && (privateKey || process.env.GITHUB_PRIVATE_KEY_FILE)) {
-      const fingerprint = `${appId}|${privateKey ?? ""}`;
-      if (!this.appCache || this.appCache.fingerprint !== fingerprint) {
-        const appAuth = new GithubAppAuth({ appId, privateKey: privateKey ?? undefined });
-        this.appCache = { fingerprint, provider: new GithubAppAuthProvider(appAuth) };
-      }
-      return this.appCache.provider.forRepo(repo, installationId);
+    if (!appId || !(privateKey || process.env.GITHUB_PRIVATE_KEY_FILE)) {
+      // App creds absent — drop any stale App cache so a future re-add starts clean.
+      this.appCache = null;
+      return null;
     }
-    // App creds absent — drop any stale App cache so a future re-add starts clean.
-    this.appCache = null;
+    const fingerprint = `${appId}|${privateKey ?? ""}`;
+    if (!this.appCache || this.appCache.fingerprint !== fingerprint) {
+      this.appCache = { fingerprint, provider: this.appProviderFactory(appId, privateKey ?? undefined) };
+    }
+    return this.appCache.provider;
+  }
+
+  async forRepo(repo: string, installationId?: number): Promise<{ gh: GitHubClient; token: string }> {
+    const appProvider = this.resolveAppProvider();
+    if (appProvider) {
+      try {
+        return await appProvider.forRepo(repo, installationId);
+      } catch (appErr) {
+        // App creds exist but failed (uninstalled/revoked/key invalid). Fall
+        // back to the PAT if one is configured so the run can still proceed.
+        const token = this.store.get("GITHUB_TOKEN");
+        if (token) {
+          log.warn({ repo, err: (appErr as Error).message }, "GitHub App auth failed; falling back to PAT");
+          return new PatAuthProvider(token).forRepo();
+        }
+        // No fallback available — re-throw so the caller sees the real cause.
+        throw appErr;
+      }
+    }
     const token = this.store.get("GITHUB_TOKEN");
     if (token) {
       return new PatAuthProvider(token).forRepo();
@@ -123,17 +172,19 @@ class LazyAuthProvider implements AuthProvider {
   }
 
   async listRepos(): Promise<import("./client.js").RepoData[]> {
-    const appId = this.store.get("GITHUB_APP_ID");
-    const privateKey = this.store.get("GITHUB_PRIVATE_KEY");
-    if (appId && (privateKey || process.env.GITHUB_PRIVATE_KEY_FILE)) {
-      const fingerprint = `${appId}|${privateKey ?? ""}`;
-      if (!this.appCache || this.appCache.fingerprint !== fingerprint) {
-        const appAuth = new GithubAppAuth({ appId, privateKey: privateKey ?? undefined });
-        this.appCache = { fingerprint, provider: new GithubAppAuthProvider(appAuth) };
+    const appProvider = this.resolveAppProvider();
+    if (appProvider) {
+      try {
+        return await appProvider.listRepos();
+      } catch (appErr) {
+        const token = this.store.get("GITHUB_TOKEN");
+        if (token) {
+          log.warn({ err: (appErr as Error).message }, "GitHub App auth failed; falling back to PAT for repo listing");
+          return new PatAuthProvider(token).listRepos();
+        }
+        throw appErr;
       }
-      return this.appCache.provider.listRepos();
     }
-    this.appCache = null;
     const token = this.store.get("GITHUB_TOKEN");
     if (token) {
       return new PatAuthProvider(token).listRepos();
@@ -141,6 +192,13 @@ class LazyAuthProvider implements AuthProvider {
     return new NoopAuthProvider().listRepos();
   }
 }
+
+/**
+ * Exported for tests so the App-throws → PAT-fallback path can be exercised with
+ * an injectable App provider (no real keys or network). Production builds it via
+ * `resolveAuthProvider`, which uses the real factory.
+ */
+export const LazyAuthProviderForTest = LazyAuthProvider;
 
 /**
  * Build the auth provider for the process. Returns a lazy provider that re-reads

@@ -107,3 +107,19 @@ export function cronScheduleText(expr: string): string {
   }
   return expr;
 }
+
+/**
+ * Lowercase, replace non-alphanumeric chars with hyphens, collapse runs, and
+ * trim leading/trailing hyphens. Mirrors src/util/slugify.ts on the server so
+ * the UI's derived-branch preview matches exactly what the runtime produces.
+ *
+ *   slugify("Noodle")      → "noodle"
+ *   slugify("My Bot")      → "my-bot"
+ *   slugify("Agent_42!")   → "agent-42"
+ */
+export function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
