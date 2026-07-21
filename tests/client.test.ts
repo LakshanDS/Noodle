@@ -221,4 +221,24 @@ describe("GitHubClient.findOpenPRForIssue", () => {
     const pr = await client.findOpenPRForIssue("owner/repo", 42, "noodle");
     expect(pr).toBeNull();
   });
+
+  it("escapes regex metacharacters in the agent slug (noodle.v1 matches literally)", async () => {
+    // Regression: an unescaped `.` in the slug used to match any char, so a
+    // slug of `noodle.v1` would also match `noodlexv1/issue-7`. The slug must
+    // be matched literally.
+    const { client } = makePrStub([
+      { head: { ref: "noodlexv1/issue-7" }, number: 11, html_url: "https://x/p/11" },
+      { head: { ref: "noodle1v1/issue-7" }, number: 12, html_url: "https://x/p/12" },
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 7, "noodle.v1");
+    expect(pr).toBeNull();
+  });
+
+  it("still matches the exact slug when it contains regex metacharacters", async () => {
+    const { client } = makePrStub([
+      { head: { ref: "noodle.v1/issue-7" }, number: 13, html_url: "https://x/p/13" },
+    ]);
+    const pr = await client.findOpenPRForIssue("owner/repo", 7, "noodle.v1");
+    expect(pr).toEqual({ branch: "noodle.v1/issue-7", number: 13, html_url: "https://x/p/13" });
+  });
 });

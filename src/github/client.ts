@@ -213,7 +213,11 @@ export class GitHubClient {
     agentSlug: string,
   ): Promise<{ branch: string; number: number; html_url: string } | null> {
     const [owner, name] = parseRepo(repo);
-    const pattern = new RegExp(`^${agentSlug}/issue-${issueNumber}($|-)`);
+    // Escape regex metacharacters in the agent slug so a name like `noodle.v1`
+    // matches literally instead of treating the `.` as "any char". Same escape
+    // pattern as triggers/check.ts, commands/match.ts, profiles/resolve.ts.
+    const escapedSlug = agentSlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`^${escapedSlug}/issue-${issueNumber}($|-)`);
     // Paginate through all open PRs — repos with >100 open PRs would otherwise
     // miss a matching branch on the first page.
     for await (const response of this.octokit.paginate.iterator(this.octokit.rest.pulls.list, {
