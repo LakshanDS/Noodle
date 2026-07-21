@@ -92,9 +92,23 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
     //    for the per-model RPM interval; its returned api_key is IGNORED — the
     //    SDK already sent the correct auth header for its transport (Bearer for
     //    OpenAI/Mistral, x-goog-api-key for Google, x-api-key for Anthropic).
+    //
+    //    The same `rerate` closure is passed to the forwarder and awaited
+    //    before EACH 429-retry fetch, so every outbound request to the upstream
+    //    honors the RPM interval — not just the first. This is what stops a
+    //    retry loop from bursting past the limit during a 429 storm.
     const profiles = buildProfileMap(config);
+    const rerate = async (): Promise<void> => {
+      try {
+        await acquireSlot(profiles, model);
+      } catch {
+        // Model vanished from config mid-request — nothing useful to do; the
+        // forward will fail on its own merits. Swallow so the retry loop isn't
+        // broken by the rate-limiter.
+      }
+    };
     try {
-      await acquireSlot(profiles, model);
+      await rerate();
     } catch (e) {
       return reply.code(400).send({ error: (e as Error).message });
     }
@@ -131,7 +145,7 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
     //    profile's api protocol, including auth.
     try {
       if (isStreaming) {
-        const result = await forwardRequestStream(forwardUrl, forwardHeaders, raw);
+        const result = await forwardRequestStream(forwardUrl, forwardHeaders, raw, rerate);
         reply.raw.writeHead(result.status, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -143,7 +157,7 @@ export function createRelayServer(config: NoodleConfig, opts: RelayOptions = {})
         return;
       }
 
-      const result = await forwardRequest(forwardUrl, forwardHeaders, raw);
+      const result = await forwardRequest(forwardUrl, forwardHeaders, raw, rerate);
       if (result.status >= 400) {
         // Errors carry forwardUrl on purpose — it's the single fastest signal
         // for "the relay built the wrong upstream path". Per-request success
