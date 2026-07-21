@@ -31,7 +31,7 @@ import {
   requireAuth,
   verifyPassword,
 } from "./ui-auth.js";
-import { log, getRecentLogs } from "../util/log.js";
+import { log, getRecentLogs, subscribeLogs, type LogEntry } from "../util/log.js";
 
 /**
  * Register the web UI routes on an existing Fastify app: the HTML shell at
@@ -94,6 +94,14 @@ export interface UiDeps {
   originalUrls?: Map<string, string>;
   /** The relay origin (e.g. http://localhost:4445) for rewriting relay-enabled profiles. */
   relayOrigin?: string;
+  /**
+   * Trigger a graceful server restart (shutdown the process; docker-compose's
+   * `restart: unless-stopped` policy brings the container back). Wired in
+   * serve.ts via a holder object because `shutdown()` is defined AFTER
+   * registerUiRoutes is called — same closure pattern as `dispatch`. Optional
+   * so test harnesses can omit it; the route returns 503 when unset.
+   */
+  restart?: () => void;
 }
 
 /**
@@ -123,7 +131,7 @@ export function seedDefaultSettings(settingsStore: SettingStore): void {
 }
 
 export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
-  const { runStore, liveRuns, getSecret, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch } = deps;
+  const { runStore, liveRuns, getSecret, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch, restart } = deps;
 
   // PreHandler closure: verify the signed cookie before any protected route.
   // The secret is read per-request so password changes take effect without restart.
@@ -269,6 +277,62 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     return { entries: filtered };
   });
 
+  // SSE stream of live log entries. Backfills the current ring buffer on
+  // connect (so opening the page shows recent history immediately), then pushes
+  // each new line as it's logged — real-time `docker logs` in the browser,
+  // replacing the old 4s polling. Same pattern as /api/chats/:id/stream.
+  // Optional ?level= floor filters both the backfill and the live tail.
+  app.get("/api/logs/stream", { preHandler: auth }, async (req, reply) => {
+    const q = req.query as { level?: string };
+    const minLevel = LEVEL_ORDER[q.level?.toLowerCase() ?? ""] ?? 0;
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      // Disable proxy buffering (nginx etc.) so lines flush immediately.
+      "X-Accel-Buffering": "no",
+    });
+    // Browser reconnect guidance (ms) if the connection drops.
+    reply.raw.write("retry: 3000\n\n");
+
+    const writeFrame = (entry: LogEntry): void => {
+      try {
+        reply.raw.write(`data: ${JSON.stringify(entry)}\n\n`);
+      } catch {
+        // Client gone — the close handler tears down. Swallow so a dead socket
+        // doesn't crash the process from inside the emit callback.
+      }
+    };
+
+    // 1. Backfill: current buffer snapshot, oldest-first, level-filtered.
+    for (const entry of getRecentLogs()) {
+      if (minLevel > 0 && entry.level < minLevel) continue;
+      writeFrame(entry);
+    }
+
+    // 2. Live tail: every new entry from now on.
+    const unsubscribe = subscribeLogs((entry) => {
+      if (minLevel > 0 && entry.level < minLevel) return;
+      writeFrame(entry);
+    });
+
+    // Heartbeat — a comment line every 15s keeps idle proxies from dropping
+    // the connection. The client's SSE parser ignores comment frames.
+    const heartbeat = setInterval(() => {
+      try {
+        reply.raw.write(": heartbeat\n\n");
+      } catch { /* best-effort */ }
+    }, 15_000);
+
+    // Teardown on client disconnect: stop the heartbeat, unsubscribe from the
+    // log emitter so we don't leak a listener per disconnected tab.
+    req.raw.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  });
+
   // Download all persistent log files (current + rotated) as a single text
   // file. Streams oldest-first so the most recent entries are at the bottom.
   app.get("/api/logs/download", { preHandler: auth }, async (_req, reply) => {
@@ -301,6 +365,38 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     reply.header("Content-Type", "text/plain; charset=utf-8");
     reply.header("Content-Disposition", 'attachment; filename="noodle-logs.txt"');
     return reply.send(combined);
+  });
+
+  // --- Server control (restart). Auth-guarded like the other mutating routes. ---
+
+  /**
+   * In-flight job count + restart availability, for the Restart confirm dialog
+   * on the Logs page. Surfaces how many agent runs are mid-flight so the
+   * operator knows shutdown will wait for them (dispatcher.stop() is graceful).
+   */
+  app.get("/api/server/status", { preHandler: auth }, async () => ({
+    runningJobs: queue.countByStatus("running"),
+    canRestart: restart !== undefined,
+  }));
+
+  /**
+   * Graceful restart: acknowledge, then trigger shutdown on the next tick so the
+   * HTTP response flushes before process.exit(). Under docker-compose
+   * (`restart: unless-stopped`) the container comes back in ~2-4s; the client
+   * polls /health and reloads when it returns. In environments without a
+   * supervisor (bare `npm run dev`), the process stays down — the UI surfaces
+   * that via the 503 path so it's never a silent "stop" button.
+   */
+  app.post("/api/server/restart", { preHandler: auth }, async (_req, reply) => {
+    if (!restart) {
+      return reply.code(503).send({
+        error: "Restart is not available — the server has no restart handler wired (are you running outside docker-compose?).",
+      });
+    }
+    // Respond first, shut down after the response is on the wire. Without
+    // setImmediate the client can see a connection-reset instead of 200.
+    await reply.send({ ok: true });
+    setImmediate(() => restart());
   });
 
   // --- Cron job management (all auth-guarded). ---

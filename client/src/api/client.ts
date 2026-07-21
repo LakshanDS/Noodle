@@ -197,3 +197,80 @@ export function streamSSE(
     controller.abort();
   };
 }
+
+/**
+ * Open an UNBOUNDED SSE stream — the live log tail. Identical transport to
+ * `streamSSE` (fetch + ReadableStream, same-origin credentials) but with NO
+ * terminal frame: the System Log stream never sends `done`/`error`, so this
+ * just delivers every `data:` frame to `onEntry` until the caller cleans up.
+ *
+ * `onDone` fires only on a real error or disconnect (not on a server-sent
+ * terminal event), so the caller can re-open or update UI state. The built-in
+ * browser `retry:` (set by the server) does NOT apply here — we use fetch, not
+ * EventSource — so the caller owns reconnect logic if it wants auto-reconnect.
+ *
+ * Returns a cleanup function: aborts the fetch and stops the reader loop.
+ */
+export function streamLogs(
+  path: string,
+  onEntry: (entry: Record<string, unknown>) => void,
+  onDone?: () => void,
+): SSECleanup {
+  let active = true;
+  const controller = new AbortController();
+
+  void (async () => {
+    try {
+      const res = await fetch(path, {
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) {
+        onDone?.();
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (active) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse complete SSE frames (separated by a double newline). The last
+        // chunk is kept in the buffer as a possibly-incomplete frame.
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          if (!frame.trim()) continue;
+          // Comment frames (heartbeats) start with `:` — ignored.
+          if (frame.trimStart().startsWith(":")) continue;
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+            try {
+              onEntry(JSON.parse(raw) as Record<string, unknown>);
+            } catch {
+              // Non-JSON data line — ignore.
+            }
+          }
+        }
+      }
+      onDone?.();
+    } catch (e) {
+      // AbortController.abort() arrives here as AbortError — fire onDone so the
+      // caller can clean up UI state (e.g. pause toggle). Don't log aborts.
+      if ((e as Error).name !== "AbortError") {
+        console.error("[streamLogs]", (e as Error).message);
+      }
+      onDone?.();
+    }
+  })();
+
+  return () => {
+    active = false;
+    controller.abort();
+  };
+}

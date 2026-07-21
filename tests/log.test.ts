@@ -44,6 +44,7 @@ async function loadLogWithBuffer() {
     mod,
     output: () => chunks.join(""),
     getRecentLogs: mod.getRecentLogs,
+    subscribeLogs: mod.subscribeLogs,
     spy,
   };
 }
@@ -151,5 +152,65 @@ describe("runLogger", () => {
     const line = output().trim().split("\n").pop()!;
     expect(line).toContain("step=clone");
     expect(line).toContain("durationMs=42");
+  });
+});
+
+describe("subscribeLogs (live tail pub/sub)", () => {
+  it("delivers each logged line to a live subscriber", async () => {
+    process.env.LOG_LEVEL = "info";
+    const { mod, subscribeLogs } = await loadLogWithBuffer();
+    const received: string[] = [];
+    const unsub = subscribeLogs((entry) => received.push(entry.msg));
+
+    mod.log.info("live-1");
+    mod.log.info("live-2");
+
+    expect(received).toEqual(["live-1", "live-2"]);
+    unsub();
+  });
+
+  it("does NOT deliver lines logged before subscribing (snapshot vs live)", async () => {
+    process.env.LOG_LEVEL = "info";
+    const { mod, subscribeLogs, getRecentLogs } = await loadLogWithBuffer();
+    mod.log.info("before-subscribe");
+
+    const received: string[] = [];
+    const unsub = subscribeLogs((entry) => received.push(entry.msg));
+    mod.log.info("after-subscribe");
+
+    // The live stream only sees post-subscribe lines; history is via
+    // getRecentLogs (the SSE route backfills from there on connect).
+    expect(received).toEqual(["after-subscribe"]);
+    expect(getRecentLogs().map((e) => e.msg)).toContain("before-subscribe");
+    unsub();
+  });
+
+  it("stops delivery after the unsubscribe function is called", async () => {
+    process.env.LOG_LEVEL = "info";
+    const { mod, subscribeLogs } = await loadLogWithBuffer();
+    const received: string[] = [];
+    const unsub = subscribeLogs((entry) => received.push(entry.msg));
+
+    mod.log.info("before-unsub");
+    unsub();
+    mod.log.info("after-unsub");
+
+    expect(received).toEqual(["before-unsub"]);
+  });
+
+  it("supports multiple concurrent subscribers independently", async () => {
+    process.env.LOG_LEVEL = "info";
+    const { mod, subscribeLogs } = await loadLogWithBuffer();
+    const a: string[] = [];
+    const b: string[] = [];
+    const unsubA = subscribeLogs((e) => a.push(e.msg));
+    const unsubB = subscribeLogs((e) => b.push(e.msg));
+
+    mod.log.info("multi");
+
+    expect(a).toEqual(["multi"]);
+    expect(b).toEqual(["multi"]);
+    unsubA();
+    unsubB();
   });
 });

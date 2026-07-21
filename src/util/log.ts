@@ -1,5 +1,6 @@
 import pino from "pino";
 import { Writable } from "node:stream";
+import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync, existsSync, statSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
@@ -68,6 +69,22 @@ export interface LogEntry {
  */
 const LOG_BUFFER_MAX = 1000;
 const logBuffer: LogEntry[] = [];
+
+/**
+ * Pub/sub for live log delivery (the System Log page's SSE stream subscribes
+ * here). Emitted on every line teed into `logBuffer` — same entries the ring
+ * buffer holds, just pushed to active subscribers in real time. The chat SSE
+ * route uses the same EventEmitter pattern (chatRuntime.events(id)).
+ *
+ * Kept separate from the buffer so `getRecentLogs` (snapshot) and
+ * `subscribeLogs` (live tail) are independent: a subscriber only sees lines
+ * emitted AFTER it subscribes, so the SSE route backfills from the buffer on
+ * connect and then switches to the live emit for the tail.
+ */
+const logEmitter = new EventEmitter();
+// A busy run can burst many lines; avoid MaxListenersExceededWarning for the
+// (rare) case of several dashboard tabs open at once.
+logEmitter.setMaxListeners(50);
 
 // --- Persistent log file with rotation ---
 // Every log line is appended to <logDir>/noodle.log. When it exceeds
@@ -160,6 +177,17 @@ export function getRecentLogs(limit?: number): LogEntry[] {
 }
 
 /**
+ * Subscribe to live log entries. `fn` is called for every line teed into the
+ * ring buffer from now on (not historical — call `getRecentLogs` for that).
+ * Returns an unsubscribe function. Used by the System Log SSE route so it can
+ * push new lines to the browser the moment they're logged.
+ */
+export function subscribeLogs(fn: (entry: LogEntry) => void): () => void {
+  logEmitter.on("entry", fn);
+  return () => logEmitter.off("entry", fn);
+}
+
+/**
  * Render one parsed pino record to the pretty stdout line AND tee it into the
  * ring buffer. Returns the formatted string (without trailing newline) so the
  * caller can batch stdout writes when multiple records arrive in one chunk.
@@ -218,6 +246,10 @@ const prettyStdout = new Writable({
       out.push(pretty);
       // Tee into the ring buffer for the dashboard's System log tab.
       logBuffer.push(entry);
+      // Notify live subscribers (the System Log SSE stream). Emit per-line so a
+      // burst of N lines in one write() reaches the browser as N frames, matching
+      // how they appear in `docker logs`.
+      logEmitter.emit("entry", entry);
       // Append to the persistent log file (with rotation).
       writeToFile(pretty);
     }
