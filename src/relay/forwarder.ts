@@ -20,6 +20,15 @@ import { log } from "../util/log.js";
  * header — Bearer for OpenAI/Mistral, x-goog-api-key for Google, x-api-key for
  * Anthropic) and never re-serializes the body. This keeps the relay a true
  * transparent proxy across all transports.
+ *
+ * ## Rate-limit spacing applies to EVERY request, including retries
+ *
+ * The earlier loop re-fetched on 429 without re-acquiring a rate-limit slot, so
+ * during a storm one logical turn became up to 6 real requests to the upstream
+ * with NO RPM spacing — which reads as abuse to a shared free tier and keeps
+ * the penalty box alive. Now each retry fetch is preceded by `await rerate()`
+ * (the same `acquireSlot` path the initial request took), so 30 RPM → every
+ * single outbound fetch is ≥ the interval after the previous one, retry or not.
  */
 
 const RETRY_429_DELAYS_MS = [5_000, 10_000, 20_000, 40_000, 60_000];
@@ -29,6 +38,9 @@ export interface ForwardResult {
   headers: Record<string, string>;
   body: unknown;
 }
+
+/** No-op rerate callback: used when the relay isn't rate-limiting (unlimited RPM). */
+const noopRerate = async (): Promise<void> => {};
 
 /** Collect response headers into a plain object. */
 function collectHeaders(response: Response): Record<string, string> {
@@ -70,11 +82,15 @@ function sleep(ms: number): Promise<void> {
  * Forward a non-streaming request. Retries on 429 (up to 5 times with backoff)
  * so the agent never sees transient platform rate-limiting. Other errors pass
  * straight through. Headers + body are the SDK's originals, forwarded verbatim.
+ *
+ * `rerate` (when provided) is awaited before EACH retry fetch, so retries stay
+ * RPM-compliant — no unsynchronized bursts during a 429 storm.
  */
 export async function forwardRequest(
   url: string,
   headers: Record<string, string>,
   rawBody: string,
+  rerate: () => Promise<void> = noopRerate,
 ): Promise<ForwardResult> {
 
   for (let attempt = 0; attempt <= RETRY_429_DELAYS_MS.length; attempt++) {
@@ -87,6 +103,10 @@ export async function forwardRequest(
 
     if (response.status === 429 && attempt < RETRY_429_DELAYS_MS.length) {
       await waitFor429Retry(respHeaders, attempt);
+      // Re-space before the retry fetch so every outbound request honors the
+      // RPM interval — not just the first one. This is what stops a retry loop
+      // from looking like a burst to a shared free-tier upstream.
+      await rerate();
       continue;
     }
 
@@ -95,6 +115,8 @@ export async function forwardRequest(
   }
 
   // Exhausted all 429 retries — return the last 429 so the agent can react.
+  // Final fetch is also RPM-spaced for consistency.
+  await rerate();
   const response = await fetch(url, {
     method: "POST",
     headers,
@@ -110,11 +132,15 @@ export async function forwardRequest(
  * BEFORE opening the SSE pipe — once streaming starts we can't retry without
  * sending partial output. Other errors throw. Headers + body are the SDK's
  * originals, forwarded verbatim.
+ *
+ * `rerate` (when provided) is awaited before EACH retry fetch, so retries stay
+ * RPM-compliant — see forwardRequest for rationale.
  */
 export async function forwardRequestStream(
   url: string,
   headers: Record<string, string>,
   rawBody: string,
+  rerate: () => Promise<void> = noopRerate,
 ): Promise<{ status: number; headers: Record<string, string>; stream: ReadableStream }> {
 
   for (let attempt = 0; attempt <= RETRY_429_DELAYS_MS.length; attempt++) {
@@ -128,6 +154,7 @@ export async function forwardRequestStream(
       const respHeaders = collectHeaders(response);
       await response.body?.cancel().catch(() => {});
       await waitFor429Retry(respHeaders, attempt);
+      await rerate();
       continue;
     }
 
@@ -139,7 +166,9 @@ export async function forwardRequestStream(
     return { status: response.status, headers: respHeaders, stream: response.body };
   }
 
-  // Exhausted all 429 retries — throw so the agent sees the error.
+  // Exhausted all 429 retries — throw so the agent sees the error. Final fetch
+  // is also RPM-spaced for consistency.
+  await rerate();
   const response = await fetch(url, {
     method: "POST",
     headers,

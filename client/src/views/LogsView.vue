@@ -1,29 +1,30 @@
 <script setup lang="ts">
 /**
- * System log — a live, auto-refreshing view of the server's in-memory log ring
- * buffer (GET /api/logs). This mirrors what `docker logs` shows for Noodle's own
- * output. Entries arrive oldest-first; newest lines appear at the bottom.
- * The viewport auto-scrolls down as new entries arrive.
+ * System log — a live SSE view of the server's in-memory log ring buffer
+ * (GET /api/logs/stream). This mirrors what `docker logs` shows for Noodle's
+ * own output, in real time: the stream backfills the current buffer on connect
+ * (so opening the page shows recent history immediately), then pushes each new
+ * line as it's logged. Replaces the old 4s polling.
  *
- * The buffer is per-boot and bounded, so this shows recent history (not the
- * full container lifetime) — same as `docker logs --since` on a fresh process.
+ * The buffer is per-boot and bounded (last 1000 lines), so this shows recent
+ * history (not the full container lifetime) — same as `docker logs --since` on
+ * a fresh process.
  */
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import { getJson, ApiRequestError, isAuthError } from "../api/client.js";
-import type { LogsResponse, LogEntry } from "../api/types.js";
+import { getJson, sendJson, streamLogs, type SSECleanup } from "../api/client.js";
+import type { LogEntry } from "../api/types.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
+import ConfirmDialog from "../components/ui/ConfirmDialog.vue";
 import Icon from "../components/ui/Icon.vue";
 import Select from "../components/ui/Select.vue";
 import type { SelectOption } from "../components/ui/Select.vue";
 
-const POLL_MS = 4000;
+/** Cap on client-held entries — mirrors the server ring buffer bound. */
+const MAX_ENTRIES = 1000;
 
 const entries = ref<LogEntry[]>([]);
-const loading = ref(false);
-const loadError = ref("");
 const levelFilter = ref<"all" | "debug" | "info" | "warn" | "error">("info");
-const autoRefresh = ref(true);
 const streamEl = ref<HTMLElement | null>(null);
 
 const levelOptions: SelectOption[] = [
@@ -33,21 +34,21 @@ const levelOptions: SelectOption[] = [
   { value: "warn", label: "Warn+" },
   { value: "error", label: "Error+" },
 ];
-let timer: ReturnType<typeof setInterval> | null = null;
 
-/** Numeric floor for the selected level filter (matches the server's ?level=). */
-const LEVEL_FLOOR: Record<typeof levelFilter.value, number> = {
-  all: 0,
-  debug: 20,
-  info: 30,
-  warn: 40,
-  error: 50,
-};
+/** Active SSE cleanup fn, or null when the stream is closed. */
+let cleanup: SSECleanup | null = null;
 
-const filtered = computed(() => {
-  const floor = LEVEL_FLOOR[levelFilter.value];
-  return floor === 0 ? entries.value : entries.value.filter((e) => e.level >= floor);
-});
+/**
+ * True when the viewport is pinned to the bottom (user is reading the tail).
+ * Used to gate auto-scroll: if the user scrolled up to read history, incoming
+ * lines must NOT yank them back down.
+ */
+function isAtBottom(): boolean {
+  const el = streamEl.value;
+  if (!el) return true;
+  // Within ~40px of the bottom counts as "following the tail".
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+}
 
 function scrollToBottom(): void {
   nextTick(() => {
@@ -56,33 +57,40 @@ function scrollToBottom(): void {
   });
 }
 
-async function load(): Promise<void> {
-  loading.value = true;
-  loadError.value = "";
-  try {
-    const body = await getJson<LogsResponse>(`/api/logs?limit=500`);
-    entries.value = body.entries ?? [];
-    scrollToBottom();
-  } catch (e) {
-    if (isAuthError(e)) return;
-    loadError.value = e instanceof ApiRequestError ? e.message : "Could not load logs.";
-  } finally {
-    loading.value = false;
+/** Stream event handler: append a log entry, cap the buffer, follow the tail. */
+function onEntry(data: Record<string, unknown>): void {
+  const entry = data as unknown as LogEntry;
+  // Follow-the-tail: only auto-scroll if the user is already at the bottom.
+  const wasAtBottom = isAtBottom();
+  entries.value.push(entry);
+  if (entries.value.length > MAX_ENTRIES) {
+    entries.value.splice(0, entries.value.length - MAX_ENTRIES);
+  }
+  if (wasAtBottom) scrollToBottom();
+}
+
+/** Open the SSE stream with the current level filter. Closes any open one first. */
+function openStream(): void {
+  closeStream();
+  // Reset entries — the stream backfills the (filtered) buffer fresh.
+  entries.value = [];
+  cleanup = streamLogs(`/api/logs/stream?level=${levelFilter.value}`, onEntry);
+  // After the backfill frames arrive, pin to the bottom. nextTick isn't enough
+  // (frames arrive async); a short delay lets the initial burst render. The
+  // follow-the-tail logic handles subsequent live lines.
+  setTimeout(scrollToBottom, 50);
+}
+
+function closeStream(): void {
+  if (cleanup) {
+    cleanup();
+    cleanup = null;
   }
 }
 
-function startPolling(): void {
-  stopPolling();
-  timer = setInterval(load, POLL_MS);
-}
-function stopPolling(): void {
-  if (timer) clearInterval(timer);
-  timer = null;
-}
-function toggleAuto(): void {
-  autoRefresh.value = !autoRefresh.value;
-  if (autoRefresh.value) startPolling();
-  else stopPolling();
+/** Level filter changed — reopen the stream so the server re-backfills filtered. */
+function onLevelChange(): void {
+  openStream();
 }
 
 /** CSS color var for a level, for the level label chip. */
@@ -104,11 +112,95 @@ function downloadLogs(): void {
   document.body.removeChild(a);
 }
 
-onMounted(async () => {
-  await load();
-  if (autoRefresh.value) startPolling();
+// --- Restart server ---
+//
+// Triggers a graceful shutdown (serve.ts:shutdown). Under docker-compose
+// (`restart: unless-stopped`) the container comes back in a few seconds; we
+// poll /health and reload when it returns. In bare-process environments the
+// endpoint returns 503 and we surface that — the button must never be a silent
+// "stop" button.
+const showRestartConfirm = ref(false);
+const restarting = ref(false);
+const restartError = ref<string | null>(null);
+/** In-flight agent runs at dialog-open time, surfaced in the confirm message. */
+const inFlightJobs = ref(0);
+
+/** Open the confirm dialog, pre-fetching the in-flight run count for the message. */
+async function openRestartConfirm(): Promise<void> {
+  restartError.value = null;
+  inFlightJobs.value = 0;
+  try {
+    const status = await getJson<{ runningJobs: number; canRestart: boolean }>("/api/server/status");
+    inFlightJobs.value = status.runningJobs;
+    if (!status.canRestart) {
+      restartError.value = "Restart is not available — the server has no restart handler (running outside docker-compose?).";
+    }
+  } catch {
+    // Non-fatal — the dialog still opens; the count just won't be shown.
+  }
+  showRestartConfirm.value = true;
+}
+
+/**
+ * Confirm: POST the restart, then poll /health until the server comes back
+ * (or 30s elapse). On success, reload the page so the fresh process's stream
+ * reconnects. The server's shutdown is graceful — dispatcher.stop() waits for
+ * in-flight runs, so the actual bounce may lag by minutes if jobs are running.
+ */
+async function confirmRestart(): Promise<void> {
+  restarting.value = true;
+  restartError.value = null;
+  try {
+    await sendJson("/api/server/restart", "POST");
+  } catch (e) {
+    restarting.value = false;
+    restartError.value = e instanceof Error ? e.message : "Failed to send restart request.";
+    return;
+  }
+  // Give the server a beat to begin shutting down before we start polling.
+  await new Promise((r) => setTimeout(r, 800));
+  const deadline = Date.now() + 30_000;
+  const poll = async (): Promise<void> => {
+    if (Date.now() > deadline) {
+      restarting.value = false;
+      restartError.value = "Server didn't come back within 30s — it may still be finishing in-flight runs. Reload manually.";
+      return;
+    }
+    try {
+      const res = await fetch("/health", { credentials: "same-origin" });
+      if (res.ok) {
+        window.location.reload();
+        return;
+      }
+    } catch {
+      // Expected while the server is down — keep polling.
+    }
+    setTimeout(poll, 500);
+  };
+  void poll();
+}
+
+/**
+ * The dialog body. When restarting, switches to a "waiting for it to come back"
+ * line since the message prop is also the only place to surface post-confirm
+ * state (the dialog stays open with loading=true until reload/timeout).
+ */
+const restartMessage = computed<string>(() => {
+  if (restartError.value) return restartError.value;
+  if (restarting.value) {
+    return "Waiting for the server to come back up… the page will reload automatically. If runs are in flight, shutdown waits for them, so this can take a while.";
+  }
+  const inFlight = inFlightJobs.value;
+  if (inFlight > 0) {
+    return `Gracefully stops the server and lets docker-compose bring it back. ${inFlight} agent ${inFlight === 1 ? "run is" : "runs are"} in flight and will be allowed to finish before shutdown — the bounce can take a while.`;
+  }
+  return "Gracefully stops the server and lets docker-compose bring it back up. The page will reload automatically.";
 });
-onUnmounted(stopPolling);
+
+onMounted(() => {
+  openStream();
+});
+onUnmounted(closeStream);
 </script>
 
 <template>
@@ -119,37 +211,30 @@ onUnmounted(stopPolling);
         :options="levelOptions"
         size="sm"
         class="level-select"
+        @update:model-value="onLevelChange"
       />
-      <Button
-        variant="ghost"
-        size="sm"
-        class="live-toggle"
-        :icon="autoRefresh ? 'pause' : 'play'"
-        :title="autoRefresh ? 'Pause live stream' : 'Resume live stream'"
-        :aria-label="autoRefresh ? 'Pause live stream' : 'Resume live stream'"
-        @click="toggleAuto"
-      />
-      <Button variant="ghost" size="sm" icon="refresh" :loading="loading" title="Refresh" @click="load">
-        <span class="btn-label">Refresh</span>
-      </Button>
       <Button variant="ghost" size="sm" icon="download" title="Download logs" @click="downloadLogs">
         <span class="btn-label">Download</span>
       </Button>
+      <Button
+        variant="danger"
+        size="sm"
+        icon="refresh"
+        title="Restart server"
+        :disabled="restarting"
+        @click="openRestartConfirm"
+      >
+        <span class="btn-label">Restart</span>
+      </Button>
     </template>
 
-    <div v-if="loadError" class="banner err">{{ loadError }}</div>
-
-    <div v-if="loading && entries.length === 0" class="loading-row">
-      Loading logs…
-    </div>
-
-    <div v-else-if="filtered.length === 0" class="empty">
+    <div v-if="entries.length === 0" class="empty">
       <Icon name="cron" :size="22" />
-      <p>{{ entries.length === 0 ? "No logs yet — the server just started." : "No entries at this level." }}</p>
+      <p>No logs yet — the server just started.</p>
     </div>
 
     <div v-else class="log-stream" ref="streamEl">
-      <div v-for="(e, i) in filtered" :key="i" class="log-line">
+      <div v-for="(e, i) in entries" :key="i" class="log-line">
         <span class="ts">{{ e.ts }}</span>
         <span class="lvl" :style="{ color: levelColor(e.level) }">{{ e.levelLabel }}</span>
         <span class="msg">{{ e.msg }}</span>
@@ -162,27 +247,24 @@ onUnmounted(stopPolling);
     </div>
 
     <p class="foot-note">
-      In-memory buffer (last 1000 lines), cleared on restart. Same output as
-      <code>docker logs</code>.
+      Live stream of the in-memory buffer (last 1000 lines), cleared on restart.
+      Same output as <code>docker logs</code>.
     </p>
+
+    <ConfirmDialog
+      v-model:open="showRestartConfirm"
+      title="Restart the server?"
+      :message="restartMessage"
+      confirm-label="Restart"
+      icon="refresh"
+      danger
+      :loading="restarting"
+      @confirm="confirmRestart"
+    />
   </AppShell>
 </template>
 
 <style scoped>
-.banner {
-  padding: var(--space-3) var(--space-4);
-  border-radius: var(--radius-md);
-  font-size: var(--text-sm);
-  margin-bottom: var(--space-4);
-  background: var(--danger-weak);
-  color: var(--danger);
-}
-.loading-row {
-  padding: var(--space-12);
-  text-align: center;
-  color: var(--text-3);
-  font-size: var(--text-sm);
-}
 .empty {
   padding: var(--space-12);
   text-align: center;
@@ -276,9 +358,6 @@ onUnmounted(stopPolling);
 }
 
 @media (max-width: 768px) {
-  .live-toggle {
-    display: none;
-  }
   .log-stream {
     height: calc(100dvh - 180px);
   }

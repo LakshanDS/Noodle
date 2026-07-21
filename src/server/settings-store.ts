@@ -81,7 +81,7 @@ export const SETTING_CATALOG: readonly SettingMeta[] = [
   { key: "queue_max_attempts", label: "Queue max attempts", restartRequired: false, secret: false, hint: "Total attempts per job (1 = no retry). Applies to the next job failure — no restart needed." },
   { key: "queue_retry_backoff_seconds", label: "Queue retry backoff (s)", restartRequired: false, secret: false, hint: "Base backoff seconds; doubles each attempt, capped at 10 min. Applies on the next failure — no restart needed." },
   // --- Run timeouts ---
-  { key: "run_stall_timeout_minutes", label: "Stall timeout (min)", restartRequired: false, secret: false, hint: "Abort after N minutes of silence while no tool is running. 0 = off." },
+  { key: "run_stall_timeout_minutes", label: "Stall timeout (min)", restartRequired: false, secret: false, hint: "Abort after N minutes of silence while no tool is running, OR after N consecutive minutes of sustained upstream rate-limiting (429s). 0 = off." },
   { key: "run_tool_stall_minutes", label: "Tool stall timeout (min)", restartRequired: false, secret: false, hint: "Abort after N minutes of silence while a tool IS running. 0 = off." },
   // --- LLM API keys live on profiles now (api_key field), not here. ---
 ] as const;

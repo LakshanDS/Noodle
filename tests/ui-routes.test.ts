@@ -9,6 +9,7 @@ import { SchedulerStore } from "../src/server/scheduler-store.js";
 import { CommandStore } from "../src/server/command-store.js";
 import { SettingStore } from "../src/server/settings-store.js";
 import { ProfileStore } from "../src/server/profile-store.js";
+import { LiveRunRegistry } from "../src/engine/live-runs.js";
 import { registerUiRoutes } from "../src/server/ui-routes.js";
 import { createWebhookApp } from "../src/server/http.js";
 import { signToken } from "../src/server/ui-auth.js";
@@ -61,8 +62,9 @@ function makeApp() {
     commandStore,
     settingsStore,
     profileStore: ProfileStore.fromDb(db),
+    liveRuns: new LiveRunRegistry(),
     // Stubs for deps not exercised by these tests:
-    queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
+    queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null, countByStatus: () => 0 } as never,
     authProvider: {} as never,
     agentName: "TestBot",
     config: { profiles: {}, default_profile: "x" } as never,
@@ -84,7 +86,7 @@ function makeWebhookAppWithUi() {
     cronStore,
     commandStore,
     settingsStore,
-    queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null } as never,
+    queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null, countByStatus: () => 0 } as never,
     authProvider: {} as never,
     agentName: "TestBot",
     config: { profiles: {}, default_profile: "x" } as never,
@@ -333,3 +335,127 @@ describe("UI routes — real webhook-app mounting (string body parser)", () => {
     }
   });
 });
+
+/**
+ * Server control routes — the Restart button on the Logs page.
+ *
+ * POST /api/server/restart triggers a graceful shutdown (serve.ts:shutdown),
+ * which under docker-compose brings the container back via the restart policy.
+ * GET /api/server/status reports the in-flight run count for the confirm
+ * dialog. Both are auth-guarded; restart returns 503 when no handler is wired
+ * (bare-process environments where exit would just stop the server).
+ */
+describe("UI routes — server restart", () => {
+  it("GET /api/server/status returns 401 without a cookie", async () => {
+    const app = await makeApp();
+    try {
+      const res = await app.inject({ method: "GET", url: "/api/server/status" });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/server/status reports runningJobs and canRestart=false by default", async () => {
+    const app = await makeApp();
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/server/status",
+        headers: { cookie: authCookie() },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body).toEqual({ runningJobs: 0, canRestart: false });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("POST /api/server/restart returns 401 without a cookie", async () => {
+    const app = await makeApp();
+    try {
+      const res = await app.inject({ method: "POST", url: "/api/server/restart" });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("POST /api/server/restart returns 503 when no restart handler is wired", async () => {
+    // makeApp() passes no `restart` fn — the endpoint must refuse rather than
+    // silently exit the process. This is the bare-process safety path.
+    const app = await makeApp();
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/server/restart",
+        headers: { cookie: authCookie() },
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).error).toMatch(/not available/i);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("POST /api/server/restart returns 200 and invokes the wired restart fn", async () => {
+    // Wire a real restart fn — assert it gets called exactly once, and that the
+    // response is 200 + {ok:true}. The fn is deferred via setImmediate so the
+    // response flushes first; we await a microtask tick to let it fire.
+    let calls = 0;
+    const app = Fastify({ logger: false });
+    registerUiRoutes(app, {
+      runStore: store,
+      getSecret: () => PASSWORD,
+      settingsStore,
+      queue: { countByStatus: () => 0 } as never,
+      authProvider: {} as never,
+      config: { profiles: {}, default_profile: "x" } as never,
+      restart: () => { calls++; },
+    });
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/server/restart",
+        headers: { cookie: authCookie() },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+      // setImmediate schedules the restart on the next macrotask; inject()
+      // resolves synchronously after sending the response, so we must yield
+      // the macrotask queue before asserting the deferred fn ran.
+      await new Promise((r) => setImmediate(r));
+      expect(calls).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("GET /api/server/status surfaces the live running-job count", async () => {
+    // Override the queue stub to return a non-zero count — verifies the route
+    // passes through queue.countByStatus('running') rather than hardcoding.
+    const app = Fastify({ logger: false });
+    registerUiRoutes(app, {
+      runStore: store,
+      getSecret: () => PASSWORD,
+      settingsStore,
+      queue: { countByStatus: (s: string) => (s === "running" ? 3 : 0) } as never,
+      authProvider: {} as never,
+      config: { profiles: {}, default_profile: "x" } as never,
+      restart: () => {},
+    });
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/server/status",
+        headers: { cookie: authCookie() },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ runningJobs: 3, canRestart: true });
+    } finally {
+      await app.close();
+    }
+  });
+});
+

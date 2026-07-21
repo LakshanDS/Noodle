@@ -205,9 +205,12 @@ export class ChatRuntime {
     // from the settings store), so settings changes take effect on next boot.
     const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
     const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+    // Rate-limit stall budget shares the idle value (see background-run.ts).
+    const rateLimitMs = idleMs;
     const watcher = new StallWatcher(session, {
       idleTimeoutMs: idleMs,
       toolTimeoutMs: toolMs,
+      rateLimitTimeoutMs: rateLimitMs,
     });
     const unsubStall = watcher.attach();
 

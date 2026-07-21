@@ -339,7 +339,17 @@ export async function runBackgroundJob(
           log_.warn({ err: (e as Error).message }, "failed to expand system prompt tags — using sysInfo only");
         }
       }
-      const prompt = buildBackgroundPrompt(input, config.agent_name, fullSysInfo);
+      // Expand {pr}, {issue}, {system}, etc. tags in the freeform task prompt
+      // too — the operator writes them in the schedule/trigger task exactly
+      // like in the system prompt. Falls back to the raw prompt on any failure
+      // so a transient GitHub API error can't block the run.
+      let taskPrompt = input.prompt;
+      try {
+        taskPrompt = await expandTags(input.prompt, { sysFacts, gh, repo: input.repo });
+      } catch (e) {
+        log_.warn({ err: (e as Error).message }, "failed to expand task prompt tags — using raw task");
+      }
+      const prompt = buildBackgroundPrompt({ ...input, prompt: taskPrompt }, config.agent_name, fullSysInfo);
       const throttle = throttleForRpm(profile.api_rpm);
       const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
       const loader = new DefaultResourceLoader({
@@ -357,6 +367,11 @@ export async function runBackgroundJob(
       const create = deps?.createAgentSessionFn ?? createAgentSession;
       const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
       const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+      // The rate-limit stall budget shares the idle (stall_timeout_minutes)
+      // value: it's the same notion of "no real progress for this long → abort."
+      // See StallWatcher for why the rate-limit budget is a separate mechanism
+      // from the idle budget despite sharing the same duration.
+      const rateLimitMs = idleMs;
       const sessionCreateOpts = {
         cwd: ws.path,
         model,
@@ -371,7 +386,7 @@ export async function runBackgroundJob(
       const bootSession = async (sessionManager: SessionManager) => {
         const { session } = await create({ ...sessionCreateOpts, sessionManager });
         subscribeForLogging(session, log_);
-        const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
+        const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs, rateLimitTimeoutMs: rateLimitMs });
         const unsubStall = watcher.attach();
         // Register the live session so the cancel endpoint can abort it.
         // Updated on every restart so the registry always holds the current one.
@@ -379,7 +394,7 @@ export async function runBackgroundJob(
         return { session, sessionManager, watcher, unsubStall };
       };
 
-      log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" }, "starting background run");
+      log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off", rateLimitTimeoutMs: rateLimitMs || "off" }, "starting background run");
       const startedAt = Date.now();
 
       let currentManager = SessionManager.create(ws.path, sessionDir);
@@ -399,10 +414,13 @@ export async function runBackgroundJob(
           watcher.dispose();
           unsubStall?.();
           if (watcher.didStall) {
-            throw new StallTimeoutError(
-              (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
-              watcher.activeBudget,
-            );
+            // A stall is fatal to the whole run — throw out of the restart loop.
+            // The queue treats StallTimeoutError as non-retryable, so the job
+            // dies instead of looping. Use the tripped budget for an accurate
+            // duration/label (rateLimit measures consecutive 429 time, not idle).
+            const budget = watcher.trippedBudget ?? watcher.activeBudget;
+            const stalledForMs = budget === "tool" ? toolMs : budget === "rateLimit" ? rateLimitMs : idleMs;
+            throw new StallTimeoutError(stalledForMs || 0, budget);
           }
           promptError = e;
         }
@@ -442,10 +460,18 @@ export async function runBackgroundJob(
           break;
         }
 
+        // If the agent completed new turns before failing, it MIGHT have made
+        // real progress — reset the restart counter so a run that's actively
+        // working always gets 3 fresh restarts. BUT pi also counts 429-failed
+        // (error-stopped) turns in assistantMessages, which are NOT real
+        // progress: they're just "we tried, got 429'd, stopped." Without this
+        // guard a sustained 429 storm resets the budget every cycle and loops
+        // until the hard cap. Only reset when the last turn was NOT an error.
         const turnsAfter = session.getSessionStats?.()?.assistantMessages ?? 0;
-        if (turnsAfter > turnsBefore) {
+        const lastWasError = lastAssistantStopReason(session).stopReason === "error";
+        if (turnsAfter > turnsBefore && !lastWasError) {
           log_.info({ turnsBefore, turnsAfter }, "agent made progress before failure — resetting restart budget");
-          attempt = -1;
+          attempt = -1; // loop increments to 0 → 3 fresh attempts
         }
 
         if (attempt >= SESSION_RESTART_ATTEMPTS) break;
@@ -760,6 +786,7 @@ async function runConflictResolver(
   const sessionDir = sessionsDirFor(`resolver-${Date.now()}`);
   const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
   const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+  const rateLimitMs = idleMs;
   const sessionCreateOpts = {
     cwd: ws.path,
     model,
@@ -774,7 +801,7 @@ async function runConflictResolver(
   const bootSession = async (sessionManager: SessionManager) => {
     const { session } = await create({ ...sessionCreateOpts, sessionManager });
     subscribeForLogging(session, log_);
-    const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
+    const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs, rateLimitTimeoutMs: rateLimitMs });
     const unsubStall = watcher.attach();
     return { session, sessionManager, watcher, unsubStall };
   };

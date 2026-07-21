@@ -531,6 +531,8 @@ export async function runJob(
     const create = deps?.createAgentSessionFn ?? createAgentSession;
     const idleMs = (config.run?.stall_timeout_minutes ?? 0) * 60_000;
     const toolMs = (config.run?.tool_stall_minutes ?? 0) * 60_000;
+    // Rate-limit stall budget shares the idle value (see background-run.ts).
+    const rateLimitMs = idleMs;
     const sessionCreateOpts = {
       cwd: ws.path,
       model,
@@ -552,7 +554,7 @@ export async function runJob(
     const bootSession = async (sessionManager: SessionManager) => {
       const { session } = await create({ ...sessionCreateOpts, sessionManager });
       subscribeForLogging(session, log_);
-      const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs });
+      const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs, rateLimitTimeoutMs: rateLimitMs });
       const unsubStall = watcher.attach();
       // Register the live session so the cancel endpoint can abort it. Updated
       // on every restart so the registry always holds the current session.
@@ -561,7 +563,7 @@ export async function runJob(
     };
 
     log_.info(
-      { idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off" },
+      { idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off", rateLimitTimeoutMs: rateLimitMs || "off" },
       "starting agent run",
     );
     const startedAt = Date.now();
@@ -585,11 +587,12 @@ export async function runJob(
         unsubStall?.();
         // Translate the abort-into-reject of a stalled run into a typed error so
         // the queue can skip retrying it (a stall won't recover on its own).
+        // Use the tripped budget for an accurate duration/label (rateLimit
+        // measures consecutive 429 time, not idle time).
         if (watcher.didStall) {
-          throw new StallTimeoutError(
-            (watcher.activeBudget === "tool" ? toolMs : idleMs) || 0,
-            watcher.activeBudget,
-          );
+          const budget = watcher.trippedBudget ?? watcher.activeBudget;
+          const stalledForMs = budget === "tool" ? toolMs : budget === "rateLimit" ? rateLimitMs : idleMs;
+          throw new StallTimeoutError(stalledForMs || 0, budget);
         }
         promptError = e;
       }
@@ -636,11 +639,16 @@ export async function runJob(
         break;
       }
 
-      // If the agent completed new turns before failing, it made real progress.
-      // Reset the restart counter so a run that's actively working always gets
-      // 3 fresh restarts — instead of burning its budget on one bad stretch.
+      // If the agent completed new turns before failing, it MIGHT have made
+      // real progress — reset the restart counter so a run that's actively
+      // working always gets 3 fresh restarts. BUT pi also counts 429-failed
+      // (error-stopped) turns in assistantMessages, which are NOT real progress:
+      // they're just "we tried, got 429'd, stopped." Without this guard a
+      // sustained 429 storm resets the budget every cycle and loops until the
+      // hard cap. Only reset when the last turn was NOT an error.
       const turnsAfter = session.getSessionStats?.()?.assistantMessages ?? 0;
-      if (turnsAfter > turnsBefore) {
+      const lastWasError = lastAssistantStopReason(session).stopReason === "error";
+      if (turnsAfter > turnsBefore && !lastWasError) {
         log_.info({ turnsBefore, turnsAfter }, "agent made progress before failure — resetting restart budget");
         attempt = -1; // loop increments to 0 → 3 fresh attempts
       }

@@ -36,6 +36,22 @@ export default defineConfig({
         // with NOODLE_DEV_PROXY if you serve on a different port.
         target: process.env.NOODLE_DEV_PROXY ?? "http://localhost:3000",
         changeOrigin: true,
+        // SSE-safe proxying. Without this, the underlying http-proxy applies a
+        // default proxyTimeout and Node ends idle pooled sockets on long-lived
+        // responses — which kills the run/chat/log SSE streams with
+        // "socket hang up" at socketOnEnd. proxyTimeout:0 disables the proxy's
+        // own inbound timeout, and the configure hook clears the timeout on
+        // each proxied request so the upstream socket isn't reaped while the
+        // stream is open. Production doesn't proxy (the server serves these
+        // endpoints directly), so this only affects `npm run dev:client`.
+        proxyTimeout: 0,
+        configure: (proxy) => {
+          proxy.on("proxyReq", (proxyReq) => {
+            // 0 = no idle timeout. Keeps the upstream socket alive for the
+            // lifetime of the SSE response.
+            proxyReq.setTimeout(0);
+          });
+        },
       },
     },
   },

@@ -366,7 +366,12 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   // Expose dispatch so UI routes can trigger it after enqueueing (manual cron
   // run) — new jobs start immediately instead of waiting for the 5s safety net.
   const dispatch = (): void => dispatcher.dispatch();
-  registerUiRoutes(app, { runStore, liveRuns, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch, originalUrls, relayOrigin });
+  // Holder for the shutdown closure — populated below once `shutdown` is
+  // defined. Same indirection as `dispatch`: registerUiRoutes is called before
+  // the shutdown closure exists, so we hand it a thunk that reads the slot at
+  // call time. The Logs page's Restart button invokes this.
+  const restartHolder: { fn?: () => void } = {};
+  registerUiRoutes(app, { runStore, liveRuns, getSecret: getUiPassword, queue, authProvider, schedulerStore, triggerStore, settingsStore, profileStore, commandStore, chatStore, chatRuntime, skillStore, config, logDir, dispatch, originalUrls, relayOrigin, restart: () => restartHolder.fn?.() });
   if (settingsStore.has("NOODLE_UI_PASSWORD")) {
     log.info("web UI enabled (password-protected)");
   } else {
@@ -421,6 +426,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  // Wire the restart holder now that `shutdown` exists. The Logs page's
+  // Restart button calls this through the UiDeps.restart thunk registered above.
+  restartHolder.fn = () => void shutdown("restart");
 
   // Keep this function alive until shutdown exits the process.
   await new Promise<void>(() => {});
