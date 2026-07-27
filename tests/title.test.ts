@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { templateTitle, phraseOutput } from "../src/engine/title.js";
+import { templateTitle, phraseOutput, generateIssueTitle } from "../src/engine/title.js";
 import { NoodleConfigSchema, type Profile } from "../src/config/schema.js";
 
 describe("templateTitle (fallback)", () => {
@@ -89,5 +89,64 @@ describe("phraseOutput", () => {
     globalThis.fetch = mockFetchResponse("should not be called") as never;
     const result = await phraseOutput("   ", profile);
     expect(result).toBe("");
+  });
+
+  // --- auth header (regression for relay 401 "Authorization Not Found") ---
+  //
+  // The relay is a transparent dumb pipe: it forwards the caller's headers
+  // verbatim and never synthesizes auth. phraseOutput / generateIssueTitle
+  // bypass the SDK and fetch the relay directly, so they MUST attach the
+  // Bearer header themselves from profile.api_key — else the relay forwards
+  // an unauthenticated request and the upstream returns 401.
+  it("attaches Authorization: Bearer from profile.api_key on phrasing calls", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: "cleaned" } }] }),
+      text: async () => "",
+    }) as unknown as typeof fetch;
+    globalThis.fetch = fetchMock;
+    await phraseOutput("raw agent message", profile);
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init!.headers as Record<string, string>).Authorization).toBe(`Bearer ${profile.api_key}`);
+  });
+
+  it("omits Authorization when the profile has no api_key (no-auth endpoint)", async () => {
+    const noKeyProfile: Profile = { ...profile, api_key: "" };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: "cleaned" } }] }),
+      text: async () => "",
+    }) as unknown as typeof fetch;
+    globalThis.fetch = fetchMock;
+    await phraseOutput("raw agent message", noKeyProfile);
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init!.headers as Record<string, string>).Authorization).toBeUndefined();
+  });
+});
+
+describe("generateIssueTitle", () => {
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.useRealTimers();
+  });
+
+  it("attaches Authorization: Bearer from profile.api_key on title calls", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: "Some finding" } }] }),
+      text: async () => "",
+    }) as unknown as typeof fetch;
+    globalThis.fetch = fetchMock;
+    await generateIssueTitle("findings text", "the task", profile);
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init!.headers as Record<string, string>).Authorization).toBe(`Bearer ${profile.api_key}`);
   });
 });

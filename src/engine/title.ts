@@ -2,6 +2,26 @@ import { log } from "../util/log.js";
 import type { Profile } from "../config/schema.js";
 
 /**
+ * Headers for a raw POST to the relay. The relay is a transparent dumb pipe:
+ * it forwards the caller's headers VERBATIM and never synthesizes auth (see
+ * src/relay/server.ts — the api_key from acquireSlot is deliberately ignored).
+ * The agent's own SDK attaches its transport's auth header (Bearer / x-api-key
+ * / x-goog-api-key) before hitting the relay, so agent traffic is authenticated.
+ *
+ * But `generateIssueTitle` / `phraseOutput` bypass the SDK and fetch the relay
+ * directly with an OpenAI-shaped body — so they must attach the Bearer header
+ * themselves from `profile.api_key`, else the relay forwards an unauthenticated
+ * request and the upstream returns 401 "Authorization Not Found". An empty
+ * api_key (e.g. local no-auth Ollama) sends no auth header, matching those
+ * endpoints.
+ */
+function relayHeaders(profile: Profile): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (profile.api_key) headers.Authorization = `Bearer ${profile.api_key}`;
+  return headers;
+}
+
+/**
  * Generate a concise GitHub issue title from the agent's findings via a single
  * model call to the relay. The relay is already running in serve mode and routes
  * by model name → profile → API key + rate limit, so we just POST an
@@ -40,7 +60,7 @@ export async function generateIssueTitle(
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: relayHeaders(profile),
       signal: controller.signal,
       body: JSON.stringify({
         model: profile.model,
@@ -156,7 +176,7 @@ export async function phraseOutput(
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: relayHeaders(profile),
       signal: controller.signal,
       body: JSON.stringify({
         model: profile.model,
