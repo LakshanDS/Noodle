@@ -1,6 +1,71 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { templateTitle, phraseOutput, generateIssueTitle } from "../src/engine/title.js";
-import { NoodleConfigSchema, type Profile } from "../src/config/schema.js";
+import { templateTitle } from "../src/engine/title.js";
+import type { Model, Api } from "@earendil-works/pi-ai/compat";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+
+// --- mocks ----------------------------------------------------------------
+//
+// phraseOutput / generateIssueTitle now call pi-ai's completeSimple with the
+// run's resolved model + registry (inheriting the agent's profile/key/base_url/
+// protocol), instead of hand-rolling a fetch to the relay. So the tests mock
+// completeSimple directly — both the success shape (text content) and the
+// failure modes (throw / empty / error stopReason) that must fall back.
+//
+// Auth resolution goes through modelRegistry.getApiKeyAndHeaders(model); we stub
+// the registry to return ok+test key so the calls reach completeSimple.
+
+const TEST_API_KEY = "sk-test-key";
+
+/** A minimal Model shape — only id/provider/api/baseUrl are read by title.ts. */
+function mockModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
+  return {
+    id: "test-model",
+    provider: "test-provider",
+    api: "openai-completions",
+    baseUrl: "https://example.test/v1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 32768,
+    maxTokens: 8192,
+    ...overrides,
+  } as unknown as Model<Api>;
+}
+
+function mockRegistry(): ModelRegistry {
+  return {
+    getApiKeyAndHeaders: async () => ({ ok: true, apiKey: TEST_API_KEY }),
+  } as unknown as ModelRegistry;
+}
+
+/** Mock the completeSimple export from pi-ai/compat. */
+vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-ai/compat")>();
+  return {
+    ...actual,
+    completeSimple: vi.fn(),
+  };
+});
+
+// Import AFTER the mock is registered so title.ts picks up the mocked binding.
+const { phraseOutput, generateIssueTitle } = await import("../src/engine/title.js");
+const { completeSimple } = await import("@earendil-works/pi-ai/compat");
+const mockedCompleteSimple = vi.mocked(completeSimple);
+
+/** Build a fake AssistantMessage carrying the given text. */
+function fakeAssistant(text: string, stopReason: "stop" | "error" = "stop", errorMessage?: string) {
+  return {
+    role: "assistant",
+    content: text ? [{ type: "text", text }] : [],
+    api: "openai-completions",
+    provider: "test-provider",
+    model: "test-model",
+    usage: {},
+    stopReason,
+    errorMessage,
+    timestamp: Date.now(),
+  };
+}
 
 describe("templateTitle (fallback)", () => {
   it("uses the first non-empty line of the task, capped to 80 chars", () => {
@@ -24,129 +89,94 @@ describe("templateTitle (fallback)", () => {
   });
 });
 
-// --- phraseOutput tests ----------------------------------------------------
-
-const config = NoodleConfigSchema.parse({
-  agent_name: "TestBot",
-  default_profile: "p",
-  profiles: { p: { provider: "openai", model: "gpt-4o-mini", base_url: "https://api.openai.com/v1", api: "openai-completions", api_key: "sk-test" } },
-  routing: [],
-});
-const profile: Profile = config.profiles.p;
-
-/** Minimal fetch mock returning a relay-style chat completion response. */
-function mockFetchResponse(content: string, ok = true, status = 200) {
-  return vi.fn().mockResolvedValue({
-    ok,
-    status,
-    json: async () => ({ choices: [{ message: { content } }] }),
-    text: async () => "relay error body",
-  });
-}
-
 describe("phraseOutput", () => {
-  const realFetch = globalThis.fetch;
+  beforeEach(() => mockedCompleteSimple.mockReset());
+  afterEach(() => vi.useRealTimers());
 
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-    vi.useRealTimers();
-  });
+  const ctx = { model: mockModel(), modelRegistry: mockRegistry() };
 
-  it("returns the relay's cleaned message on success", async () => {
-    globalThis.fetch = mockFetchResponse("## Cleaned\n\nThe fix is in `src/x.ts`.") as never;
-    const result = await phraseOutput(
-      "Let me check... running grep... The fix is in src/x.ts.",
-      profile,
-    );
+  it("returns the model's cleaned message on success", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("## Cleaned\n\nThe fix is in `src/x.ts`.") as never);
+    const result = await phraseOutput("Let me check... The fix is in src/x.ts.", ctx);
     expect(result).toBe("## Cleaned\n\nThe fix is in `src/x.ts`.");
   });
 
-  it("falls back to the raw agent message when the relay is down (non-ok)", async () => {
+  it("falls back to the raw agent message when the model returns empty", async () => {
     const raw = "The fix is in src/x.ts.";
-    globalThis.fetch = mockFetchResponse("", false, 503) as never;
-    const result = await phraseOutput(raw, profile);
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("   ") as never);
+    const result = await phraseOutput(raw, ctx);
     expect(result).toBe(raw);
   });
 
-  it("falls back to the raw agent message when the relay returns empty", async () => {
+  it("falls back to the raw agent message when completeSimple throws", async () => {
     const raw = "The fix is in src/x.ts.";
-    globalThis.fetch = mockFetchResponse("   ") as never;
-    const result = await phraseOutput(raw, profile);
+    mockedCompleteSimple.mockRejectedValueOnce(new Error("ECONNREFUSED") as never);
+    const result = await phraseOutput(raw, ctx);
     expect(result).toBe(raw);
   });
 
-  it("falls back when fetch throws (relay unreachable)", async () => {
+  it("falls back when the model returns an error stopReason", async () => {
     const raw = "The fix is in src/x.ts.";
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED")) as never;
-    const result = await phraseOutput(raw, profile);
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("", "error", "upstream 500") as never);
+    const result = await phraseOutput(raw, ctx);
     expect(result).toBe(raw);
   });
 
   it("returns the input unchanged when the agent message is empty", async () => {
-    globalThis.fetch = mockFetchResponse("should not be called") as never;
-    const result = await phraseOutput("   ", profile);
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("should not be called") as never);
+    const result = await phraseOutput("   ", ctx);
     expect(result).toBe("");
+    expect(mockedCompleteSimple).not.toHaveBeenCalled();
   });
 
-  // --- auth header (regression for relay 401 "Authorization Not Found") ---
-  //
-  // The relay is a transparent dumb pipe: it forwards the caller's headers
-  // verbatim and never synthesizes auth. phraseOutput / generateIssueTitle
-  // bypass the SDK and fetch the relay directly, so they MUST attach the
-  // Bearer header themselves from profile.api_key — else the relay forwards
-  // an unauthenticated request and the upstream returns 401.
-  it("attaches Authorization: Bearer from profile.api_key on phrasing calls", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ choices: [{ message: { content: "cleaned" } }] }),
-      text: async () => "",
-    }) as unknown as typeof fetch;
-    globalThis.fetch = fetchMock;
-    await phraseOutput("raw agent message", profile);
-    const [, init] = fetchMock.mock.calls[0];
-    expect((init!.headers as Record<string, string>).Authorization).toBe(`Bearer ${profile.api_key}`);
-  });
-
-  it("omits Authorization when the profile has no api_key (no-auth endpoint)", async () => {
-    const noKeyProfile: Profile = { ...profile, api_key: "" };
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ choices: [{ message: { content: "cleaned" } }] }),
-      text: async () => "",
-    }) as unknown as typeof fetch;
-    globalThis.fetch = fetchMock;
-    await phraseOutput("raw agent message", noKeyProfile);
-    const [, init] = fetchMock.mock.calls[0];
-    expect((init!.headers as Record<string, string>).Authorization).toBeUndefined();
+  it("falls back when auth resolution fails", async () => {
+    const raw = "The fix is in src/x.ts.";
+    const badCtx = {
+      model: mockModel(),
+      modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key" }) } as never,
+    };
+    const result = await phraseOutput(raw, badCtx);
+    expect(result).toBe(raw);
+    expect(mockedCompleteSimple).not.toHaveBeenCalled();
   });
 });
 
 describe("generateIssueTitle", () => {
-  const realFetch = globalThis.fetch;
+  beforeEach(() => mockedCompleteSimple.mockReset());
+  afterEach(() => vi.useRealTimers());
 
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-    vi.useRealTimers();
+  const ctx = { model: mockModel(), modelRegistry: mockRegistry() };
+
+  it("returns the cleaned title on success", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("DB connection pool leak on response destroy") as never);
+    const title = await generateIssueTitle("findings...", "the task", ctx);
+    expect(title).toBe("DB connection pool leak on response destroy");
   });
 
-  it("attaches Authorization: Bearer from profile.api_key on title calls", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ choices: [{ message: { content: "Some finding" } }] }),
-      text: async () => "",
-    }) as unknown as typeof fetch;
-    globalThis.fetch = fetchMock;
-    await generateIssueTitle("findings text", "the task", profile);
-    const [, init] = fetchMock.mock.calls[0];
-    expect((init!.headers as Record<string, string>).Authorization).toBe(`Bearer ${profile.api_key}`);
+  it("strips a leading 'Bug:' prefix the model sometimes adds", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("Bug: pool leak under disconnects") as never);
+    const title = await generateIssueTitle("findings...", "the task", ctx);
+    expect(title).toBe("pool leak under disconnects");
+  });
+
+  it("falls back to template when the model returns empty", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("   ") as never);
+    const title = await generateIssueTitle("findings...", "Find bugs and open issues.", ctx);
+    expect(title).toBe("Find bugs and open issues.");
+  });
+
+  it("falls back to template when completeSimple throws", async () => {
+    mockedCompleteSimple.mockRejectedValueOnce(new Error("upstream 503") as never);
+    const title = await generateIssueTitle("findings...", "Find bugs.", ctx);
+    expect(title).toBe("Find bugs.");
+  });
+
+  it("falls back to template when auth resolution fails", async () => {
+    const badCtx = {
+      model: mockModel(),
+      modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key" }) } as never,
+    };
+    const title = await generateIssueTitle("findings...", "Find bugs.", badCtx);
+    expect(title).toBe("Find bugs.");
   });
 });

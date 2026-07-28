@@ -73,9 +73,15 @@ describe("SchedulerStore", () => {
       cron_expression: "0 0 * * *",
     });
     const oldNext = cron.next_run_at;
-    const updated = store.updateScheduler(cron.id, { cron_expression: "0 * * * *", prompt: "new prompt" });
+    // Use an expression with a different MINUTE field so the two next-fire
+    // instants are always distinct regardless of when the test runs or the
+    // machine's timezone. (cron-parser evaluates in local time, so pairs that
+    // share a minute — e.g. `0 0 * * *` vs `0 * * * *` — can resolve to the
+    // same next-fire instant during the hour before local midnight, making the
+    // `not.toBe` assertion flaky.)
+    const updated = store.updateScheduler(cron.id, { cron_expression: "30 * * * *", prompt: "new prompt" });
     expect(updated.prompt).toBe("new prompt");
-    expect(updated.cron_expression).toBe("0 * * * *");
+    expect(updated.cron_expression).toBe("30 * * * *");
     // next_run_at changes because the expression changed.
     expect(updated.next_run_at).not.toBe(oldNext);
   });

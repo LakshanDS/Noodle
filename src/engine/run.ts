@@ -745,7 +745,7 @@ export async function runJob(
           // Only reached on a successful run; an errored run (e.g. the agent's
           // own LLM call failed) takes the error-comment branch above and is
           // never routed through phrasing.
-          agentAnswer = await phraseOutput(agentAnswer, profile);
+          agentAnswer = await phraseOutput(agentAnswer, { model, modelRegistry });
         }
       }
 
