@@ -534,7 +534,10 @@ export async function runBackgroundJob(
         } else {
           agentAnswer = extractLastAssistantText(session);
           if (agentAnswer) {
-            agentAnswer = await phraseOutput(agentAnswer, profile);
+            // Phrase over the SAME model + transport the agent just used —
+            // inherits profile/key/base_url/protocol, so the shaping call is
+            // protocol-correct regardless of which transport ran the sweep.
+            agentAnswer = await phraseOutput(agentAnswer, { model, modelRegistry });
           }
         }
 
@@ -567,7 +570,7 @@ export async function runBackgroundJob(
         await gh.ensureLabel(input.repo, outcome.name, outcome.color, labelDescription(outcomeStage));
 
         if (!errored && changedFiles.length > 0) {
-          const prTitle = await generateIssueTitle(agentAnswer ?? "", input.prompt, profile);
+          const prTitle = await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry });
           const prBody = buildPrBody(profile, changedFiles, "", agentAnswer, config.agent_name, runStats);
           const pr = await gh.createPullRequest(input.repo, workBranch, prBase, prTitle, prBody);
           prUrl = pr.html_url;
@@ -584,7 +587,7 @@ export async function runBackgroundJob(
             : buildBackgroundIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
           const issueTitle = errored
             ? templateTitle(input.prompt)
-            : await generateIssueTitle(agentAnswer ?? "", input.prompt, profile);
+            : await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry });
           const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [outputLabel, outcome.name]);
           issueUrl = issue.html_url;
           log_.info({ issue: issue.number, url: issueUrl, errored, hadChanges: changedFiles.length > 0 }, "opened background-run output issue");
