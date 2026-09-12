@@ -216,6 +216,11 @@ export async function runBackgroundJob(
     }
     const profile = { name: profileName, provider: profileName, ...profileDef };
     log_.info({ profile: profile.name, model: profile.model }, "routed profile");
+    // Record profile + model as soon as they're known so a mid-flight run row
+    // shows them on the runs list (mirrors runJob in run.ts).
+    if (runStore) {
+      runStore.updateRun(jobId, { profile: profile.name, model: profile.model });
+    }
 
     // 2. Resolve model via the registry.
     const modelRuntime = deps?.modelRuntime ?? (await ModelRuntime.create());

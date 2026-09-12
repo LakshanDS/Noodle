@@ -378,3 +378,62 @@ describe("runBackgroundJob — task prompt tags are expanded", () => {
     expect(prompt).toContain("https://x/issues/42");
   });
 });
+
+/**
+ * Regression: cron/trigger run rows kept profile/model NULL for the whole
+ * in-flight window (the only write was the terminal updateRun), so the runs
+ * list showed "—" in both columns while a run was live. The row must be
+ * updated with profile + model as soon as the profile resolves — before any
+ * terminal status write — mirroring runJob in run.ts.
+ */
+describe("runBackgroundJob — run row records profile/model while running", () => {
+  it("writes profile + model to the run store before the terminal update", async () => {
+    const config = makeConfig();
+    const stub = vi.fn(() =>
+      Promise.resolve({
+        session: {
+          subscribe: () => {},
+          prompt: async () => {},
+          dispose: async () => {},
+          getSessionStats: () => ({ tokens: { total: 0 }, cost: 0, toolCalls: 0, assistantMessages: 1 }),
+          messages: [
+            { role: "user", content: [{ type: "text", text: "go" }] },
+            { role: "assistant", content: [{ type: "text", text: "done" }] },
+          ],
+        },
+      }),
+    );
+    const updates: Array<Record<string, unknown>> = [];
+    const runStore = {
+      createRun: vi.fn(),
+      updateRun: vi.fn((_id: string, u: Record<string, unknown>) => {
+        updates.push(u);
+      }),
+    } as any;
+
+    await runBackgroundJob(
+      config,
+      mockGh(),
+      {
+        repo: "o/r",
+        prompt: "find bugs",
+        branchName: "noodle/schedule-test",
+        displayName: "profile-test",
+        runKind: "trigger",
+      },
+      {
+        createAgentSessionFn: stub as any,
+        tokenProvider: async () => "fake-token",
+        runStore,
+      },
+    );
+
+    const early = updates.find((u) => u.profile === "p" && u.model === "gpt-4o-mini");
+    // The profile/model write happened at resolution time, not only in the
+    // terminal update — and it carries no status (that's a separate, later call).
+    expect(early).toBeDefined();
+    expect(early!.status).toBeUndefined();
+    const terminalIdx = updates.findIndex((u) => u.status !== undefined);
+    expect(terminalIdx).toBeGreaterThan(updates.indexOf(early!));
+  });
+});
