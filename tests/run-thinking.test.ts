@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
 import { NoodleConfigSchema } from "../src/config/schema.js";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,7 +83,6 @@ describe("runJob forwards thinking_level to createAgentSession", () => {
     });
 
     await runJob(config, mockGh(), { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: createAgentSessionFn as any,
       tokenProvider: async () => "fake-token",
     });
@@ -111,7 +109,6 @@ describe("runJob forwards thinking_level to createAgentSession", () => {
     });
 
     await runJob(config, mockGh(), { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: createAgentSessionFn as any,
       tokenProvider: async () => "fake-token",
     });

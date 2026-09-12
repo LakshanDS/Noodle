@@ -21,11 +21,6 @@ import type { NoodleConfig } from "../config/schema.js";
 import { runBackgroundJob, type BackgroundRunDeps } from "./background-run.js";
 import type { RunResult } from "./run.js";
 
-/** AuthStorage instance type (passed through from deps to the engine). */
-type AuthStorageInstance = ReturnType<
-  typeof import("@earendil-works/pi-coding-agent").AuthStorage.create
->;
-
 /**
  * Input for a scheduled (cron) run. Kept for caller compatibility — the engine
  * consumes `BackgroundRunInput` directly, and `runSchedulerJob` adapts this
@@ -60,7 +55,6 @@ export async function runSchedulerJob(
   gh: GitHubClient,
   input: SchedulerRunInput,
   deps?: {
-    authStorage?: AuthStorageInstance;
     runStore?: import("../server/run-store.js").RunStore;
     createAgentSessionFn?: typeof import("@earendil-works/pi-coding-agent").createAgentSession;
     /** Live run registry — forwarded to runBackgroundJob for cancel support. */
@@ -71,7 +65,6 @@ export async function runSchedulerJob(
   },
 ): Promise<RunResult> {
   const engineDeps: BackgroundRunDeps = {
-    authStorage: deps?.authStorage,
     runStore: deps?.runStore,
     liveRuns: deps?.liveRuns,
     createAgentSessionFn: deps?.createAgentSessionFn,

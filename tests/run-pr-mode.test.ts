@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NoodleConfigSchema } from "../src/config/schema.js";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +15,14 @@ import { join } from "node:path";
 vi.mock("../src/util/paths.js", () => ({
   installSkills: vi.fn().mockResolvedValue(undefined),
   noodleSkillsDir: () => "/tmp/skills",
+}));
+
+// Keep output shaping hermetic — no LLM call in unit tests. generateIssueTitle
+// echoes the task so tests can assert the title passed to createPullRequest.
+vi.mock("../src/engine/final-pass.js", () => ({
+  phraseOutput: vi.fn(async (m: string) => m),
+  generateIssueTitle: vi.fn(async (_m: string, task: string, _c?: unknown, opts?: { kind?: string }) =>
+    opts?.kind === "pr" ? `Noodle PR - ${task}` : `Noodle Issue - ${task}`),
 }));
 
 // Track the branch name handed to checkoutOrReuse + push so tests can assert
@@ -103,7 +110,6 @@ describe("runJob PR mode", () => {
     } as any;
 
     const result = await runJob(config, gh, { repo: "owner/name", issueNumber: 3 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: mockSessionFn() as any,
       tokenProvider: async () => "fake-token",
     });
@@ -141,7 +147,6 @@ describe("runJob PR mode", () => {
     } as any;
 
     const result = await runJob(config, gh, { repo: "owner/name", issueNumber: 5 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: mockSessionFn() as any,
       tokenProvider: async () => "fake-token",
     });
@@ -172,7 +177,6 @@ describe("runJob PR mode", () => {
     } as any;
 
     const result = await runJob(config, gh, { repo: "owner/name", issueNumber: 9 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: mockSessionFn() as any,
       tokenProvider: async () => "fake-token",
     });
@@ -181,5 +185,52 @@ describe("runJob PR mode", () => {
     expect(wsCalls.checkoutOrReuse).toBeUndefined(); // branch() was used, not checkoutOrReuse
     expect(createdPR).toBe(true);
     expect(result.prUrl).toBe("https://x/p/9");
+  });
+
+  it("uniquifies the branch when stacking onto Noodle's own still-open PR (no head===base)", async () => {
+    // Regression for issue #52: a follow-up run on an issue whose open PR was
+    // created by Noodle itself used to reuse the SAME `<agent>/issue-<N>`
+    // branch — commits fast-forwarded the old PR and the stacked-PR call got
+    // head===base, which GitHub rejects with 422.
+    const config = makeConfig();
+    let prArgs: { head?: string; base?: string; title?: string } = {};
+    const gh = {
+      getIssue: async () => ({
+        number: 12, title: "the original bug", body: "/noodle also fix the flake",
+        labels: [], html_url: "https://x/issues/12", pull_request: false,
+      }),
+      getIssueComments: async () => [],
+      ensureLabel: async () => {},
+      addIssueLabel: async () => {},
+      removeIssueLabel: async () => {},
+      defaultBranch: async () => "main",
+      createIssueComment: async () => "https://x#c1",
+      // The open PR is Noodle's own — its branch IS the bare issue branch.
+      findOpenPRForIssue: async () => ({
+        number: 7, branch: "noodle/issue-12", html_url: "https://x/pull/7", state: "open",
+      }),
+      createPullRequest: async (_r: string, head: string, base: string, title: string) => {
+        prArgs = { head, base, title };
+        return { html_url: "https://x/p/13", number: 13 };
+      },
+    } as any;
+
+    const result = await runJob(config, gh, { repo: "owner/name", issueNumber: 12 }, {
+      createAgentSessionFn: mockSessionFn() as any,
+      tokenProvider: async () => "fake-token",
+    });
+
+    // The work branch was cut FROM the old PR's branch but carries a unique name.
+    expect(wsCalls.branchFrom?.fromBranch).toBe("noodle/issue-12");
+    expect(wsCalls.branchFrom?.newBranch).toMatch(/^noodle\/issue-12-/);
+    // The stacked PR targets the old PR's branch with the unique head — never
+    // head===base.
+    expect(prArgs.base).toBe("noodle/issue-12");
+    expect(prArgs.head).toBe(wsCalls.branchFrom?.newBranch);
+    expect(prArgs.head).not.toBe(prArgs.base);
+    // The pushed branch is the unique one, and the title uses the tag format.
+    expect(wsCalls.push).toBe(prArgs.head);
+    expect(prArgs.title).toBe("Noodle PR - the original bug");
+    expect(result.prUrl).toBe("https://x/p/13");
   });
 });

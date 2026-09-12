@@ -6,10 +6,10 @@
  *
  * This view is mounted inside AppShell, so it inherits the sidebar + top bar.
  */
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { getJson, sendJson, ApiRequestError, isAuthError } from "../api/client.js";
-import type { RunDetailResponse, ParsedMessage, RunRow } from "../api/types.js";
+import { getJson, sendJson, streamSSE, ApiRequestError, isAuthError } from "../api/client.js";
+import type { RunDetailResponse, ParsedMessage, ParsedToolCall, RunRow, RunStreamEvent } from "../api/types.js";
 import { fmtTime } from "../lib/format.js";
 import AppShell from "../components/AppShell.vue";
 import Button from "../components/ui/Button.vue";
@@ -28,6 +28,39 @@ const messages = ref<ParsedMessage[]>([]);
 const loading = ref(false);
 const loadError = ref("");
 const cancelling = ref(false);
+
+/* ---- Live streaming state (mirrors ChatDetailView) ---- */
+/** True while we're attached to a live run (stream open OR in reconnect backoff). */
+const isStreaming = ref(false);
+/** Partial assistant text as it streams in (replaced wholesale on each delta). */
+const streamingText = ref("");
+/** Tool calls observed in-flight on the current turn, rendered as live ToolCall cards. */
+const streamingTools = ref<{ name: string; args: Record<string, unknown>; ok?: boolean }[]>([]);
+let cleanupSSE: (() => void) | null = null;
+/**
+ * While streaming, the transcript is refreshed on a short interval (not only
+ * on turn boundaries): the page can attach mid-run, the first load can fail
+ * (backend briefly down — the vite proxy ECONNREFUSED case), and a single
+ * assistant message can run for minutes without emitting a turn_start. A 3s
+ * poll picks up the prompt + newly completed turns no matter what, and the
+ * turn_end fold still gives instant feedback between polls.
+ */
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+/** Retry timer for the initial load failing (backend still booting). */
+let retryLoadTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * Reconnect bookkeeping. Without these, a stream that closes immediately
+ * (server not booted yet, proxy drop, etc.) tight-loops: onDone → load →
+ * openStream → close → onDone, with `isStreaming` flickering each cycle and
+ * nothing ever rendering. The guard below keeps `isStreaming` steady across
+ * reconnects and caps retries so a genuinely broken connection degrades to a
+ * "couldn't connect" state instead of spinning forever.
+ */
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+/** Consecutive close-and-reopen cycles that produced NO real events. Reset on
+ *  any delta/tool/turn event. Past the cap we stop reconnecting. */
+let consecutiveEmptyReconnects = 0;
+const MAX_EMPTY_RECONNECTS = 5;
 
 const isRunning = computed(() => run.value?.status === "running");
 
@@ -66,20 +99,239 @@ async function load(): Promise<void> {
   loadError.value = "";
   try {
     const body = await getJson<RunDetailResponse>(`/api/runs/${encodeURIComponent(props.id)}`);
+    const wasAtBottom = isAtBottom();
     run.value = body.run;
     messages.value = body.messages ?? [];
-    await nextTick(scrollToBottom);
+    await nextTick();
+    if (wasAtBottom) scrollToBottom();
+    // If the run is still in flight (navigated to a running run, or reloaded
+    // mid-run), open the SSE stream to receive events live. The server
+    // synthesizes a `done` if the run already finished, so this is safe even
+    // if the run completes between the fetch and the stream open.
+    if (run.value.status === "running") {
+      openStream();
+    }
   } catch (e) {
     if (isAuthError(e)) return;
     loadError.value = e instanceof ApiRequestError ? e.message : "Could not load run.";
+    // The backend may still be booting (e.g. vite proxy ECONNREFUSED during a
+    // restart) — retry until it answers; the page is useless otherwise.
+    if (!run.value && retryLoadTimer === null) {
+      retryLoadTimer = setTimeout(() => {
+        retryLoadTimer = null;
+        void load();
+      }, 3000);
+    }
   } finally {
     loading.value = false;
   }
 }
 
+/* ---- Follow-the-tail scrolling. The scroll container is AppShell's .main
+ * (overflow-y: auto) — .stream itself never scrolls. Auto-scroll only when
+ * the user is pinned to the bottom; scrolling up to read history must not
+ * get yanked back by incoming events. ---- */
+
+function scrollContainer(): HTMLElement | null {
+  return document.querySelector(".main");
+}
+
+/** Within ~60px of the bottom counts as "following the tail". */
+function isAtBottom(): boolean {
+  const el = scrollContainer();
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+}
+
 function scrollToBottom(): void {
-  const el = document.querySelector(".stream") as HTMLElement | null;
+  const el = scrollContainer();
   if (el) el.scrollTop = el.scrollHeight;
+}
+
+/** Scroll on the next frame iff the user was at the bottom before the update. */
+function followTail(): void {
+  const wasAtBottom = isAtBottom();
+  void nextTick(() => {
+    if (wasAtBottom) scrollToBottom();
+  });
+}
+
+/**
+ * Best-effort mid-stream refresh of the run row + transcript. Unlike load(),
+ * never surfaces errors (the stream stays live; the next turn boundary
+ * retries) and never touches the stream itself.
+ */
+function refreshTranscript(): void {
+  void getJson<RunDetailResponse>(`/api/runs/${encodeURIComponent(props.id)}`)
+    .then((body) => {
+      run.value = body.run;
+      messages.value = body.messages ?? [];
+      // followTail MUST come after the mutations: with no flush pending yet,
+      // a pre-mutation nextTick resolves before Vue renders this change, and
+      // the scroll lands on the old layout and is lost.
+      followTail();
+    })
+    .catch(() => { /* transient — retried on the next turn boundary */ });
+}
+
+/* ---- SSE streaming (mirrors ChatDetailView's pattern, plus reconnect guard) ---- */
+
+/**
+ * Tear down the current stream + any pending reconnect. Leaves `isStreaming`
+ * alone — callers decide whether to flip it (steady across reconnects, false
+ * only when the run is truly done or we give up reconnecting).
+ */
+function teardownStream(): void {
+  cleanupSSE?.();
+  cleanupSSE = null;
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function openStream(): void {
+  // Don't open if a stream is already live OR a reconnect is pending.
+  if (cleanupSSE || reconnectTimer !== null) return;
+  // Steady across reconnects: once we're "streaming" we stay streaming until
+  // the run finishes or we exhaust retries. This is what stops the flicker.
+  isStreaming.value = true;
+
+  // Poll the transcript while attached (see refreshTimer's doc above).
+  if (refreshTimer === null) {
+    refreshTimer = setInterval(refreshTranscript, 3000);
+  }
+
+  let sawRealEventThisCycle = false;
+
+  cleanupSSE = streamSSE(
+    `/api/runs/${encodeURIComponent(props.id)}/stream`,
+    (data) => {
+      const e = data as unknown as RunStreamEvent;
+      // Any of these means the stream is genuinely alive (not just a server
+      // immediately sending done because it has no session yet).
+      if (e.type === "delta" || e.type === "tool_start" || e.type === "tool_end" || e.type === "turn_start" || e.type === "turn_end") {
+        sawRealEventThisCycle = true;
+        consecutiveEmptyReconnects = 0;
+      }
+      handleStreamEvent(e);
+    },
+    () => {
+      // Stream closed. Three cases:
+      // 1. We saw real events this cycle → the run produced something, so a
+      //    close most likely means it finished. Reconcile + stop streaming.
+      // 2. No real events but a `done`/`error` was the cause → run finished
+      //    cleanly without streaming (e.g. errored during boot). Reconcile.
+      // 3. No real events, immediate close, run still running → the stream
+      //    dropped before the session booted (cloning window) or a transient
+      //    disconnect. Back off and retry; cap consecutive empties.
+      cleanupSSE = null;
+      const wasProductive = sawRealEventThisCycle;
+
+      // If the run already finished (the close came with a terminal event, or
+      // we genuinely saw content and now it's done), reconcile + stop.
+      if (wasProductive) {
+        isStreaming.value = false;
+        consecutiveEmptyReconnects = 0;
+        void load();
+        return;
+      }
+
+      // Empty close. Check the run status before deciding to retry — the run
+      // may have finished in the background (status flipped), in which case
+      // reconnecting would loop forever getting immediate dones.
+      void getJson<RunDetailResponse>(`/api/runs/${encodeURIComponent(props.id)}`)
+        .then((body) => {
+          run.value = body.run;
+          messages.value = body.messages ?? [];
+          if (body.run.status !== "running") {
+            // Genuinely finished — stop streaming, keep reconciled data.
+            isStreaming.value = false;
+            consecutiveEmptyReconnects = 0;
+            return;
+          }
+          // Still running — schedule a reconnect with capped backoff. Keeps
+          // isStreaming true (no flicker) and avoids the tight loop.
+          scheduleReconnect();
+        })
+        .catch(() => {
+          // Fetch failed — treat as transient, try again with backoff.
+          scheduleReconnect();
+        });
+    },
+  );
+}
+
+/**
+ * Reconnect after a short delay (doubles each empty cycle, capped). Resets the
+ * SSE bookkeeping but leaves `isStreaming` true so the hint stays steady.
+ */
+function scheduleReconnect(): void {
+  consecutiveEmptyReconnects += 1;
+  if (consecutiveEmptyReconnects > MAX_EMPTY_RECONNECTS) {
+    // Give up — stop the flicker and surface the empty state. The persisted
+    // messages (if any) remain visible from the last reconcile.
+    isStreaming.value = false;
+    return;
+  }
+  const delay = Math.min(1000 * 2 ** (consecutiveEmptyReconnects - 1), 15_000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    openStream();
+  }, delay);
+}
+
+function handleStreamEvent(e: RunStreamEvent): void {
+  switch (e.type) {
+    case "turn_start":
+      streamingText.value = "";
+      streamingTools.value = [];
+      // The prompt + every completed turn live in the session file (session_path
+      // is persisted at boot, and pi appends each message as it completes).
+      // Refresh on turn boundaries so the transcript builds up from server
+      // truth — including the user's prompt — instead of only from stream
+      // events that arrive after this page opened.
+      refreshTranscript();
+      break;
+    case "delta":
+      streamingText.value = e.text;
+      break;
+    case "tool_start":
+      streamingTools.value.push({ name: e.name, args: e.args });
+      break;
+    case "tool_end": {
+      // Patch the most recent matching tool that hasn't resolved yet (tools
+      // can run in parallel — match the latest unresolved start).
+      const idx = streamingTools.value.map((t) => t.name === e.name && t.ok === undefined).lastIndexOf(true);
+      if (idx >= 0) streamingTools.value[idx].ok = e.ok;
+      break;
+    }
+    case "turn_end": {
+      // Fold the completed turn into the transcript instantly; the next
+      // turn_start refresh (and the final reconcile on stream close) replaces
+      // it with the authoritative persisted rows, including tool results.
+      // toolCalls keep name+args to match the persisted message shape.
+      let toolCalls: ParsedToolCall[] | undefined;
+      if (streamingTools.value.length > 0) {
+        toolCalls = streamingTools.value.map((t) => ({ name: t.name, args: t.args }));
+      }
+      if (e.text || toolCalls) {
+        messages.value.push({ role: "assistant", text: e.text, ...(toolCalls ? { toolCalls } : {}) });
+      }
+      streamingText.value = "";
+      streamingTools.value = [];
+      break;
+    }
+    case "error":
+      // The reconcile fetch on close will surface the error in the sidebar.
+      break;
+    // "done" — handled by the onDone callback (cleanup), not here.
+  }
+  followTail();
 }
 
 async function cancel(): Promise<void> {
@@ -87,9 +339,13 @@ async function cancel(): Promise<void> {
   cancelling.value = true;
   try {
     await sendJson(`/api/runs/${encodeURIComponent(run.value.job_id)}/cancel`, "POST");
+    // Stop streaming immediately — the run is being killed, no point retrying.
+    teardownStream();
+    consecutiveEmptyReconnects = 0;
+    isStreaming.value = false;
     await load();
   } catch {
-    /* leave as-is; next refresh reconciles */
+    /* leave as-is; the run row will reconcile on next load */
   } finally {
     cancelling.value = false;
   }
@@ -100,20 +356,36 @@ function back(): void {
   else void router.replace({ name: "runs" });
 }
 
+function cancelRetryLoad(): void {
+  if (retryLoadTimer !== null) {
+    clearTimeout(retryLoadTimer);
+    retryLoadTimer = null;
+  }
+}
+
 watch(
   () => props.id,
-  () => void load(),
+  () => {
+    // Clean up any open stream + pending reconnect from the previous run.
+    teardownStream();
+    cancelRetryLoad();
+    consecutiveEmptyReconnects = 0;
+    isStreaming.value = false;
+    void load();
+  },
 );
 onMounted(load);
+onUnmounted(() => {
+  teardownStream();
+  cancelRetryLoad();
+  consecutiveEmptyReconnects = 0;
+});
 </script>
 
 <template>
   <AppShell>
     <template #actions>
       <Button variant="ghost" size="sm" icon="back" @click="back">Back</Button>
-      <Button variant="ghost" size="sm" icon="refresh" :loading="loading" @click="load">
-        <span class="btn-label">Refresh</span>
-      </Button>
       <Button
         v-if="isRunning"
         variant="danger"
@@ -133,7 +405,7 @@ onMounted(load);
       <!-- Conversation stream -->
       <div class="stream-col">
         <div class="stream">
-          <div v-if="messages.length === 0" class="empty-chat">
+          <div v-if="messages.length === 0 && !isStreaming" class="empty-chat">
             <Icon name="message" :size="20" />
             <p>No conversation recorded for this run.</p>
           </div>
@@ -149,6 +421,27 @@ onMounted(load);
                 />
               </template>
             </template>
+          </template>
+
+          <!-- Live-streaming assistant bubble + in-flight tool cards (while the
+               run is in flight). Cards mirror the persisted ToolCall look so
+               live activity and history read as one continuous flow. -->
+          <template v-if="isStreaming">
+            <ChatBubble
+              v-if="streamingText"
+              :message="{ role: 'assistant', text: streamingText }"
+            />
+            <ToolCall
+              v-for="(tool, i) in streamingTools"
+              :key="'st' + i"
+              :call="{ name: tool.name, args: tool.args }"
+              :state="tool.ok === undefined ? 'pending' : tool.ok ? 'ok' : 'error'"
+            />
+            <!-- Subtle "working" hint when no text/tools have arrived yet -->
+            <div v-if="!streamingText && streamingTools.length === 0" class="streaming-hint">
+              <span class="dot-flash" />
+              <span>Agent is working…</span>
+            </div>
           </template>
         </div>
       </div>
@@ -248,6 +541,28 @@ onMounted(load);
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
+}
+
+/* ---------- Live streaming ---------- */
+.streaming-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-3);
+  font-size: var(--text-sm);
+  padding: var(--space-2) 0;
+}
+/* Pulsing dot — a single CSS animation, no JS. */
+.dot-flash {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: dot-flash 1.2s ease-in-out infinite;
+}
+@keyframes dot-flash {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
 }
 
 /* ---------- Meta sidebar ---------- */

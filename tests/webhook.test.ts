@@ -109,6 +109,15 @@ describe("parseWebhookEvent", () => {
     expect(parseWebhookEvent("issues", payload, "noodle-bot")).toBeNull();
   });
 
+  it("matches issues.assigned across the GitHub-App [bot] suffix (both directions)", () => {
+    // GitHub emits `<app-slug>[bot]` as the assignee for App identities; the
+    // operator may set selfLogin with or without the suffix (issue #52).
+    const appAssigned = { ...basePayload, action: "assigned", assignee: { login: "noodle-bot[bot]" } };
+    expect(parseWebhookEvent("issues", appAssigned, "noodle-bot")?.kind).toBe("issue");
+    const bareAssigned = { ...basePayload, action: "assigned", assignee: { login: "noodle-bot" } };
+    expect(parseWebhookEvent("issues", bareAssigned, "noodle-bot[bot]")?.kind).toBe("issue");
+  });
+
   it("ignores issues.assigned when selfLogin is not provided", () => {
     const payload = { ...basePayload, action: "assigned", assignee: { login: "noodle-bot" } };
     expect(parseWebhookEvent("issues", payload)).toBeNull();

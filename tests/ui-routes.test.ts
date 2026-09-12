@@ -459,3 +459,117 @@ describe("UI routes — server restart", () => {
   });
 });
 
+
+/**
+ * GET /api/runs/:id/stream — the run-detail SSE endpoint. app.inject can't
+ * test a held-open stream (its promise never settles), so the streaming cases
+ * boot the app on an ephemeral port and read the body with fetch. The bus is
+ * a captured LiveRunRegistry so the tests can emit events like a run does.
+ */
+describe("GET /api/runs/:id/stream", () => {
+  function makeStreamApp(liveRuns: LiveRunRegistry) {
+    const app = Fastify({ logger: false });
+    registerUiRoutes(app, {
+      runStore: store,
+      getSecret: () => PASSWORD,
+      cronStore,
+      commandStore,
+      settingsStore,
+      profileStore: ProfileStore.fromDb(db),
+      liveRuns,
+      queue: { enqueue: () => {}, enqueueCron: () => {}, markFailed: () => {}, getById: () => null, countByStatus: () => 0 } as never,
+      authProvider: {} as never,
+      agentName: "TestBot",
+      config: { profiles: {}, default_profile: "x" } as never,
+    });
+    return app;
+  }
+
+  /** Read an SSE body until `marker` appears (or timeout), returning the text so far. */
+  async function readUntil(body: ReadableStream<Uint8Array>, marker: string, timeoutMs = 3000): Promise<string> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let acc = "";
+    const timer = setTimeout(() => void reader.cancel(), timeoutMs);
+    try {
+      while (!acc.includes(marker)) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    return acc;
+  }
+
+  it("404s for an unknown run id", async () => {
+    const app = await makeStreamApp(new LiveRunRegistry());
+    try {
+      const res = await app.inject({ method: "GET", url: "/api/runs/nope/stream", headers: { cookie: authCookie() } });
+      expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("401s without a cookie", async () => {
+    store.createRun({ job_id: "job-s0", repo: "o/r", issue: 1, branch: "b" });
+    const app = await makeStreamApp(new LiveRunRegistry());
+    try {
+      const res = await app.inject({ method: "GET", url: "/api/runs/job-s0/stream" });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("sends a synthetic done immediately when the run has no live session", async () => {
+    store.createRun({ job_id: "job-s1", repo: "o/r", issue: 1, branch: "b" });
+    const app = makeStreamApp(new LiveRunRegistry());
+    try {
+      await app.listen({ port: 0 });
+      const port = (app.server.address() as { port: number }).port;
+      const res = await fetch(`http://127.0.0.1:${port}/api/runs/job-s1/stream`, {
+        headers: { cookie: authCookie() },
+      });
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const text = await readUntil(res.body as ReadableStream<Uint8Array>, "event: done");
+      expect(text).toContain("retry: 3000");
+      expect(text).toContain("event: done");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("fans out live registry events to the connected client", async () => {
+    store.createRun({ job_id: "job-s2", repo: "o/r", issue: 1, branch: "b" });
+    const liveRuns = new LiveRunRegistry();
+    // Register a session so isBusy is true — otherwise the route's synthetic
+    // done (for finished runs) fires at connect and satisfies readUntil
+    // before the emitted events arrive.
+    liveRuns.set("job-s2", {} as never);
+    const app = makeStreamApp(liveRuns);
+    try {
+      await app.listen({ port: 0 });
+      const port = (app.server.address() as { port: number }).port;
+      // The handler registers its bus listener synchronously before the
+      // response headers flush, so events emitted after fetch resolves are
+      // guaranteed to be seen.
+      const res = await fetch(`http://127.0.0.1:${port}/api/runs/job-s2/stream`, {
+        headers: { cookie: authCookie() },
+      });
+      liveRuns.emit("job-s2", { type: "turn_start" });
+      liveRuns.emit("job-s2", { type: "delta", text: "hello" });
+      liveRuns.emit("job-s2", { type: "tool_start", name: "grep", args: { pattern: "x" } });
+      liveRuns.emit("job-s2", { type: "done" });
+      const text = await readUntil(res.body as ReadableStream<Uint8Array>, "event: done");
+      expect(text).toContain("event: turn_start");
+      expect(text).toContain('"text":"hello"');
+      expect(text).toContain("event: tool_start");
+      expect(text).toContain("event: done");
+    } finally {
+      await app.close();
+    }
+  });
+});

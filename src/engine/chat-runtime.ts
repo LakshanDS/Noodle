@@ -27,8 +27,8 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  AuthStorage,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
   DefaultResourceLoader,
   createAgentSession,
@@ -129,8 +129,8 @@ export class ChatRuntime {
 
     // 2. Profile + model resolution (same path as run.ts).
     const profile = this.resolveProfileFor(chat);
-    const authStorage = AuthStorage.create();
-    const modelRegistry = ModelRegistry.create(authStorage);
+    const modelRuntime = await ModelRuntime.create();
+    const modelRegistry = new ModelRegistry(modelRuntime);
     const providerKeyMap = registerCustomProviders(config, modelRegistry);
     // Provider key = profile name (see custom-providers.ts). Fall back to the
     // name itself if registration somehow skipped this profile.
@@ -189,8 +189,7 @@ export class ChatRuntime {
     const { session } = await create({
       cwd: workspace.path,
       model,
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       settingsManager,
       resourceLoader: loader,
       // Per-chat override wins; fall back to the profile's setting. The chat
@@ -384,9 +383,11 @@ function sessionsDirFor(id: string): string {
  * Bridge pi's session events into our uniform ChatStreamEvent shape on the
  * per-chat EventEmitter. Returns an unsubscribe. Mirrors the event set proven
  * in run.ts:subscribeForLogging (we add the streaming delta + tool args that
- * the log subscriber deliberately drops).
+ * the log subscriber deliberately drops). Also used by the queue-run paths
+ * (run.ts / background-run.ts) to feed the LiveRunRegistry bus for the run
+ * detail SSE stream.
  */
-function attachEventBridge(session: AgentSession, bus: EventEmitter): () => void {
+export function attachEventBridge(session: AgentSession, bus: EventEmitter): () => void {
   if (typeof session.subscribe !== "function") return () => {};
   let currentTurnText = "";
   const emit = (e: ChatStreamEvent) => bus.emit("event", e);

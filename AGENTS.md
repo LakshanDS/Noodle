@@ -92,9 +92,11 @@ Cron/trigger use `buildSchedulerPrompt` / `buildTriggerPrompt` instead of `build
 
 Every run captures the agent's last assistant message (`extractLastAssistantText` in `src/engine/run.ts`), then shapes it into the delivered comment / PR body / issue body before posting. The shaping pipeline runs in every mode (issue, PR, cron, trigger) and has two stages:
 
-1. **Phrasing** — the raw answer is passed through `phraseOutput` (`src/engine/title.ts`), a single LLM call to the local relay (port 4445, same model that just ran). This **cleans the presentation** — strips thinking-token residue, tool-call chatter ("Let me check…", "Running grep…"), fixes markdown headings/lists — but **never summarises**: its system prompt enforces "PRESERVE EVERY TECHNICAL DETAIL". Sibling to `generateIssueTitle` (used to title cron/trigger output issues), same relay pattern. Falls back to the raw message on any failure (relay down, empty result, throw), so a run is never blocked by phrasing.
+1. **Phrasing** — the raw answer is passed through `phraseOutput` (`src/engine/final-pass.ts`), a single LLM call to the local relay (port 4445, same model that just ran). This **restructures for skimmability and cleans the presentation** — a `## Summary` section up front, one numbered `##` section per distinct finding, bold `**Where:**`/`**Fix:**` lead-ins — while stripping thinking-token residue and tool-call chatter ("Let me check…", "Running grep…"). It **never summarises**: its system prompt enforces "PRESERVE EVERY TECHNICAL DETAIL". Both phrasing and titling funnel through the generic one-shot `runFinalPass` in the same file, which resolves auth from the run's registry and calls `completeSimple` over the agent's own model + transport (protocol-correct for any `api`). Falls back to the raw message on any failure (relay down, empty result, throw), so a run is never blocked by phrasing.
 
-2. **Footer** — appended after a `---` separator on every output (`buildFooter` in `src/engine/run.ts`): agent name, profile + model, cook time / tool calls / turns, token usage, cost (when priced), and a random fun line.
+2. **Footer** — appended after a `---` separator on every output (`buildFooter` in `src/engine/run.ts`): agent name, profile + model, cook time / tool calls / turns, token usage (cache read/write as absolute counts), cost (when priced), and a random fun line.
+
+**Titles:** every output PR and every cron/trigger findings issue gets a generated title via `generateIssueTitle` (`src/engine/final-pass.ts`): a 30-50 char core title from the agent's findings, wrapped in the tag line — `Noodle Issue - <short>` for issues, `Noodle PR - <short>` for PRs (agent name from `config.agent_name`, capitalised). The 50-char cap cuts at a clause boundary (`,` `—` `:` `;`) when one exists, else on a word boundary with `…`. On LLM failure it falls back to the untagged `templateTitle` (first line of the task).
 
 **Failed-state invariant:** phrasing is only reached in the **non-errored** branch. When the agent's own LLM call fails (`stopReason === "error"`), the run takes the template error path (`buildErrorComment` / `buildCronErrorBody` / `buildTriggerErrorBody`) and is marked `failed` — it is never routed through `phraseOutput`. Error bodies carry the footer too, so a triage list sees the same stats block regardless of outcome.
 
@@ -102,7 +104,7 @@ Every run captures the agent's last assistant message (`extractLastAssistantText
 
 | Builder | File | Used for | Body shape |
 |---------|------|----------|------------|
-| `buildPrBody` | `run.ts` | Issue/PR run with code changes | phrased answer + changed files + footer + `Closes <url>` |
+| `buildPrBody` | `run.ts` | Issue/PR run with code changes | phrased answer + changed files + footer + `Closes <url>` (only when an issue URL is passed — cron/trigger PRs omit it) |
 | `buildIssueComment` | `run.ts` | Issue/PR run (no changes, or PR opened) | phrased answer + footer |
 | `buildErrorComment` | `run.ts` | Issue/PR run errored | templated error notice + footer |
 | `buildCronIssueBody` | `scheduler-run.ts` | Cron run succeeded | phrased findings + footer |
@@ -190,7 +192,7 @@ sequenceDiagram
 
 The `originalUrls` map (`Map<model, originOf(base_url)>`) holds the upstream **origin** per model. It is populated at boot in `serve.ts` and kept live by profile create/update in `ui-routes.ts`. When `use_relay` is on, the profile's `base_url` is rewritten to the relay-facing URL (`relayBaseUrl(...)`) for the agent to see; the upstream origin is retained in `originalUrls` for the relay to forward to. The agent never sees the real URL; the relay never tells the agent anything.
 
-**Internal LLM calls (phrasing, titles) use the same path.** `phraseOutput` and `generateIssueTitle` (`src/engine/title.ts`) POST to `http://localhost:4445/v1/chat/completions` using the run's resolved profile. The relay does its origin-swap and forwards. Same relay, same model lookup, same rate-limiting. The only difference is they use a tiny non-streaming request with a tight `max_tokens` cap.
+**Internal LLM calls (phrasing, titles) use the same path.** `phraseOutput` and `generateIssueTitle` (`src/engine/final-pass.ts`) call the run's resolved model over the relay via pi-ai's `completeSimple` (the model's `baseUrl` is the relay-facing URL when `use_relay` is on). The relay does its origin-swap and forwards. Same relay, same model lookup, same rate-limiting. The only difference is they are one-shot calls with a capped token budget.
 
 **Common failure modes (and why they're fixed at the agent layer, not the relay):**
 

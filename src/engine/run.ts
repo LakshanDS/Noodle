@@ -5,6 +5,7 @@ import type { Model, Api } from "@earendil-works/pi-ai/compat";
 // keeps our fail-fast list in sync with pi's retryable list.
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { join, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, statSync, rmSync } from "node:fs";
 import { log, runLogger } from "../util/log.js";
 import { resolveProfile } from "../profiles/resolve.js";
@@ -14,28 +15,26 @@ import type { PullRequestData } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { buildRunPrompt, DEFAULT_SYSTEM_PROMPT } from "./prompt.js";
 import { expandTags } from "./tags.js";
-import { phraseOutput } from "./title.js";
+import { phraseOutput, generateIssueTitle } from "./final-pass.js";
 import { createCommentOnIssueTool } from "./tools.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
 import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
+import { attachEventBridge } from "./chat-runtime.js";
 import type { LiveRunRegistry } from "./live-runs.js";
 import { slugify } from "../util/slugify.js";
 import { extractProfileTag } from "../triggers/check.js";
 import {
-  AuthStorage,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
   DefaultResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 import type { RunStore } from "../server/run-store.js";
 import type { CommandRow } from "../server/command-store.js";
 import type { NoodleConfig } from "../config/schema.js";
-
-/** AuthStorage instance type (its constructor is private; use the factory's return type). */
-type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
 
 /**
  * Status labels applied to issues the agent works on. All three are ensured to
@@ -150,8 +149,6 @@ export async function runJob(
   gh: GitHubClient,
   input: RunInput,
   deps?: {
-    /** Optional pre-built auth storage (carrying API keys). */
-    authStorage?: AuthStorageInstance;
     /** Optional run store — when set, the run is recorded in the `runs` table. */
     runStore?: RunStore;
     /**
@@ -246,7 +243,10 @@ export async function runJob(
   }
   // Agent always gets a fresh branch name. For PR comment / issue-with-PR it
   // is derived from the existing PR's branch; for fresh issues it's off default.
-  const branchName = branchNameFor(input.issueNumber, agentSlug);
+  // Reassigned to a uniquified name when stacking onto Noodle's own still-open
+  // PR branch (see the branch creation below) — everything after that point
+  // (branchFrom, push, PR head) reads this variable.
+  let branchName = branchNameFor(input.issueNumber, agentSlug);
 
   // Per-run logger: stdout only (pretty). Run context is bound to the raw JSON
   // for correlation/grep, but the pretty formatter hides it from per-event
@@ -403,8 +403,8 @@ export async function runJob(
   deps?.onProfileResolved?.(profile.name);
 
   // 3. Resolve the model via the registry.
-  const authStorage = deps?.authStorage ?? AuthStorage.create();
-  const modelRegistry = ModelRegistry.create(authStorage);
+  const modelRuntime = await ModelRuntime.create();
+  const modelRegistry = new ModelRegistry(modelRuntime);
   // Register any custom-endpoint profiles (Ollama/vLLM/proxies) with pi first.
   // Returns a map from profile name → provider key used in the registry (handles
   // dedup when multiple profiles share the same provider name).
@@ -460,10 +460,23 @@ export async function runJob(
     throw setupErr;
   }
   let agentAnswer: string | undefined;
+  // Terminal error message for the run-detail SSE stream: set when the run
+  // ends failed (stopReason=error fallthrough or a thrown error), read by the
+  // finally block to emit the bus's terminal event before it's dropped.
+  let runError: string | null = null;
   try {
     if (prBranch) {
       // PR comment mode or issue-with-PR: create a fresh branch from the
       // existing PR's branch. A stacked PR will be opened targeting it.
+      // When the existing open PR is Noodle's own (its branch IS the bare
+      // `<agent>/issue-<N>` name), stacking onto it head-on would push this
+      // run's commits onto the OLD PR and then create a head===base PR that
+      // GitHub rejects with 422. Uniquify the work branch instead — same
+      // pattern as background-run's stacked branches.
+      if (prBranch === branchName) {
+        branchName = `${branchName}-${randomHash(3)}`;
+        log_.info({ branchName, base: prBranch }, "existing PR is on our own issue branch — uniquifying stacked branch");
+      }
       await ws.branchFrom(branchName, prBranch, cloneUrlFor(input.repo, await freshToken()));
     } else {
       // Fresh issue: branch off the cloned default branch.
@@ -536,8 +549,7 @@ export async function runJob(
     const sessionCreateOpts = {
       cwd: ws.path,
       model,
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       settingsManager,
       resourceLoader: loader,
       // Forward the profile's thinking level. pi-ai clamps it to what the model
@@ -556,10 +568,13 @@ export async function runJob(
       subscribeForLogging(session, log_);
       const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs, rateLimitTimeoutMs: rateLimitMs });
       const unsubStall = watcher.attach();
-      // Register the live session so the cancel endpoint can abort it. Updated
-      // on every restart so the registry always holds the current session.
+      // Register the live session so the cancel endpoint can abort it, and
+      // bridge pi's events onto the job's bus so the run detail page can
+      // stream them via SSE. Updated on every restart so the registry always
+      // holds the current session.
       deps?.liveRuns?.set(jobId, session);
-      return { session, sessionManager, watcher, unsubStall };
+      const unsubEvents = deps?.liveRuns ? attachEventBridge(session, deps.liveRuns.events(jobId)) : undefined;
+      return { session, sessionManager, watcher, unsubStall, unsubEvents };
     };
 
     log_.info(
@@ -572,19 +587,27 @@ export async function runJob(
     let currentManager = SessionManager.create(ws.path, sessionDir);
     let booted = await bootSession(currentManager);
     let promptError: unknown = null;
+    // Persist the session file path up front so a mid-run page load can show
+    // the turns completed so far (readSession tolerates a missing file). The
+    // post-run update below records the same path again.
+    if (runStore) {
+      const sessionPath = booted.sessionManager.getSessionFile() ?? undefined;
+      if (sessionPath) runStore.updateRun(jobId, { session_path: sessionPath });
+    }
 
     for (let attempt = 0, totalRestarts = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++, totalRestarts++) {
       if (totalRestarts > SESSION_RESTART_HARD_CAP) {
         log_.warn({ totalRestarts }, "hit hard cap on total restarts — giving up");
         break;
       }
-      const { session, sessionManager, watcher, unsubStall } = booted;
+      const { session, sessionManager, watcher, unsubStall, unsubEvents } = booted;
       const turnsBefore = session.getSessionStats?.()?.assistantMessages ?? 0;
       try {
         await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
       } catch (e) {
         watcher.dispose();
         unsubStall?.();
+        unsubEvents?.();
         // Translate the abort-into-reject of a stalled run into a typed error so
         // the queue can skip retrying it (a stall won't recover on its own).
         // Use the tripped budget for an accurate duration/label (rateLimit
@@ -610,12 +633,14 @@ export async function runJob(
       if (!promptError) {
         watcher.dispose();
         unsubStall?.();
+        unsubEvents?.();
         break;
       }
 
       // Failure — dispose, optionally restart.
       watcher.dispose();
       unsubStall?.();
+      unsubEvents?.();
 
       // Fail fast on non-retryable errors (404, auth, quota, context overflow).
       // These never recover on retry — but pi still counts the errored assistant
@@ -729,6 +754,7 @@ export async function runJob(
       const errored = stopReason.stopReason === "error";
       if (errored) {
         const errMsg = stopReason.errorMessage ?? "unknown error";
+        runError = errMsg;
         log_.error({ errorMessage: errMsg, stopReason: stopReason.stopReason }, "agent run ended on error");
       } else {
         // Capture the agent's final message — its actual answer. Posted as the
@@ -770,11 +796,19 @@ export async function runJob(
           // Open a new PR. Base = existing PR's branch (stacked) or default branch.
           const prBody = buildPrBody(profile, changedFiles, issue.html_url, agentAnswer, agentName, runStats);
           const prBase = prBranch ?? baseBranch;
+          // Title in the standard tagged format; the `Closes <url>` in the body
+          // (not the title) carries the issue linkage.
+          const prTitle = await generateIssueTitle(
+            agentAnswer ?? "",
+            issue.title,
+            { model, modelRegistry },
+            { kind: "pr", agentName },
+          );
           const prResult = await ghNow.createPullRequest(
             input.repo,
             branchName,
             prBase,
-            isPR ? `Update PR #${input.issueNumber}: ${issue.title}` : `Fixes #${issue.number}: ${issue.title}`,
+            prTitle,
             prBody,
           );
           log_.info({ pr: prResult.html_url, changedFiles, base: prBase }, "opened PR");
@@ -867,10 +901,13 @@ export async function runJob(
     if (runStore) {
       runStore.updateRun(jobId, { status: "failed", error: (e as Error).message ?? String(e), finished_at: nowIso() });
     }
+    runError = (e as Error).message ?? String(e);
     throw e;
   } finally {
-    // Remove from the live registry so a late cancel is a clean no-op rather
-    // than aborting a session whose run loop has already exited.
+    // Tell any connected run-detail SSE client the run reached a terminal
+    // state, then drop the registry entry — which also drops the bus, so a
+    // late subscriber hits the route's synthetic done instead of hanging.
+    deps?.liveRuns?.emit(jobId, runError ? { type: "error", message: runError } : { type: "done" });
     deps?.liveRuns?.delete(jobId);
     await ws.dispose();
   }
@@ -891,6 +928,11 @@ function nowIso(): string {
  */
 function branchNameFor(issueNumber: number, agentSlug: string): string {
   return `${agentSlug}/issue-${issueNumber}`;
+}
+
+/** Short hex suffix for branch-name uniqueness (mirrors background-run's helper). */
+function randomHash(bytes: number): string {
+  return randomBytes(bytes).toString("hex").slice(0, bytes * 2);
 }
 
 /**
@@ -1291,13 +1333,6 @@ function formatTokens(n: number): string {
   return String(Math.round(n));
 }
 
-// Integer percent of `part` relative to `whole`. Returns "0%" when whole is 0
-// rather than NaN — should never hit at runtime but cheap to be defensive.
-function pctOf(part: number, whole: number): string {
-  if (!whole) return "0%";
-  return `${Math.round((part / whole) * 100)}%`;
-}
-
 /** Format a USD cost, trimming to cents for small amounts. */
 function formatCost(usd: number): string {
   if (usd < 0.01) return `$${usd.toFixed(4)}`;
@@ -1358,11 +1393,11 @@ export function buildFooter(
         `${formatTokens(t.output)} out`,
       ];
       // Cache tokens only surface for providers that support prompt caching
-      // (Anthropic, an Anthropic-protocol proxy). Rendered as a percentage of
-      // input tokens — the ratio that actually tells you how much was reused
-      // vs reread.
-      if (t.cacheRead > 0) parts.push(`${pctOf(t.cacheRead, t.input)} cache read`);
-      if (t.cacheWrite > 0) parts.push(`${pctOf(t.cacheWrite, t.input)} cache write`);
+      // (Anthropic, an Anthropic-protocol proxy). Absolute counts — a ratio
+      // reads absurd on long runs, where per-turn cache reuse is many times
+      // the input size.
+      if (t.cacheRead > 0) parts.push(`${formatTokens(t.cacheRead)} cache read`);
+      if (t.cacheWrite > 0) parts.push(`${formatTokens(t.cacheWrite)} cache write`);
       parts.push(`${formatTokens(t.total)} total`);
       lines.push(`Tokens: ${parts.join(" · ")}`);
 
@@ -1405,7 +1440,9 @@ export function buildPrBody(
   if (changedFiles.length) {
     lines.push("**Changed files:**", ...changedFiles.map((f) => `- \`${f}\``), "");
   }
-  lines.push("---", buildFooter(prof, agentName, stats), "", `Closes ${issueUrl}`);
+  const closing = issueUrl ? `Closes ${issueUrl}` : "";
+  lines.push("---", buildFooter(prof, agentName, stats));
+  if (closing) lines.push("", closing);
   return lines.join("\n");
 }
 

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { RunStore } from "./run-store.js";
-import type { LiveRunRegistry } from "../engine/live-runs.js";
+import type { LiveRunRegistry, RunStreamEvent } from "../engine/live-runs.js";
 import type { JobQueue } from "./queue.js";
 import { SchedulerStore } from "./scheduler-store.js";
 import type { NewSchedulerJob, SchedulerUpdate } from "./scheduler-store.js";
@@ -190,6 +190,62 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     // temp paths that leak from pi's session records.
     const messages: ParsedMessage[] = run.session_path ? readSession(run.session_path) : [];
     return { run, messages };
+  });
+
+  // --- SSE stream of live agent events for a run (run detail page). Same
+  // frame shape as the chat stream: pi events translated by attachEventBridge,
+  // fanned out through the LiveRunRegistry's per-job bus, terminal done/error
+  // emitted by the run path's finally block. If the run has no live session
+  // (already finished, or still in a pre-session phase like cloning), a
+  // synthetic `done` is sent immediately so the client closes cleanly instead
+  // of hanging. Heartbeat comment every 15s keeps proxies from dropping the
+  // connection during quiet stretches. ---
+  app.get("/api/runs/:id/stream", { preHandler: auth }, async (req, reply) => {
+    const { id } = req.params as { id: string }; // e.g. "job-19"
+    try {
+      runStore.getRun(id);
+    } catch {
+      return reply.code(404).send({ error: "run not found" });
+    }
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    reply.raw.write("retry: 3000\n\n");
+
+    const bus = liveRuns.events(id);
+    const onEvent = (e: RunStreamEvent) => {
+      try {
+        reply.raw.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+      } catch {
+        /* client gone — the close handler tears down */
+      }
+    };
+    bus.on("event", onEvent);
+
+    const heartbeat = setInterval(() => {
+      try {
+        reply.raw.write(": heartbeat\n\n");
+      } catch { /* best-effort */ }
+    }, 15_000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      bus.off("event", onEvent);
+    };
+    req.raw.on("close", cleanup);
+
+    if (!liveRuns.isBusy(id)) {
+      reply.raw.write("event: done\ndata: " + JSON.stringify({ type: "done" }) + "\n\n");
+    }
+
+    // Hold the request open: return undefined so Fastify doesn't try to
+    // finalize the response (returning reply.raw here makes Fastify treat it
+    // as the handler's return value and close the socket). Same shape as
+    // /api/logs/stream.
   });
 
   // --- Cancel a running job. Aborts the live pi session (actually stops the
@@ -1535,9 +1591,10 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
       reply.raw.write("event: done\ndata: " + JSON.stringify({ type: "done" }) + "\n\n");
     }
 
-    // Hold the request open. Fastify wants the handler promise to stay
-    // pending; reply.raw is being written to directly.
-    return reply.raw;
+    // Hold the request open: return undefined so Fastify doesn't try to
+    // finalize the response (returning reply.raw makes Fastify treat it as
+    // the handler's return value and close the socket). Same shape as
+    // /api/logs/stream.
   });
 }
 

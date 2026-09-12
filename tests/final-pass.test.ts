@@ -1,22 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { templateTitle } from "../src/engine/title.js";
+import { runFinalPass, templateTitle } from "../src/engine/final-pass.js";
 import type { Model, Api } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 // --- mocks ----------------------------------------------------------------
 //
-// phraseOutput / generateIssueTitle now call pi-ai's completeSimple with the
-// run's resolved model + registry (inheriting the agent's profile/key/base_url/
-// protocol), instead of hand-rolling a fetch to the relay. So the tests mock
-// completeSimple directly — both the success shape (text content) and the
-// failure modes (throw / empty / error stopReason) that must fall back.
+// phraseOutput / generateIssueTitle / runFinalPass call pi-ai's completeSimple
+// with the run's resolved model + registry (inheriting the agent's profile/key/
+// base_url/protocol). The tests mock completeSimple directly — both the success
+// shape (text content) and the failure modes (throw / empty / error stopReason)
+// that must fall back.
 //
 // Auth resolution goes through modelRegistry.getApiKeyAndHeaders(model); we stub
 // the registry to return ok+test key so the calls reach completeSimple.
 
 const TEST_API_KEY = "sk-test-key";
 
-/** A minimal Model shape — only id/provider/api/baseUrl are read by title.ts. */
+/** A minimal Model shape — only id/provider/api/baseUrl are read by final-pass.ts. */
 function mockModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
   return {
     id: "test-model",
@@ -47,8 +47,8 @@ vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
   };
 });
 
-// Import AFTER the mock is registered so title.ts picks up the mocked binding.
-const { phraseOutput, generateIssueTitle } = await import("../src/engine/title.js");
+// Import AFTER the mock is registered so final-pass.ts picks up the mocked binding.
+const { phraseOutput, generateIssueTitle } = await import("../src/engine/final-pass.js");
 const { completeSimple } = await import("@earendil-works/pi-ai/compat");
 const mockedCompleteSimple = vi.mocked(completeSimple);
 
@@ -68,7 +68,7 @@ function fakeAssistant(text: string, stopReason: "stop" | "error" = "stop", erro
 }
 
 describe("templateTitle (fallback)", () => {
-  it("uses the first non-empty line of the task, capped to 80 chars", () => {
+  it("uses the first non-empty line of the task, capped to 50 chars", () => {
     expect(templateTitle("Find bugs and open issues.")).toBe("Find bugs and open issues.");
   });
 
@@ -79,7 +79,7 @@ describe("templateTitle (fallback)", () => {
   it("truncates a long first line with an ellipsis on a word boundary", () => {
     const long = "Check if the logs still use cron=true when logging to the console during scheduled runs are running";
     const title = templateTitle(long);
-    expect(title.length).toBeLessThanOrEqual(80);
+    expect(title.length).toBeLessThanOrEqual(50);
     expect(title.endsWith("…")).toBe(true);
   });
 
@@ -147,36 +147,108 @@ describe("generateIssueTitle", () => {
 
   const ctx = { model: mockModel(), modelRegistry: mockRegistry() };
 
-  it("returns the cleaned title on success", async () => {
+  it("wraps the cleaned title in the default Issue tag line", async () => {
     mockedCompleteSimple.mockResolvedValue(fakeAssistant("DB connection pool leak on response destroy") as never);
     const title = await generateIssueTitle("findings...", "the task", ctx);
-    expect(title).toBe("DB connection pool leak on response destroy");
+    expect(title).toBe("Noodle Issue - DB connection pool leak on response destroy");
+  });
+
+  it("uses the PR tag line for kind 'pr'", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("DB connection pool leak on destroy") as never);
+    const title = await generateIssueTitle("findings...", "the task", ctx, { kind: "pr" });
+    expect(title).toBe("Noodle PR - DB connection pool leak on destroy");
+  });
+
+  it("uses the configured agent name in the tag line", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("pool leak under disconnects") as never);
+    const title = await generateIssueTitle("findings...", "the task", ctx, { agentName: "mybot" });
+    expect(title).toBe("Mybot Issue - pool leak under disconnects");
   });
 
   it("strips a leading 'Bug:' prefix the model sometimes adds", async () => {
     mockedCompleteSimple.mockResolvedValue(fakeAssistant("Bug: pool leak under disconnects") as never);
     const title = await generateIssueTitle("findings...", "the task", ctx);
-    expect(title).toBe("pool leak under disconnects");
+    expect(title).toBe("Noodle Issue - pool leak under disconnects");
   });
 
-  it("falls back to template when the model returns empty", async () => {
+  it("cuts an over-long title at a clause boundary without an ellipsis", async () => {
+    mockedCompleteSimple.mockResolvedValue(
+      fakeAssistant("Cache-stats footer renders 1550%, confusing operators reading triage lists") as never,
+    );
+    const title = await generateIssueTitle("findings...", "the task", ctx);
+    // 50-char window ends after "1550%," — the dangling tail is dropped.
+    expect(title).toBe("Noodle Issue - Cache-stats footer renders 1550%");
+  });
+
+  it("falls back to untagged template when the model returns empty", async () => {
     mockedCompleteSimple.mockResolvedValue(fakeAssistant("   ") as never);
     const title = await generateIssueTitle("findings...", "Find bugs and open issues.", ctx);
     expect(title).toBe("Find bugs and open issues.");
   });
 
-  it("falls back to template when completeSimple throws", async () => {
+  it("falls back to untagged template when completeSimple throws", async () => {
     mockedCompleteSimple.mockRejectedValueOnce(new Error("upstream 503") as never);
     const title = await generateIssueTitle("findings...", "Find bugs.", ctx);
     expect(title).toBe("Find bugs.");
   });
 
-  it("falls back to template when auth resolution fails", async () => {
+  it("falls back to untagged template when auth resolution fails", async () => {
     const badCtx = {
       model: mockModel(),
       modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key" }) } as never,
     };
     const title = await generateIssueTitle("findings...", "Find bugs.", badCtx);
     expect(title).toBe("Find bugs.");
+  });
+});
+
+describe("runFinalPass (generic entry)", () => {
+  beforeEach(() => mockedCompleteSimple.mockReset());
+
+  const ctx = { model: mockModel(), modelRegistry: mockRegistry() };
+  const req = { label: "test pass", system: "sys", input: "user text", maxTokens: 256 };
+
+  it("returns the model's text on success and passes auth through", async () => {
+    mockedCompleteSimple.mockResolvedValue(fakeAssistant("the result") as never);
+    const result = await runFinalPass(ctx, req);
+    expect(result).toBe("the result");
+    expect(mockedCompleteSimple).toHaveBeenCalledTimes(1);
+    const [model, , options] = mockedCompleteSimple.mock.calls[0];
+    expect(model.id).toBe("test-model");
+    expect(options?.apiKey).toBe(TEST_API_KEY);
+    expect(options?.maxTokens).toBe(256);
+  });
+
+  it("returns null (never throws) when the call fails", async () => {
+    mockedCompleteSimple.mockRejectedValueOnce(new Error("relay down") as never);
+    expect(await runFinalPass(ctx, req)).toBeNull();
+  });
+
+  it("returns null when the model errors or returns nothing", async () => {
+    mockedCompleteSimple.mockResolvedValueOnce(fakeAssistant("", "error", "boom") as never);
+    expect(await runFinalPass(ctx, req)).toBeNull();
+    mockedCompleteSimple.mockResolvedValueOnce(fakeAssistant("  ") as never);
+    expect(await runFinalPass(ctx, req)).toBeNull();
+  });
+
+  it("returns null when auth resolution fails, without calling the model", async () => {
+    const badCtx = {
+      model: mockModel(),
+      modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key" }) } as never,
+    };
+    const result = await runFinalPass(badCtx, req);
+    expect(result).toBeNull();
+    expect(mockedCompleteSimple).not.toHaveBeenCalled();
+  });
+
+  it("keeps only text content (thinking blocks are ignored)", async () => {
+    mockedCompleteSimple.mockResolvedValue({
+      ...fakeAssistant("visible"),
+      content: [
+        { type: "thinking", thinking: "hmm" },
+        { type: "text", text: "visible" },
+      ],
+    } as never);
+    expect(await runFinalPass(ctx, req)).toBe("visible");
   });
 });

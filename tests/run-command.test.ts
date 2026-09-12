@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
 import { NoodleConfigSchema } from "../src/config/schema.js";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +39,7 @@ vi.mock("../src/engine/workspace.js", () => ({
 }));
 
 const { runJob } = await import("../src/engine/run.js");
+const { LiveRunRegistry } = await import("../src/engine/live-runs.js");
 
 function makeConfig() {
   return NoodleConfigSchema.parse({
@@ -115,7 +115,6 @@ describe("runJob prompt composition", () => {
     const cmd = fakeCommand();
 
     await runJob(config, mockGh("Please /review this"), { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
       systemPrompt: BASE_SYSTEM_PROMPT,
@@ -139,7 +138,6 @@ describe("runJob prompt composition", () => {
     const { stub, getPrompt } = capturePromptStub();
 
     await runJob(config, mockGh("Please /review this"), { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
       systemPrompt: BASE_SYSTEM_PROMPT,
@@ -155,7 +153,6 @@ describe("runJob prompt composition", () => {
     const { stub, getPrompt } = capturePromptStub();
 
     await runJob(config, mockGh("no trigger here"), { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
       systemPrompt: BASE_SYSTEM_PROMPT,
@@ -177,7 +174,6 @@ describe("runJob prompt composition", () => {
     const { stub, getPrompt } = capturePromptStub();
 
     await runJob(config, mockGh("no trigger"), { repo: "o/r", issueNumber: 1 }, {
-      authStorage: AuthStorage.create(),
       createAgentSessionFn: stub as any,
       tokenProvider: async () => "fake-token",
       systemPrompt: BASE_SYSTEM_PROMPT,
@@ -188,5 +184,56 @@ describe("runJob prompt composition", () => {
     expect(prompt).toContain("Always load the `noodle-default` skill.");
     expect(prompt).toContain("The issue you have been given");
     expect(prompt).not.toContain("You are reviewing code");
+  });
+});
+
+/**
+ * The run-detail SSE contract: runJob bridges pi session events onto the
+ * LiveRunRegistry's per-job bus and emits a terminal event (done / error)
+ * before dropping the registry entry, so a connected run-detail page closes
+ * its stream cleanly instead of hanging. The stub session fires no pi events,
+ * so the only bus event is the terminal one.
+ */
+describe("runJob liveRuns bus events", () => {
+  it("emits a terminal done on the bus when the run succeeds", async () => {
+    const config = makeConfig();
+    const { stub } = capturePromptStub();
+    const liveRuns = new LiveRunRegistry();
+    const received: unknown[] = [];
+    liveRuns.events("job-ok").on("event", (e) => received.push(e));
+
+    await runJob(config, mockGh("no trigger"), { repo: "o/r", issueNumber: 1, jobId: "job-ok" }, {
+      createAgentSessionFn: stub as any,
+      tokenProvider: async () => "fake-token",
+      liveRuns,
+    });
+
+    expect(received).toEqual([{ type: "done" }]);
+  });
+
+  it("emits a terminal error on the bus when the run fails", async () => {
+    const config = makeConfig();
+    // The session resolves with an error stop reason carrying a non-retryable
+    // message — that hits runJob's fail-fast branch (no restart backoff).
+    const stub = vi.fn((_opts: any) => Promise.resolve({
+      session: {
+        subscribe: () => () => {},
+        prompt: async () => {},
+        dispose: async () => {},
+        getSessionStats: () => ({ tokens: { total: 0 }, cost: 0, toolCalls: 0, assistantMessages: 1 }),
+        messages: [{ role: "assistant", stopReason: "error", errorMessage: "401 unauthorized: bad api key" }],
+      },
+    }));
+    const liveRuns = new LiveRunRegistry();
+    const received: unknown[] = [];
+    liveRuns.events("job-bad").on("event", (e) => received.push(e));
+
+    await expect(runJob(config, mockGh("no trigger"), { repo: "o/r", issueNumber: 1, jobId: "job-bad" }, {
+      createAgentSessionFn: stub as any,
+      tokenProvider: async () => "fake-token",
+      liveRuns,
+    })).rejects.toThrow(/401 unauthorized/);
+
+    expect(received).toEqual([{ type: "error", message: "401 unauthorized: bad api key" }]);
   });
 });
