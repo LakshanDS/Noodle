@@ -480,3 +480,11 @@ export type ChatStreamEvent =
   | { type: "turn_end"; text: string }
   | { type: "error"; message: string }
   | { type: "done" };
+
+/**
+ * Event shape the run SSE stream ships to the browser. Identical to
+ * ChatStreamEvent (the server uses the same attachEventBridge for chats and
+ * runs) — aliased so the run view isn't coupled to "chat" naming. Source of
+ * truth for the union is ChatStreamEvent above.
+ */
+export type RunStreamEvent = ChatStreamEvent;

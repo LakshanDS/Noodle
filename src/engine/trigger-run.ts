@@ -26,11 +26,6 @@ import type { NoodleConfig } from "../config/schema.js";
 import { runBackgroundJob, type BackgroundRunDeps } from "./background-run.js";
 import type { RunResult } from "./run.js";
 
-/** AuthStorage instance type (passed through from deps to the engine). */
-type AuthStorageInstance = ReturnType<
-  typeof import("@earendil-works/pi-coding-agent").AuthStorage.create
->;
-
 /**
  * Input for an event-driven trigger run. Kept for caller compatibility — the
  * engine consumes `BackgroundRunInput` directly, and `runTriggerJob` adapts
@@ -67,7 +62,6 @@ export async function runTriggerJob(
   gh: GitHubClient,
   input: TriggerRunInput,
   deps?: {
-    authStorage?: AuthStorageInstance;
     runStore?: import("../server/run-store.js").RunStore;
     createAgentSessionFn?: typeof import("@earendil-works/pi-coding-agent").createAgentSession;
     /** Live run registry — forwarded to runBackgroundJob for cancel support. */
@@ -83,7 +77,6 @@ export async function runTriggerJob(
   const triggerId = deps?.triggerId;
   const triggerStore = deps?.triggerStore;
   const engineDeps: BackgroundRunDeps = {
-    authStorage: deps?.authStorage,
     runStore: deps?.runStore,
     liveRuns: deps?.liveRuns,
     createAgentSessionFn: deps?.createAgentSessionFn,

@@ -2,14 +2,15 @@
 /**
  * An expandable tool-call chip beneath an assistant message. Collapsed it shows
  * a monospace label (summarizeArgs) + a chevron; expanded, the pretty-printed
- * args JSON in a mono code block.
+ * args JSON in a mono code block. `state` is only set by live streaming views:
+ * pending (spinner) while the call is in flight, ok/error once it resolved.
  */
 import { ref } from "vue";
 import type { ParsedToolCall } from "../../api/types.js";
 import { summarizeArgs } from "../../lib/format.js";
 import Icon from "../ui/Icon.vue";
 
-const props = defineProps<{ call: ParsedToolCall }>();
+const props = defineProps<{ call: ParsedToolCall; state?: "pending" | "ok" | "error" }>();
 const open = ref(false);
 const label = summarizeArgs(props.call.name, props.call.args);
 const argsJson = JSON.stringify(props.call.args, null, 2);
@@ -21,6 +22,9 @@ const argsJson = JSON.stringify(props.call.args, null, 2);
       <span class="tool-glyph"><Icon name="bolt" :size="11" /></span>
       <span class="tool-name mono">{{ call.name }}</span>
       <span class="tool-summary ellipsis">{{ label }}</span>
+      <span v-if="state === 'pending'" class="tool-state"><span class="spinner" /></span>
+      <span v-else-if="state === 'ok'" class="tool-state ok">✓</span>
+      <span v-else-if="state === 'error'" class="tool-state err">✗</span>
       <Icon name="chevronDown" :size="14" class="chev" />
     </button>
     <div v-if="open" class="tool-body">
@@ -75,6 +79,28 @@ const argsJson = JSON.stringify(props.call.args, null, 2);
 }
 .open .chev {
   transform: rotate(180deg);
+}
+.tool-state {
+  flex: 0 0 auto;
+  font-weight: var(--weight-semibold);
+}
+.tool-state.ok {
+  color: var(--success);
+}
+.tool-state.err {
+  color: var(--danger);
+}
+.spinner {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tool-spin 0.8s linear infinite;
+}
+@keyframes tool-spin {
+  to { transform: rotate(360deg); }
 }
 .tool-body {
   margin-top: var(--space-1);

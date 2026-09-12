@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { NoodleConfigSchema, crossValidate } from "../src/config/schema.js";
 import { registerCustomProviders } from "../src/profiles/custom-providers.js";
-import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 /** A minimal valid profile — base_url + api are required (every profile is a custom endpoint). */
 function profile(model = "llama") {
@@ -67,11 +67,11 @@ describe("custom endpoint config validation", () => {
 });
 
 describe("registerCustomProviders", () => {
-  function freshRegistry() {
-    return ModelRegistry.create(AuthStorage.create());
+  async function freshRegistry() {
+    return new ModelRegistry(await ModelRuntime.create());
   }
 
-  it("registers an OpenAI-compatible custom provider so find() resolves", () => {
+  it("registers an OpenAI-compatible custom provider so find() resolves", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -84,7 +84,7 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     const m = reg.find("vllm", "llama-3.1");
     expect(m.id).toBe("llama-3.1");
@@ -92,7 +92,7 @@ describe("registerCustomProviders", () => {
     expect(m.baseUrl).toBe("http://localhost:8000/v1");
   });
 
-  it("registers an Anthropic-compatible custom provider", () => {
+  it("registers an Anthropic-compatible custom provider", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -104,13 +104,13 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     const m = reg.find("proxy", "claude-proxy");
     expect(m.api).toBe("anthropic-messages");
   });
 
-  it("registers a custom provider with pricing from the profile config", () => {
+  it("registers a custom provider with pricing from the profile config", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -124,14 +124,14 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     const m = reg.find("deepseek", "deepseek-chat");
     expect(m.cost.input).toBe(0.14);
     expect(m.cost.output).toBe(0.28);
   });
 
-  it("defaults pricing to 0 when not set (local models)", () => {
+  it("defaults pricing to 0 when not set (local models)", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -143,7 +143,7 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     const m = reg.find("ollama", "llama3");
     expect(m.cost.input).toBe(0);
@@ -152,7 +152,7 @@ describe("registerCustomProviders", () => {
     expect(m.cost.cacheWrite).toBe(0);
   });
 
-  it("registers custom endpoints with reasoning disabled by default", () => {
+  it("registers custom endpoints with reasoning disabled by default", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -164,12 +164,12 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     expect(reg.find("vllm", "llama3").reasoning).toBe(false);
   });
 
-  it("registers custom endpoints with reasoning enabled when set in config", () => {
+  it("registers custom endpoints with reasoning enabled when set in config", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -182,12 +182,12 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     expect(reg.find("deepseek", "deepseek-reasoner").reasoning).toBe(true);
   });
 
-  it("registers cache pricing for an Anthropic-protocol proxy", () => {
+  it("registers cache pricing for an Anthropic-protocol proxy", async () => {
     const config = NoodleConfigSchema.parse({
       ...base,
       profiles: {
@@ -203,7 +203,7 @@ describe("registerCustomProviders", () => {
         },
       },
     });
-    const reg = freshRegistry();
+    const reg = await freshRegistry();
     registerCustomProviders(config, reg);
     const m = reg.find("proxy", "our-finetune-v2");
     expect(m.cost.input).toBe(3.0);
@@ -252,7 +252,7 @@ describe("profile pricing config", () => {
     expect(c.profiles.p.cache_write_price).toBe(3.75);
   });
 
-  it("defaults all prices to 0 when omitted", () => {
+  it("defaults all prices to 0 when omitted", async () => {
     const c = NoodleConfigSchema.parse({
       ...base,
       profiles: { p: profile() },

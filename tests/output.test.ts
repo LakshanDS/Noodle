@@ -69,16 +69,29 @@ describe("buildFooter", () => {
     expect(f).not.toContain("cache write");
   });
 
-  it("includes cache tokens when non-zero (caching providers)", () => {
+  it("includes cache tokens as absolute counts when non-zero (caching providers)", () => {
     const cacheStats: RunStats = {
       ...stats,
       tokens: { input: 45210, output: 3180, cacheRead: 12800, cacheWrite: 5000, total: 66190 },
     };
     const f = buildFooter(profile, "Noodle", cacheStats);
-    // Cache tokens render as a percentage of input tokens (12800/45210 ≈ 28%).
-    expect(f).toContain("28% cache read");
-    expect(f).toContain("11% cache write");
+    // Absolute counts — a percentage reads absurd on long runs (cache reuse
+    // is many times the input size).
+    expect(f).toContain("12.8K cache read");
+    expect(f).toContain("5K cache write");
     expect(f).toContain("66.19K total");
+    expect(f).not.toMatch(/\d+% cache/);
+  });
+
+  it("renders heavy multi-turn cache reuse as an absolute count, not >100%", () => {
+    // Regression for the "1550% cache read" footer seen in real runs.
+    const heavy: RunStats = {
+      ...stats,
+      tokens: { input: 114910, output: 16770, cacheRead: 1778000, cacheWrite: 0, total: 1909680 },
+    };
+    const f = buildFooter(profile, "Noodle", heavy);
+    expect(f).toContain("1.78M cache read");
+    expect(f).not.toContain("%");
   });
 
   it("includes cost for priced providers", () => {
@@ -135,6 +148,11 @@ describe("buildPrBody", () => {
     const body = buildPrBody(profile, changedFiles, "https://x/#42", undefined);
     expect(body).toMatch(/did not leave a summary/i);
     expect(body).toContain("Closes https://x/#42");
+  });
+
+  it("omits the Closes line when there is no issue URL (cron/trigger PRs)", () => {
+    const body = buildPrBody(profile, changedFiles, "", agentMessage);
+    expect(body).not.toMatch(/Closes/);
   });
 
   it("accepts legacy callsites passing profile name as a string", () => {

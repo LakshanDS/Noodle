@@ -12,17 +12,18 @@ import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { expandTags } from "./tags.js";
-import { generateIssueTitle, phraseOutput, templateTitle } from "./title.js";
+import { generateIssueTitle, phraseOutput, templateTitle } from "./final-pass.js";
 import { installSkills } from "../util/paths.js";
 import { collectSysFacts, buildSysInfoGuidance } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
 import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
+import { attachEventBridge } from "./chat-runtime.js";
 import type { LiveRunRegistry } from "./live-runs.js";
 import { defaultLabelSet, parseLabelSet, labelDescription, type LabelSet } from "./labels.js";
 import {
-  AuthStorage,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
   DefaultResourceLoader,
 } from "@earendil-works/pi-coding-agent";
@@ -38,8 +39,12 @@ import {
   type RunStats,
 } from "./run.js";
 
-/** AuthStorage instance type (its constructor is private; use the factory's return type). */
-type AuthStorageInstance = ReturnType<typeof AuthStorage.create>;
+/**
+ * ModelRuntime instance type (its constructor is private; use the factory's
+ * return type). Carries credential storage + the model catalog — the pi 0.85
+ * replacement for the old AuthStorage.
+ */
+type ModelRuntimeInstance = Awaited<ReturnType<typeof ModelRuntime.create>>;
 
 /**
  * Color applied to the agent-name label on background-run output — teal
@@ -112,7 +117,7 @@ export interface BackgroundRunInput {
  * `${agent}-Issue` or `${agent}-Trigger`).
  */
 export interface BackgroundRunDeps {
-  authStorage?: AuthStorageInstance;
+  modelRuntime?: ModelRuntimeInstance;
   runStore?: RunStore;
   /**
    * Live run registry — when set, the run registers its pi session here so the
@@ -213,8 +218,8 @@ export async function runBackgroundJob(
     log_.info({ profile: profile.name, model: profile.model }, "routed profile");
 
     // 2. Resolve model via the registry.
-    const authStorage = deps?.authStorage ?? AuthStorage.create();
-    const modelRegistry = ModelRegistry.create(authStorage);
+    const modelRuntime = deps?.modelRuntime ?? (await ModelRuntime.create());
+    const modelRegistry = new ModelRegistry(modelRuntime);
     const providerKeyMap = registerCustomProviders(config, modelRegistry);
     const providerKey = providerKeyMap.get(profile.name) ?? profile.name;
     let model: Model<Api> | undefined;
@@ -241,6 +246,10 @@ export async function runBackgroundJob(
     };
     const ws = await Workspace.clone(cloneUrlFor(input.repo, await freshToken()), jobId);
     let agentAnswer: string | undefined;
+    // Terminal error message for the run-detail SSE stream: set when the run
+    // ends failed (stopReason=error fallthrough or a thrown error), read by
+    // the finally block to emit the bus's terminal event before it's dropped.
+    let runError: string | null = null;
     try {
       // 4. Trunk + stacked-branch resolution. See runBackgroundJob doc comment.
       const baseBranch = await gh.defaultBranch(input.repo);
@@ -252,7 +261,7 @@ export async function runBackgroundJob(
           log_.warn({ files: mergeResult.files }, "trunk conflicted with main — spawning resolver");
           const resolved = await runConflictResolver(
             ws,
-            { model, authStorage, modelRegistry, profile, config, createAgentSessionFn: deps?.createAgentSessionFn, log_ },
+            { model, modelRuntime, profile, config, createAgentSessionFn: deps?.createAgentSessionFn, log_ },
             mergeResult.files,
           );
           if (!resolved) {
@@ -375,8 +384,7 @@ export async function runBackgroundJob(
       const sessionCreateOpts = {
         cwd: ws.path,
         model,
-        authStorage,
-        modelRegistry,
+        modelRuntime,
         settingsManager,
         resourceLoader: loader,
         thinkingLevel: profile.thinking_level,
@@ -388,10 +396,13 @@ export async function runBackgroundJob(
         subscribeForLogging(session, log_);
         const watcher = new StallWatcher(session, { idleTimeoutMs: idleMs, toolTimeoutMs: toolMs, rateLimitTimeoutMs: rateLimitMs });
         const unsubStall = watcher.attach();
-        // Register the live session so the cancel endpoint can abort it.
-        // Updated on every restart so the registry always holds the current one.
+        // Register the live session so the cancel endpoint can abort it, and
+        // bridge pi's events onto the job's bus so the run detail page can
+        // stream them via SSE. Updated on every restart so the registry
+        // always holds the current one.
         deps?.liveRuns?.set(jobId, session);
-        return { session, sessionManager, watcher, unsubStall };
+        const unsubEvents = deps?.liveRuns ? attachEventBridge(session, deps.liveRuns.events(jobId)) : undefined;
+        return { session, sessionManager, watcher, unsubStall, unsubEvents };
       };
 
       log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off", rateLimitTimeoutMs: rateLimitMs || "off" }, "starting background run");
@@ -400,19 +411,27 @@ export async function runBackgroundJob(
       let currentManager = SessionManager.create(ws.path, sessionDir);
       let booted = await bootSession(currentManager);
       let promptError: unknown = null;
+      // Persist the session file path up front so a mid-run page load can show
+      // the turns completed so far (readSession tolerates a missing file). The
+      // post-run update below records the same path again.
+      if (runStore) {
+        const sessionPath = booted.sessionManager.getSessionFile() ?? undefined;
+        if (sessionPath) runStore.updateRun(jobId, { session_path: sessionPath });
+      }
 
       for (let attempt = 0, totalRestarts = 0; attempt <= SESSION_RESTART_ATTEMPTS; attempt++, totalRestarts++) {
         if (totalRestarts > SESSION_RESTART_HARD_CAP) {
           log_.warn({ totalRestarts }, "hit hard cap on total restarts — giving up");
           break;
         }
-        const { session, watcher, unsubStall } = booted;
+        const { session, watcher, unsubStall, unsubEvents } = booted;
         const turnsBefore = session.getSessionStats?.()?.assistantMessages ?? 0;
         try {
           await session.prompt(attempt === 0 ? prompt : "Continue. The previous attempt failed — pick up where you left off.");
         } catch (e) {
           watcher.dispose();
           unsubStall?.();
+          unsubEvents?.();
           if (watcher.didStall) {
             // A stall is fatal to the whole run — throw out of the restart loop.
             // The queue treats StallTimeoutError as non-retryable, so the job
@@ -433,10 +452,12 @@ export async function runBackgroundJob(
         if (!promptError) {
           watcher.dispose();
           unsubStall?.();
+          unsubEvents?.();
           break;
         }
         watcher.dispose();
         unsubStall?.();
+        unsubEvents?.();
 
         // Fail fast on non-retryable errors (404, auth, quota, context overflow).
         // These never recover on retry — but pi still counts the errored assistant
@@ -530,6 +551,7 @@ export async function runBackgroundJob(
         const stopReason = lastAssistantStopReason(session);
         const errored = stopReason.stopReason === "error";
         if (errored) {
+          runError = stopReason.errorMessage ?? "agent run ended on error";
           log_.error({ errorMessage: stopReason.errorMessage, stopReason: stopReason.stopReason }, "background run ended on error");
         } else {
           agentAnswer = extractLastAssistantText(session);
@@ -570,7 +592,7 @@ export async function runBackgroundJob(
         await gh.ensureLabel(input.repo, outcome.name, outcome.color, labelDescription(outcomeStage));
 
         if (!errored && changedFiles.length > 0) {
-          const prTitle = await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry });
+          const prTitle = await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry }, { kind: "pr", agentName: config.agent_name });
           const prBody = buildPrBody(profile, changedFiles, "", agentAnswer, config.agent_name, runStats);
           const pr = await gh.createPullRequest(input.repo, workBranch, prBase, prTitle, prBody);
           prUrl = pr.html_url;
@@ -587,7 +609,7 @@ export async function runBackgroundJob(
             : buildBackgroundIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
           const issueTitle = errored
             ? templateTitle(input.prompt)
-            : await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry });
+            : await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry }, { kind: "issue", agentName: config.agent_name });
           const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [outputLabel, outcome.name]);
           issueUrl = issue.html_url;
           log_.info({ issue: issue.number, url: issueUrl, errored, hadChanges: changedFiles.length > 0 }, "opened background-run output issue");
@@ -624,8 +646,13 @@ export async function runBackgroundJob(
         runStore.updateRun(jobId, { status: "failed", error: (e as Error).message ?? String(e), finished_at: nowIso() });
       }
       deps?.onStatus?.("failed");
+      runError = (e as Error).message ?? String(e);
       throw e;
     } finally {
+      // Tell any connected run-detail SSE client the run reached a terminal
+      // state, then drop the registry entry — which also drops the bus, so a
+      // late subscriber hits the route's synthetic done instead of hanging.
+      deps?.liveRuns?.emit(jobId, runError ? { type: "error", message: runError } : { type: "done" });
       // Remove from the live registry so a late cancel is a clean no-op.
       deps?.liveRuns?.delete(jobId);
       await ws.dispose();
@@ -744,8 +771,7 @@ function randomHash(bytes: number): string {
  */
 interface ConflictResolverDeps {
   model: Model<Api>;
-  authStorage: AuthStorageInstance;
-  modelRegistry: ReturnType<typeof ModelRegistry.create>;
+  modelRuntime: ModelRuntimeInstance;
   profile: Profile & { name: string; provider: string };
   config: NoodleConfig;
   createAgentSessionFn?: typeof createAgentSession;
@@ -769,7 +795,7 @@ async function runConflictResolver(
   deps: ConflictResolverDeps,
   conflictedFiles: string[],
 ): Promise<boolean> {
-  const { model, authStorage, modelRegistry, profile, config, log_ } = deps;
+  const { model, modelRuntime, profile, config, log_ } = deps;
   const create = deps.createAgentSessionFn ?? createAgentSession;
 
   const fileList = conflictedFiles.map((f) => `- \`${f}\``).join("\n");
@@ -793,8 +819,7 @@ async function runConflictResolver(
   const sessionCreateOpts = {
     cwd: ws.path,
     model,
-    authStorage,
-    modelRegistry,
+    modelRuntime,
     settingsManager,
     resourceLoader: loader,
     thinkingLevel: profile.thinking_level,

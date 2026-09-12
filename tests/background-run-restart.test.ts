@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
 import { NoodleConfigSchema } from "../src/config/schema.js";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +26,13 @@ import { join } from "node:path";
 vi.mock("../src/util/paths.js", () => ({
   installSkills: vi.fn().mockResolvedValue(undefined),
   noodleSkillsDir: () => "/tmp/skills",
+}));
+// Keep output shaping hermetic — the success paths reach the title/phrasing calls.
+vi.mock("../src/engine/final-pass.js", () => ({
+  phraseOutput: vi.fn(async (m: string) => m),
+  generateIssueTitle: vi.fn(async (_m: string, task: string, _c?: unknown, opts?: { kind?: string }) =>
+    opts?.kind === "pr" ? `TestBot PR - ${task}` : `TestBot Issue - ${task}`),
+  templateTitle: vi.fn((task: string) => task.split("\n").find((l: string) => l.trim()) ?? "scheduled sweep"),
 }));
 vi.mock("../src/engine/workspace.js", () => ({
   Workspace: {
@@ -156,7 +162,6 @@ describe("runBackgroundJob restart loop — fail-fast on non-retryable errors", 
           runKind: "scheduler",
         },
         {
-          authStorage: AuthStorage.create(),
           createAgentSessionFn: stub as any,
           tokenProvider: async () => "fake-token",
         },
@@ -182,7 +187,6 @@ describe("runBackgroundJob restart loop — fail-fast on non-retryable errors", 
           runKind: "scheduler",
         },
         {
-          authStorage: AuthStorage.create(),
           createAgentSessionFn: stub as any,
           tokenProvider: async () => "fake-token",
         },
@@ -208,7 +212,6 @@ describe("runBackgroundJob restart loop — fail-fast on non-retryable errors", 
           runKind: "scheduler",
         },
         {
-          authStorage: AuthStorage.create(),
           createAgentSessionFn: stub as any,
           tokenProvider: async () => "fake-token",
         },
@@ -262,7 +265,6 @@ describe("runBackgroundJob restart loop — sustained 429 does not loop forever"
           runKind: "scheduler",
         },
         {
-          authStorage: AuthStorage.create(),
           createAgentSessionFn: stub as any,
           tokenProvider: async () => "fake-token",
         },
@@ -363,7 +365,6 @@ describe("runBackgroundJob — task prompt tags are expanded", () => {
         runKind: "scheduler",
       },
       {
-        authStorage: AuthStorage.create(),
         createAgentSessionFn: stub as any,
         tokenProvider: async () => "fake-token",
       },

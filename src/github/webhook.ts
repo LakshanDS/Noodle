@@ -173,10 +173,11 @@ export function parseWebhookEvent(
     }
     // Only trigger on assignment when Noodle itself is the new assignee.
     // Assignment is unconditional wake (being assigned IS the signal) — it
-    // doesn't go through the trigger filter.
+    // doesn't go through the trigger filter. normalizeLogin strips the
+    // GitHub-App `[bot]` suffix so `<slug>[bot]` matches a bare-slug selfLogin.
     if (p.action === "assigned" && selfLogin) {
-      const newAssignee = p.assignee?.login?.toLowerCase();
-      if (newAssignee && newAssignee === selfLogin.toLowerCase()) {
+      const newAssignee = normalizeLogin(p.assignee?.login);
+      if (newAssignee && newAssignee === normalizeLogin(selfLogin)) {
         return { kind: "issue", repo, issueNumber, installationId };
       }
     }

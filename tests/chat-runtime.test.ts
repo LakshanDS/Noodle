@@ -65,12 +65,10 @@ vi.mock("../src/engine/stall.js", () => ({
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
-  AuthStorage: { create: vi.fn(() => ({})) },
-  ModelRegistry: {
-    create: vi.fn(() => ({
-      find: vi.fn(() => ({ id: "gpt-4o", name: "gpt-4o" })),
-    })),
-  },
+  ModelRuntime: { create: vi.fn(async () => ({})) },
+  ModelRegistry: vi.fn(() => ({
+    find: vi.fn(() => ({ id: "gpt-4o", name: "gpt-4o" })),
+  })),
   SessionManager: {
     create: vi.fn(() => ({
       getSessionDir: vi.fn(() => "/tmp/sessions/test"),
