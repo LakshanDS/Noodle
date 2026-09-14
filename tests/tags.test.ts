@@ -67,22 +67,37 @@ describe("expandTags — issue tags", () => {
     { number: 9, title: "Feature request", body: "", labels: [], html_url: "https://github.com/o/r/issues/9" },
   ];
 
-  it("expands {issue} to all issues", async () => {
+  it("expands {issue} to all issue titles", async () => {
     const result = await expandTags("{issue}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
-    expect(result).toContain("#10 Bug in login");
-    expect(result).toContain("[bug]");
-    expect(result).toContain("#9 Feature request");
+    expect(result).toContain("Bug in login");
+    expect(result).toContain("Feature request");
+    expect(result).not.toContain("http");
+    expect(result).not.toContain("#10");
   });
 
-  it("expands {issue.0} to the first issue", async () => {
+  it("expands {issue.0} to the first issue title", async () => {
     const result = await expandTags("{issue.0}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
-    expect(result).toContain("#10 Bug in login");
-    expect(result).not.toContain("#9");
+    expect(result).toBe("Bug in login");
   });
 
-  it("expands {issue.1} to the second issue", async () => {
+  it("expands {issue.1} to the second issue title", async () => {
     const result = await expandTags("{issue.1}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
-    expect(result).toContain("#9 Feature request");
+    expect(result).toBe("Feature request");
+  });
+
+  it("expands {issue.+1} to the latest issue title only", async () => {
+    const result = await expandTags("{issue.+1}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
+    expect(result).toBe("Bug in login");
+  });
+
+  it("expands {issue.+10} to all issues when fewer exist", async () => {
+    const result = await expandTags("{issue.+10}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
+    expect(result).toBe("Bug in login\nFeature request");
+  });
+
+  it("expands {issue.+0} to _(none)_", async () => {
+    const result = await expandTags("{issue.+0}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
+    expect(result).toBe("_(none)_");
   });
 
   it("expands out-of-range {issue.5} to empty string", async () => {
@@ -102,17 +117,22 @@ describe("expandTags — PR tags", () => {
     { number: 18, title: "Add tests", body: "", head_branch: "feat/tests", head_repo: "o/r", base_branch: "main", is_fork: false, html_url: "https://github.com/o/r/pull/18", state: "open" },
   ];
 
-  it("expands {pr} to all PRs", async () => {
+  it("expands {pr} to all PR titles", async () => {
     const result = await expandTags("{pr}", { sysFacts: facts, gh: mockGh([], prs), repo: "o/r" });
-    expect(result).toContain("#20 Fix auth");
-    expect(result).toContain("fix/auth → main");
-    expect(result).toContain("#18 Add tests");
+    expect(result).toContain("Fix auth");
+    expect(result).toContain("Add tests");
+    expect(result).not.toContain("http");
+    expect(result).not.toContain("fix/auth");
   });
 
-  it("expands {pr.0} to the first PR", async () => {
+  it("expands {pr.0} to the first PR title", async () => {
     const result = await expandTags("{pr.0}", { sysFacts: facts, gh: mockGh([], prs), repo: "o/r" });
-    expect(result).toContain("#20 Fix auth");
-    expect(result).not.toContain("#18");
+    expect(result).toBe("Fix auth");
+  });
+
+  it("expands {pr.+1} to the latest PR title only", async () => {
+    const result = await expandTags("{pr.+1}", { sysFacts: facts, gh: mockGh([], prs), repo: "o/r" });
+    expect(result).toBe("Fix auth");
   });
 
   it("expands out-of-range {pr.9} to empty string", async () => {
@@ -129,7 +149,7 @@ describe("expandTags — mixed and edge cases", () => {
     const text = "CPU: {system.cpu}\nIssues:\n{issue}";
     const result = await expandTags(text, { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
     expect(result).toContain("CPU cores: 4");
-    expect(result).toContain("#1 Test");
+    expect(result).toContain("Test");
   });
 
   it("leaves unknown tags as-is", async () => {
@@ -156,7 +176,7 @@ describe("expandTags — mixed and edge cases", () => {
 
     const result = await expandTags("{pr}\n---\n{pr.0}", { sysFacts: facts, gh, repo: "o/r" });
     expect(fetchCount).toBe(1);
-    expect(result).toContain("#1 A");
+    expect(result).toContain("A");
   });
 
   it("gracefully degrades on API failure", async () => {

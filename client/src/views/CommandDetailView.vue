@@ -327,8 +327,12 @@ onMounted(async () => {
             <div class="tag-row"><code class="inline mono">{system.cpu}</code> — CPU core count.</div>
             <div class="tag-row"><code class="inline mono">{system.ram}</code> — Total, free, and limit memory (MB).</div>
             <div class="tag-row"><code class="inline mono">{system.tier}</code> — constrained or capable.</div>
-            <div class="tag-row"><code class="inline mono">{pr.[n]}</code> — nth open PR (0-indexed): number, title, branches, URL.</div>
-            <div class="tag-row"><code class="inline mono">{issue.[n]}</code> — nth open issue (0-indexed): number, title, labels, URL.</div>
+            <div class="tag-row"><code class="inline mono">{pr}</code> — All open PR titles, one per line.</div>
+            <div class="tag-row"><code class="inline mono">{pr.0}</code> — nth open PR title (0-indexed, newest first).</div>
+            <div class="tag-row"><code class="inline mono">{pr.+10}</code> — Latest 10 open PR titles.</div>
+            <div class="tag-row"><code class="inline mono">{issue}</code> — All open issue titles, one per line.</div>
+            <div class="tag-row"><code class="inline mono">{issue.0}</code> — nth open issue title (0-indexed, newest first).</div>
+            <div class="tag-row"><code class="inline mono">{issue.+10}</code> — Latest 10 open issue titles.</div>
           </div>
         </Card>
       </aside>
