@@ -11,9 +11,11 @@
  *   {system.tier}  — "constrained" or "capable"
  *   {repository}   — the "owner/name" string for the repo the agent is working in
  *   {pr}           — all open PR titles (one per line)
- *   {pr.0}         — first open PR title (0-indexed)
+ *   {pr.0}         — first open PR title (0-indexed, newest first)
+ *   {pr.+10}       — latest 10 open PR titles
  *   {issue}        — all open issue titles (one per line)
- *   {issue.0}      — first open issue title (0-indexed)
+ *   {issue.0}      — first open issue title (0-indexed, newest first)
+ *   {issue.+10}    — latest 10 open issue titles
  *
  * Unknown tags and tags that can't be resolved (API failure, index out of
  * range) expand to an empty string — the run never crashes because of a typo
@@ -59,9 +61,9 @@ export async function expandTags(text: string, ctx: TagContext): Promise<string>
     return issueCache;
   }
 
-  // Match {word.word} or {word} or {word.number} patterns.
+  // Match {word.word} or {word} or {word.number} or {word.+number} patterns.
   // We process sequentially because PR/issue expansion is async.
-  const tagPattern = /\{([a-z]+)(?:\.([a-z0-9]+))?\}/gi;
+  const tagPattern = /\{([a-z]+)(?:\.(\+?\d+|[a-z0-9]+))?\}/gi;
   const matches: { tag: string; sub: string | undefined; index: number; full: string }[] = [];
   let m: RegExpExecArray | null;
   while ((m = tagPattern.exec(text)) !== null) {
@@ -135,9 +137,10 @@ function resolveSystemTag(sub: string | undefined, facts: SysFacts): string {
 }
 
 /**
- * Resolve {pr} / {pr.N} / {issue} / {issue.N} tags.
+ * Resolve {pr} / {pr.N} / {pr.+N} / {issue} / {issue.N} / {issue.+N} tags.
  * Without a sub-tag: return all items, one per line.
- * With a numeric sub-tag: return the item at that 0-indexed position (or empty if out of range).
+ * With a numeric sub-tag: the item at that 0-indexed position (or empty if out of range).
+ * With a +N sub-tag: the latest N items (the list is newest-first), one per line.
  */
 async function resolveListTag<T>(
   sub: string | undefined,
@@ -145,6 +148,11 @@ async function resolveListTag<T>(
   formatter: (item: T) => string,
 ): Promise<string> {
   const items = await fetcher();
+  if (sub?.startsWith("+")) {
+    const count = parseInt(sub.slice(1), 10);
+    const latest = items.slice(0, Math.max(0, count));
+    return latest.length > 0 ? latest.map(formatter).join("\n") : "_(none)_";
+  }
   if (!sub) {
     return items.length > 0 ? items.map(formatter).join("\n") : "_(none)_";
   }

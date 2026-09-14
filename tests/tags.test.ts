@@ -85,6 +85,21 @@ describe("expandTags — issue tags", () => {
     expect(result).toBe("Feature request");
   });
 
+  it("expands {issue.+1} to the latest issue title only", async () => {
+    const result = await expandTags("{issue.+1}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
+    expect(result).toBe("Bug in login");
+  });
+
+  it("expands {issue.+10} to all issues when fewer exist", async () => {
+    const result = await expandTags("{issue.+10}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
+    expect(result).toBe("Bug in login\nFeature request");
+  });
+
+  it("expands {issue.+0} to _(none)_", async () => {
+    const result = await expandTags("{issue.+0}", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
+    expect(result).toBe("_(none)_");
+  });
+
   it("expands out-of-range {issue.5} to empty string", async () => {
     const result = await expandTags("X{issue.5}Y", { sysFacts: facts, gh: mockGh(issues), repo: "o/r" });
     expect(result).toBe("XY");
@@ -112,6 +127,11 @@ describe("expandTags — PR tags", () => {
 
   it("expands {pr.0} to the first PR title", async () => {
     const result = await expandTags("{pr.0}", { sysFacts: facts, gh: mockGh([], prs), repo: "o/r" });
+    expect(result).toBe("Fix auth");
+  });
+
+  it("expands {pr.+1} to the latest PR title only", async () => {
+    const result = await expandTags("{pr.+1}", { sysFacts: facts, gh: mockGh([], prs), repo: "o/r" });
     expect(result).toBe("Fix auth");
   });
 
