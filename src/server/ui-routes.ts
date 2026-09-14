@@ -16,7 +16,7 @@ import { ChatStore } from "./chat-store.js";
 import { SkillStore, type SkillInput, type SkillUpdate } from "./skill-store.js";
 import { SettingStore, SETTING_CATALOG } from "./settings-store.js";
 import { ProfileStore, validateProfileInput, type StoredProfile } from "./profile-store.js";
-import type { AuthProvider } from "../github/auth-provider.js";
+import { isAppMode, type AuthProvider } from "../github/auth-provider.js";
 import type { NoodleConfig, Profile } from "../config/schema.js";
 import { ThinkingLevel, type ThinkingLevelT } from "../config/schema.js";
 import { labelsFor } from "../engine/run.js";
@@ -849,6 +849,56 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
     return { url: `https://github.com/apps/${slug}/installations/new` };
   });
 
+  /**
+   * Validate that the configured GitHub App's installation actually has the
+   * Checks: Read & write permission — the one permission the live PR check
+   * runs (RunCheck) need and the one most easily missed: it's granted at
+   * creation by the manifest (see create-app), but apps created before that —
+   * or configured by hand — lack it, and GitHub only 403s on the first run.
+   * Reads the installation's CURRENT permission grant via the App JWT, so an
+   * operator can verify a permission fix here without restarting Noodle.
+   */
+  app.get("/api/github/app-check-permission", { preHandler: auth }, async () => {
+    const slug = settingsStore.get("GITHUB_APP_SLUG")?.trim() ?? "";
+    const settingsUrl = slug
+      ? `https://github.com/settings/apps/${slug}/permissions`
+      : "https://github.com/settings/apps";
+    if (!isAppMode(settingsStore)) {
+      return { appMode: false };
+    }
+    try {
+      const repos = await authProvider.listRepos();
+      if (repos.length === 0) {
+        return {
+          appMode: true, ok: false, settingsUrl,
+          reason: "The App has no repository installations yet — install it on at least one repo first.",
+        };
+      }
+      const repo = repos[0].full_name;
+      const perms = await authProvider.appPermissions?.(repo);
+      if (!perms) {
+        return {
+          appMode: true, ok: false, settingsUrl, repo,
+          reason: "Could not read the installation's permissions — check the App ID and private key.",
+        };
+      }
+      const checks = perms.checks ?? "none";
+      const ok = checks === "write";
+      return {
+        appMode: true,
+        ok,
+        checks,
+        repo,
+        settingsUrl,
+        hint: ok
+          ? undefined
+          : "Live PR check runs are disabled. Fix: App settings → Permissions & events → Checks → Read and write, then accept the change under Installed GitHub Apps, and restart Noodle (cached installation tokens keep the old permissions for up to 1 hour).",
+      };
+    } catch (e) {
+      return { appMode: true, ok: false, settingsUrl, reason: (e as Error).message };
+    }
+  });
+
   app.get("/api/github/repos", { preHandler: auth }, async (_req, reply) => {
     try {
       const repos = await authProvider.listRepos();
@@ -938,6 +988,10 @@ export function registerUiRoutes(app: FastifyInstance, deps: UiDeps): void {
         pull_requests: "write",
         contents: "write",
         metadata: "read",
+        // Live PR check runs (RunCheck) — the Checks API rejects writes without
+        // this, and permission changes on EXISTING apps need manual re-approval,
+        // so new apps must be born with it.
+        checks: "write",
       },
       default_events: ["issues", "issue_comment", "pull_request"],
     };
