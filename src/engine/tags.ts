@@ -10,10 +10,10 @@
  *   {system.os}    — platform string (e.g. "linux x64")
  *   {system.tier}  — "constrained" or "capable"
  *   {repository}   — the "owner/name" string for the repo the agent is working in
- *   {pr}           — all open PRs (one per line)
- *   {pr.0}         — first open PR (0-indexed)
- *   {issue}        — all open issues (one per line)
- *   {issue.0}      — first open issue (0-indexed)
+ *   {pr}           — all open PR titles (one per line)
+ *   {pr.0}         — first open PR title (0-indexed)
+ *   {issue}        — all open issue titles (one per line)
+ *   {issue.0}      — first open issue title (0-indexed)
  *
  * Unknown tags and tags that can't be resolved (API failure, index out of
  * range) expand to an empty string — the run never crashes because of a typo
@@ -153,13 +153,14 @@ async function resolveListTag<T>(
   return formatter(items[idx]);
 }
 
-/** Format a PR for inline display in the system prompt. */
+/** Format a PR for inline display in the system prompt. Titles only — the agent
+ *  has no GitHub network access, so URLs/numbers are dead weight that invite
+ *  fetch attempts. The agent matches issues/PRs by title. */
 function formatPR(pr: PullRequestData): string {
-  return `#${pr.number} ${pr.title} (${pr.head_branch} → ${pr.base_branch}) — ${pr.html_url}`;
+  return pr.title;
 }
 
-/** Format an issue for inline display in the system prompt. */
+/** Format an issue for inline display in the system prompt. See formatPR. */
 function formatIssue(issue: IssueData): string {
-  const labels = issue.labels.length > 0 ? ` [${issue.labels.join(", ")}]` : "";
-  return `#${issue.number} ${issue.title}${labels} — ${issue.html_url}`;
+  return issue.title;
 }

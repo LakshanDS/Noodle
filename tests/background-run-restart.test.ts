@@ -371,10 +371,10 @@ describe("runBackgroundJob — task prompt tags are expanded", () => {
     );
 
     const prompt = captured();
-    // The tag must be replaced with the issue's title/URL — the literal
+    // The tag must be replaced with the issue's title — the literal
     // "{issue.0}" must NOT appear in what the agent receives.
     expect(prompt).not.toContain("{issue.0}");
     expect(prompt).toContain("Known bug: off-by-one in foo");
-    expect(prompt).toContain("https://x/issues/42");
+    expect(prompt).not.toContain("https://x/issues/42");
   });
 });
