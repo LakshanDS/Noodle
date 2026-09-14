@@ -188,6 +188,8 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         // Apply this cron's custom labels to its output issue; falls back to the
         // global defaults when the cron has no override (labels === null).
         labelOverrides: scheduler.labels,
+        // Live check runs are App-token exclusive — PAT setups get none.
+        checksEnabled: isAppMode(settingsStore),
       });
       return;
     }
@@ -226,6 +228,8 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         // `label` column); they use the global default label set.
         triggerStore,
         triggerId: trigger.id,
+        // Live check runs are App-token exclusive — PAT setups get none.
+        checksEnabled: isAppMode(settingsStore),
       });
       return;
     }
@@ -252,6 +256,8 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       resolveCommand: (texts) => commandStore.resolveByTrigger(texts),
       // Issue/PR runs use the global default labels for now (no per-run override).
       labelOverrides: null,
+      // Live check runs are App-token exclusive — PAT setups get none.
+      checksEnabled: isAppMode(settingsStore),
     });
   };
 

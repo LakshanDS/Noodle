@@ -62,6 +62,8 @@ export async function runSchedulerJob(
     tokenProvider?: () => Promise<string>;
     systemPrompt?: string;
     labelOverrides?: string | null;
+    /** App-mode gate for the live check run on the trunk PR — see run-check.ts. */
+    checksEnabled?: boolean;
   },
 ): Promise<RunResult> {
   const engineDeps: BackgroundRunDeps = {
@@ -71,6 +73,7 @@ export async function runSchedulerJob(
     tokenProvider: deps?.tokenProvider,
     systemPrompt: deps?.systemPrompt,
     labelOverrides: deps?.labelOverrides,
+    checksEnabled: deps?.checksEnabled,
     outputLabelPrefix: "Issue",
     // No onStatus hook — schedulers have no DB status column.
   };

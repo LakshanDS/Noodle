@@ -169,3 +169,68 @@ describe("webhook http endpoint", () => {
     expect(res.json()).toEqual({ status: "ok" });
   });
 });
+
+describe("self check-run webhook suppression", () => {
+  /** A trigger store with one trigger that fires on ANY check_run event. */
+  const checkRunTriggerStore = {
+    listByRepo: () => [{ id: 1, event_type: "check_run", event_action: null, branch_pattern: null }],
+    markTriggered: () => {},
+  };
+
+  const checkRunPayload = (login: string) =>
+    JSON.stringify({
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      sender: { login },
+      check_run: { id: 555, name: "Noodle is cooking", status: "in_progress" },
+    });
+
+  it("does NOT fire a trigger for the bot's own check_run webhook", async () => {
+    const enqueued: number[] = [];
+    const app = createWebhookApp(() => SECRET, {
+      enqueue: async () => {},
+      selfLogin: () => "noodle[bot]",
+      triggerStore: checkRunTriggerStore as any,
+      enqueueTrigger: async (o) => {
+        enqueued.push(o.triggerId);
+      },
+      defaultProfile: () => "p",
+    });
+    apps.add(app);
+    const body = checkRunPayload("noodle[bot]");
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sign(body), "x-github-event": "check_run" },
+      payload: body,
+    });
+    // Acknowledged + ignored — the bot's own progress updates never chain-run.
+    expect(res.statusCode).toBe(202);
+    expect(res.json().ignored).toBe(true);
+    expect(enqueued).toEqual([]);
+  });
+
+  it("still fires the trigger for a check_run webhook from someone else", async () => {
+    const enqueued: number[] = [];
+    const app = createWebhookApp(() => SECRET, {
+      enqueue: async () => {},
+      selfLogin: () => "noodle[bot]",
+      triggerStore: checkRunTriggerStore as any,
+      enqueueTrigger: async (o) => {
+        enqueued.push(o.triggerId);
+      },
+      defaultProfile: () => "p",
+    });
+    apps.add(app);
+    const body = checkRunPayload("some-other-app[bot]");
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sign(body), "x-github-event": "check_run" },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(enqueued).toEqual([1]);
+  });
+});

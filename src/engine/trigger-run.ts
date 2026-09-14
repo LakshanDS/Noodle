@@ -69,6 +69,8 @@ export async function runTriggerJob(
     tokenProvider?: () => Promise<string>;
     systemPrompt?: string;
     labelOverrides?: string | null;
+    /** App-mode gate for the live check run on the trunk PR — see run-check.ts. */
+    checksEnabled?: boolean;
     /** Updates the trigger row's status column. Called at start/success/failure. */
     triggerStore?: { updateRunStatus: (id: number, status: string) => void };
     triggerId?: number;
@@ -83,6 +85,7 @@ export async function runTriggerJob(
     tokenProvider: deps?.tokenProvider,
     systemPrompt: deps?.systemPrompt,
     labelOverrides: deps?.labelOverrides,
+    checksEnabled: deps?.checksEnabled,
     outputLabelPrefix: "Trigger",
     onStatus: (status) => {
       if (triggerId != null && triggerStore) {

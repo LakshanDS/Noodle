@@ -22,6 +22,7 @@ import { collectSysFacts } from "../util/sysinfo.js";
 import { throttleForRpm, throttleExtensionFactory } from "./throttle.js";
 import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
+import { RunCheck } from "./run-check.js";
 import { attachEventBridge } from "./chat-runtime.js";
 import type { LiveRunRegistry } from "./live-runs.js";
 import { slugify } from "../util/slugify.js";
@@ -194,6 +195,16 @@ export async function runJob(
      * global default labels. Mirrors scheduler-run's labelOverrides dep.
      */
     labelOverrides?: string | null;
+    /**
+     * GitHub check-run reporting (App mode only — the Checks API rejects user
+     * tokens). When true, the run attaches a live "cooking" check to the
+     * involved PR's head SHA: spinner + elapsed timer in the merge box and
+     * Checks tab while the agent works, ✓/✗ on completion. PR-comment runs
+     * attach to that PR; issue runs with an open PR attach to it (the stacked
+     * PR will target it); fresh issues without a PR have nothing to show one
+     * on and are skipped.
+     */
+    checksEnabled?: boolean;
   },
 ): Promise<RunResult> {
   const agentName = config.agent_name;
@@ -433,6 +444,22 @@ export async function runJob(
   // 1h token TTL); CLI/tests fall back to the start-of-run token/gh.
   const tokenProvider = deps?.tokenProvider ?? (async () => input.token ?? process.env.GITHUB_TOKEN ?? "");
   const ghProvider = deps?.ghProvider ?? (async () => gh);
+
+  // Live check run on the target PR (App mode only). Created before any work
+  // so the spinner covers the clone too; every terminal path below completes
+  // it (success / failure), and the outer catch completes it as failed.
+  const runCheck = await RunCheck.start({
+    gh,
+    getGh: ghProvider,
+    repo: input.repo,
+    sha: isPR ? pr?.head_sha : existing?.head_sha,
+    jobId,
+    agentName,
+    context: isPR
+      ? `PR #${input.issueNumber} — ${issue.title}`
+      : `Issue #${input.issueNumber} — stacked on PR #${existing?.number}`,
+    enabled: deps?.checksEnabled === true,
+  });
   const freshToken = async () => {
     const t = await tokenProvider();
     if (!t) {
@@ -483,6 +510,7 @@ export async function runJob(
       await ws.branch(branchName);
     }
     await installSkills(ws.path);
+    await runCheck?.stage("Agent working — reading code and making changes");
 
     // 5. Build prompt + resource loader.
     // Probe the host hardware up front so the agent knows whether this box can
@@ -771,6 +799,7 @@ export async function runJob(
           // Only reached on a successful run; an errored run (e.g. the agent's
           // own LLM call failed) takes the error-comment branch above and is
           // never routed through phrasing.
+          await runCheck?.stage("Phrasing output…");
           agentAnswer = await phraseOutput(agentAnswer, { model, modelRegistry });
         }
       }
@@ -813,6 +842,7 @@ export async function runJob(
           );
           log_.info({ pr: prResult.html_url, changedFiles, base: prBase }, "opened PR");
           const prUrl = prResult.html_url;
+          await runCheck?.complete("success", `Opened PR #${prResult.number}`, agentAnswer ?? undefined);
 
           await swapLabel(ghNow, input.repo, input.issueNumber, labels, "cooked", log_);
 
@@ -846,6 +876,11 @@ export async function runJob(
       // a templated error comment; a clean no-change run swaps to `cooked`.
       const ghNow = await ghProvider();
       await swapLabel(ghNow, input.repo, input.issueNumber, labels, errored ? "failed" : "cooked", log_);
+      await runCheck?.complete(
+        errored ? "failure" : "success",
+        errored ? "Run failed" : "Finished — no code changes",
+        errored ? stopReason.errorMessage ?? "unknown error" : agentAnswer,
+      );
       const commentBody = errored
         ? buildErrorComment(profile, stopReason.errorMessage ?? "unknown error", agentName, runStats)
         : buildIssueComment(profile, agentAnswer, agentName, runStats);
@@ -878,6 +913,10 @@ export async function runJob(
       teardownDisposeGuard();
     }
   } catch (e) {
+    // Complete the check run as failed — the run died on a thrown error (setup,
+    // profile resolution, agent failure after restarts, …). Idempotent no-op if
+    // a terminal path already completed it.
+    await runCheck?.complete("failure", "Run failed", (e as Error).message ?? String(e));
     // Mark the run failed (rethrow so the caller still sees the error). Also
     // swap the cooking → failed label: the run added the cooking label at the
     // start, and a thrown error skips the normal terminal-label path. Without

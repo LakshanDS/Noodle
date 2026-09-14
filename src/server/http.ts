@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import { verifySignature, parseWebhookEvent, parseWebhookMetadata, matchTriggers } from "../github/webhook.js";
+import { verifySignature, parseWebhookEvent, parseWebhookMetadata, matchTriggers, isSelfSender } from "../github/webhook.js";
 import { log } from "../util/log.js";
 import type { TriggerConfig } from "../triggers/check.js";
 import type { TriggerStore } from "./trigger-store.js";
@@ -116,9 +116,18 @@ export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDe
     }
 
     // Always check for trigger matches — triggers can match events that
-    // parseWebhookEvent ignores (e.g. pull_request lifecycle, push).
+    // parseWebhookEvent ignores (e.g. pull_request lifecycle, push). EXCEPT for
+    // the bot's own check_run/check_suite echoes: Noodle creating/updating its
+    // live run check fires these back at the webhook, and they are outputs,
+    // never wake signals — the same rule that keeps bot comments from
+    // re-triggering runs. Without this, a broad trigger rule could chain-fire
+    // the agent off its own progress updates.
+    const sender = (payload as { sender?: { login?: string | null } | null } | null)?.sender;
+    const selfCheckEvent =
+      (event === "check_run" || event === "check_suite") &&
+      isSelfSender(sender?.login, deps.selfLogin?.());
     let triggerMatched = false;
-    if (deps.triggerStore && deps.enqueueTrigger) {
+    if (!selfCheckEvent && deps.triggerStore && deps.enqueueTrigger) {
       const metadata = parseWebhookMetadata(event ?? "", payload);
       if (metadata) {
         try {

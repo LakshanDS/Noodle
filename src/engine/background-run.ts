@@ -20,6 +20,7 @@ import { buildSettingsManager } from "./pi-settings.js";
 import { StallWatcher, StallTimeoutError } from "./stall.js";
 import { attachEventBridge } from "./chat-runtime.js";
 import type { LiveRunRegistry } from "./live-runs.js";
+import { RunCheck } from "./run-check.js";
 import { defaultLabelSet, parseLabelSet, labelDescription, type LabelSet } from "./labels.js";
 import {
   ModelRegistry,
@@ -144,6 +145,14 @@ export interface BackgroundRunDeps {
    * `${agent}-Trigger` (trigger). Defaults to "Issue".
    */
   outputLabelPrefix?: "Issue" | "Trigger";
+  /**
+   * GitHub check-run reporting (App mode only — the Checks API rejects user
+   * tokens). When true and the run's trunk has an open PR, the run attaches a
+   * live "cooking" check to the trunk's head SHA so the open PR shows a
+   * spinner + elapsed timer while the agent works. First runs (no open PR yet)
+   * have no PR surface to show a check on and are skipped.
+   */
+  checksEnabled?: boolean;
 }
 
 /**
@@ -255,6 +264,9 @@ export async function runBackgroundJob(
     // ends failed (stopReason=error fallthrough or a thrown error), read by
     // the finally block to emit the bus's terminal event before it's dropped.
     let runError: string | null = null;
+    // Live check run on the open trunk PR (App mode only) — assigned once the
+    // openPR lookup below resolves; every terminal path completes it.
+    let runCheck: RunCheck | null = null;
     try {
       // 4. Trunk + stacked-branch resolution. See runBackgroundJob doc comment.
       const baseBranch = await gh.defaultBranch(input.repo);
@@ -331,6 +343,20 @@ export async function runBackgroundJob(
         await ws.branchFrom(workBranch, branchName, cloneUrlFor(input.repo, await freshToken()));
         prBase = branchName;
         log_.info({ trunk: branchName, workBranch, prNumber: openPR.number }, "open PR on trunk — stacking new branch");
+        // Live check on the trunk PR (App mode only) — the head SHA is the
+        // trunk tip, so the PR's Checks tab spins while this run stacks on it.
+        const trunkSha = await gh
+          .defaultBranchSha(input.repo, branchName)
+          .catch(() => undefined);
+        runCheck = await RunCheck.start({
+          gh,
+          repo: input.repo,
+          sha: trunkSha,
+          jobId,
+          agentName: config.agent_name,
+          context: `${input.runKind} run stacking on PR #${openPR.number} — ${input.displayName}`,
+          enabled: deps?.checksEnabled === true,
+        });
       } else {
         workBranch = branchName;
         prBase = baseBranch;
@@ -411,6 +437,7 @@ export async function runBackgroundJob(
       };
 
       log_.info({ idleTimeoutMs: idleMs || "off", toolTimeoutMs: toolMs || "off", rateLimitTimeoutMs: rateLimitMs || "off" }, "starting background run");
+      await runCheck?.stage("Agent working — investigating the task");
       const startedAt = Date.now();
 
       let currentManager = SessionManager.create(ws.path, sessionDir);
@@ -608,6 +635,7 @@ export async function runBackgroundJob(
             log_.warn({ err: (labelErr as Error).message, pr: pr.number }, "could not apply labels to background-run PR");
           }
           log_.info({ pr: pr.number, url: prUrl, base: prBase, changedFiles }, "opened background-run output PR");
+          await runCheck?.complete("success", `Opened PR #${pr.number}`, agentAnswer ?? undefined);
         } else {
           const issueBody = errored
             ? buildBackgroundErrorBody(config.agent_name, input.runKind, stopReason.errorMessage ?? "agent run ended on error", buildFooter(profile, config.agent_name, runStats))
@@ -618,6 +646,11 @@ export async function runBackgroundJob(
           const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [outputLabel, outcome.name]);
           issueUrl = issue.html_url;
           log_.info({ issue: issue.number, url: issueUrl, errored, hadChanges: changedFiles.length > 0 }, "opened background-run output issue");
+          await runCheck?.complete(
+            errored ? "failure" : "success",
+            errored ? "Run failed" : `Findings posted — issue #${issue.number}`,
+            errored ? stopReason.errorMessage ?? "unknown error" : agentAnswer,
+          );
         }
 
         if (runStore) {
@@ -647,6 +680,7 @@ export async function runBackgroundJob(
         teardownDisposeGuard();
       }
     } catch (e) {
+      await runCheck?.complete("failure", "Run failed", (e as Error).message ?? String(e));
       if (runStore) {
         runStore.updateRun(jobId, { status: "failed", error: (e as Error).message ?? String(e), finished_at: nowIso() });
       }

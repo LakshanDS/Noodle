@@ -27,6 +27,8 @@ export interface PullRequestData {
   body: string;
   /** The PR's source branch (e.g. "noodle/issue-7" or "feature/x"). */
   head_branch: string;
+  /** The head commit SHA — the anchor check runs attach to. */
+  head_sha?: string;
   /** The repo the head branch lives in ("owner/name"). Same as target for same-repo PRs. */
   head_repo: string;
   /** The branch the PR targets (e.g. "main"). */
@@ -211,7 +213,7 @@ export class GitHubClient {
     repo: string,
     issueNumber: number,
     agentSlug: string,
-  ): Promise<{ branch: string; number: number; html_url: string } | null> {
+  ): Promise<{ branch: string; number: number; html_url: string; head_sha?: string } | null> {
     const [owner, name] = parseRepo(repo);
     // Escape regex metacharacters in the agent slug so a name like `noodle.v1`
     // matches literally instead of treating the `.` as "any char". Same escape
@@ -230,7 +232,12 @@ export class GitHubClient {
         (pr) => typeof pr.head?.ref === "string" && pattern.test(pr.head.ref),
       );
       if (match) {
-        return { branch: match.head.ref, number: match.number, html_url: match.html_url };
+        return {
+          branch: match.head.ref,
+          number: match.number,
+          html_url: match.html_url,
+          head_sha: typeof match.head.sha === "string" ? match.head.sha : undefined,
+        };
       }
     }
     return null;
@@ -308,6 +315,7 @@ export class GitHubClient {
       title: data.title,
       body: data.body ?? "",
       head_branch: headBranch,
+      head_sha: typeof data.head?.sha === "string" ? data.head.sha : undefined,
       head_repo: headRepo,
       base_branch: baseBranch,
       // Fork = the head ref lives in a different repo than the target.
@@ -422,11 +430,92 @@ export class GitHubClient {
       title: p.title,
       body: p.body ?? "",
       head_branch: p.head?.ref ?? "",
+      head_sha: typeof p.head?.sha === "string" ? p.head.sha : undefined,
       head_repo: p.head?.repo?.full_name ?? repo,
       base_branch: p.base?.ref ?? "",
       is_fork: (p.head?.repo?.full_name ?? repo).toLowerCase() !== repo.toLowerCase(),
       html_url: p.html_url,
       state: p.state,
     }));
+  }
+
+  // --- check runs (GitHub-App-only API; PATs get 403 on write) --------------
+
+  /**
+   * Create an in-progress check run on `headSha` and return its id. The Checks
+   * tab renders the elapsed timer client-side from `startedAt`, so the caller
+   * only touches the API again on stage changes / completion.
+   */
+  async createCheckRun(
+    repo: string,
+    opts: { name: string; headSha: string; externalId?: string; title: string; summary: string },
+  ): Promise<number> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.checks.create({
+      owner,
+      repo: name,
+      name: opts.name,
+      head_sha: opts.headSha,
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+      external_id: opts.externalId,
+      output: { title: opts.title, summary: opts.summary },
+    });
+    return data.id;
+  }
+
+  /** Patch a check run's output (title/summary) mid-run. Replaces the whole output. */
+  async updateCheckRun(
+    repo: string,
+    checkRunId: number,
+    opts: { title: string; summary?: string },
+  ): Promise<void> {
+    const [owner, name] = parseRepo(repo);
+    await this.octokit.rest.checks.update({
+      owner,
+      repo: name,
+      check_run_id: checkRunId,
+      output: { title: opts.title, summary: opts.summary ?? "" },
+    });
+  }
+
+  /** Complete a check run. Setting a conclusion auto-flips status to completed. */
+  async completeCheckRun(
+    repo: string,
+    checkRunId: number,
+    opts: {
+      conclusion: "success" | "failure" | "cancelled";
+      title: string;
+      summary?: string;
+    },
+  ): Promise<void> {
+    const [owner, name] = parseRepo(repo);
+    await this.octokit.rest.checks.update({
+      owner,
+      repo: name,
+      check_run_id: checkRunId,
+      status: "completed",
+      conclusion: opts.conclusion,
+      completed_at: new Date().toISOString(),
+      output: { title: opts.title, summary: opts.summary ?? "" },
+    });
+  }
+
+  /** List this repo's in-progress check runs named `checkName` on `ref` (a SHA). */
+  async listInProgressCheckRuns(
+    repo: string,
+    ref: string,
+    checkName: string,
+  ): Promise<Array<{ id: number; externalId: string | null }>> {
+    const [owner, name] = parseRepo(repo);
+    const { data } = await this.octokit.rest.checks.listForRef({
+      owner,
+      repo: name,
+      ref,
+      check_name: checkName,
+      status: "in_progress",
+      per_page: 100,
+    });
+    return data.check_runs.map((c) => ({ id: c.id, externalId: c.external_id ?? null }));
   }
 }
