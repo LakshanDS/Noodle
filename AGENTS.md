@@ -112,6 +112,16 @@ Every run captures the agent's last assistant message (`extractLastAssistantText
 | `buildTriggerIssueBody` | `trigger-run.ts` | Trigger run succeeded | phrased findings + footer |
 | `buildTriggerErrorBody` | `trigger-run.ts` | Trigger run errored | templated error notice + footer |
 
+### Live check runs (GitHub-side run progress)
+
+App-mode runs attach a live **check run** (name `<agent> is cooking`) to the head SHA of the PR a run targets — the GitHub-Actions-style experience: spinner in the PR merge box, a Checks-tab entry with an elapsed timer (GitHub renders it client-side from `started_at`; the API is only touched on stage changes), stage titles ("Agent working…", "Phrasing output…"), and ✓/✗ with the outcome on completion. The engine side is `RunCheck` (`src/engine/run-check.ts`), a best-effort wrapper over four thin REST methods on `GitHubClient` (`checks.create/update/listForRef`); it is never allowed to fail a run.
+
+- **Where it attaches** — PR-comment runs: that PR's `head_sha`. Issue-with-open-PR runs: the open PR's `head_sha` (the stacked PR will target it). Cron/Trigger runs: the long-lived trunk's head SHA, but **only when the trunk already has an open PR** (`findOpenPRByBranch`). Fresh issues without a PR and first background runs have no PR surface — no check, deliberately (checks attach to commit SHAs; an issue page has nowhere to render one).
+- **App mode only** (`checksEnabled: isAppMode(settingsStore)` threaded through `serve.ts` → run deps): the Checks API rejects writes from user tokens (403). PAT setups get nothing — no fallback to commit statuses.
+- **Stale/false handling** — every terminal path completes the check (success on PR-opened / findings-issue, failure on error, and the outer catch backstops); `start` first sweeps in-progress checks with the same name on that SHA and cancels them (crashed process / retry leftovers); GitHub's own 14-day `stale` marking is the last-resort backstop. `external_id` carries the queue job id for correlation.
+- **Webhook echo** — creating/updating the check fires `check_run`/`check_suite` webhooks back; `http.ts` drops those from the bot's own sender so they can never fire a stored trigger (same rule as self comments).
+- **Setup requirement** — the GitHub App needs the **Checks: Read & write** repository permission (App settings → Permissions & events), re-approved on each installation after enabling.
+
 ### Self-trigger suppression (no infinite loops)
 
 The agent posts its output as comments and swaps labels. Without a guard, those actions would re-fire the webhook and trigger another run — e.g. an answer comment containing `@noodle` or `#GLM` in its text would wake the agent again the moment it's posted.
