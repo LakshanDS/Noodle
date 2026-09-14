@@ -93,7 +93,36 @@ function toggleReveal(key: string): void {
 
 const anyDirty = computed(() => Object.values(fields).some((f) => f.dirty));
 
-onMounted(load);
+// --- live check-run permission validation (App mode only) -------------------
+
+interface AppPermissionStatus {
+  appMode: boolean;
+  ok?: boolean;
+  checks?: string;
+  repo?: string;
+  settingsUrl?: string;
+  reason?: string;
+  hint?: string;
+}
+
+const permStatus = ref<AppPermissionStatus | null>(null);
+const permChecking = ref(false);
+
+async function checkPermission(): Promise<void> {
+  permChecking.value = true;
+  try {
+    permStatus.value = await getJson<AppPermissionStatus>("/api/github/app-check-permission");
+  } catch {
+    permStatus.value = null;
+  } finally {
+    permChecking.value = false;
+  }
+}
+
+onMounted(() => {
+  load();
+  checkPermission();
+});
 </script>
 
 <template>
@@ -166,6 +195,45 @@ onMounted(load);
             <Icon name="refresh" :size="11" /> Restart required
           </div>
         </Field>
+      </Card>
+
+      <Card v-if="permStatus?.appMode">
+        <template #header>
+          <div class="sec-head">
+            <span class="sec-icon"><Icon name="check" :size="15" /></span>
+            <h3 class="sec-title">Live PR check runs</h3>
+          </div>
+        </template>
+
+        <div v-if="permStatus.ok" class="perm-line ok-line">
+          <Icon name="check" :size="15" />
+          <span>
+            Checks: Read &amp; write granted — PRs show a live spinner + timer while the agent works
+            <template v-if="permStatus.repo"> (verified on {{ permStatus.repo }})</template>.
+          </span>
+        </div>
+        <div v-else class="perm-line warn-line">
+          <Icon name="alert" :size="15" />
+          <span>
+            {{ permStatus.reason ?? "The Checks permission is missing." }}
+            {{ permStatus.hint }}
+          </span>
+        </div>
+
+        <div class="perm-actions">
+          <Button variant="secondary" size="sm" :loading="permChecking" @click="checkPermission">
+            Re-check
+          </Button>
+          <a
+            v-if="!permStatus.ok && permStatus.settingsUrl"
+            class="perm-link"
+            :href="permStatus.settingsUrl"
+            target="_blank"
+            rel="noopener"
+          >
+            Open App permission settings ↗
+          </a>
+        </div>
       </Card>
 
       <p class="foot-note">
@@ -273,6 +341,40 @@ onMounted(load);
   background: var(--warning-weak);
   padding: 2px 8px;
   border-radius: var(--radius-full);
+}
+
+.perm-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+.perm-line :deep(svg) {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+.ok-line {
+  color: var(--success);
+}
+.warn-line {
+  color: var(--warning);
+}
+
+.perm-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+.perm-link {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--accent);
+  text-decoration: none;
+}
+.perm-link:hover {
+  text-decoration: underline;
 }
 
 .foot-note {

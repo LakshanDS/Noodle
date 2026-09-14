@@ -22,6 +22,14 @@ export interface AuthProvider {
   forRepo(repo: string, installationId?: number): Promise<{ gh: GitHubClient; token: string }>;
   /** List repos accessible to the configured credentials (PAT or App installation). */
   listRepos(): Promise<import("./client.js").RepoData[]>;
+  /**
+   * App mode only: the permissions the installation currently has on `repo`
+   * (e.g. `{ checks: "write", contents: "write", ... }`). Read fresh from
+   * GitHub — never cached — so the settings UI can validate a permission fix
+   * without a restart. Null = not installed, unreadable, or not App mode
+   * (PAT providers don't implement this — the caller gates on isAppMode).
+   */
+  appPermissions?(repo: string): Promise<Record<string, string> | null>;
 }
 
 /** PAT mode: a single constant token from GITHUB_TOKEN. */
@@ -78,6 +86,10 @@ export class GithubAppAuthProvider implements AuthProvider {
     const octokit = new Octokit({ auth: token, request: { headers: { "X-GitHub-Api-Version": GH_API_VERSION } } });
     const { data } = await octokit.rest.apps.listReposAccessibleToInstallation({ per_page: 100 });
     return data.repositories.map((r) => ({ full_name: r.full_name, default_branch: r.default_branch }));
+  }
+
+  async appPermissions(repo: string): Promise<Record<string, string> | null> {
+    return this.appAuth.getInstallationPermissions(repo);
   }
 }
 
@@ -190,6 +202,19 @@ class LazyAuthProvider implements AuthProvider {
       return new PatAuthProvider(token).listRepos();
     }
     return new NoopAuthProvider().listRepos();
+  }
+
+  async appPermissions(repo: string): Promise<Record<string, string> | null> {
+    const appProvider = this.resolveAppProvider();
+    if (appProvider?.appPermissions) {
+      try {
+        return await appProvider.appPermissions(repo);
+      } catch (appErr) {
+        log.warn({ repo, err: (appErr as Error).message }, "could not read App installation permissions");
+        return null;
+      }
+    }
+    return null;
   }
 }
 

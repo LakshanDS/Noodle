@@ -142,6 +142,33 @@ export class GithubAppAuth {
     return data.id;
   }
 
+  /**
+   * Fetch the permissions an installation currently has for `repo`, via the App
+   * JWT (GET /repos/{repo}/installation). Never cached — permissions change the
+   * moment the operator accepts a pending update on the installation, and the
+   * point of this call is to see the CURRENT grant. Returns null when the App
+   * isn't installed on the repo.
+   */
+  async getInstallationPermissions(repo: string): Promise<Record<string, string> | null> {
+    const jwt = buildAppJwt(this.appId, this.privateKey);
+    const res = await this.fetchImpl(`${GITHUB_API}/repos/${repo}/installation`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${jwt}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `Failed to read installation permissions for ${repo} (${res.status}): ${body.slice(0, 200)}`,
+      );
+    }
+    const data = (await res.json()) as { permissions?: Record<string, string> };
+    return data.permissions ?? {};
+  }
+
   /** Clear the cache (used on shutdown / forced re-auth). */
   clearCache(): void {
     this.cache.clear();
