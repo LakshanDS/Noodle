@@ -362,3 +362,30 @@ describe("isRetryableError + backoffMs", () => {
     expect(backoffMs(10, 60)).toBe(600_000); // cap
   });
 });
+
+describe("trigger jobs: PR number + fired event", () => {
+  it("stores the PR number and fired event on the job row", () => {
+    const job = queue.enqueueTrigger({
+      repo: "o/r",
+      triggerId: 5,
+      issueNumber: 42,
+      event: { type: "pull_request", action: "opened" },
+    });
+    expect(job.issue_number).toBe(42);
+    expect(JSON.parse(job.event ?? "null")).toEqual({ type: "pull_request", action: "opened" });
+  });
+
+  it("defaults issue_number to 0 and event to null (manual runs)", () => {
+    const job = queue.enqueueTrigger({ repo: "o/r", triggerId: 5, source: "manual" });
+    expect(job.issue_number).toBe(0);
+    expect(job.event).toBeNull();
+  });
+
+  it("dedupes per (trigger, PR): same PR twice is a no-op, different PRs run concurrently", () => {
+    const first = queue.enqueueTrigger({ repo: "o/r", triggerId: 5, issueNumber: 42 });
+    const dup = queue.enqueueTrigger({ repo: "o/r", triggerId: 5, issueNumber: 42 });
+    const other = queue.enqueueTrigger({ repo: "o/r", triggerId: 5, issueNumber: 43 });
+    expect(dup.id).toBe(first.id);
+    expect(other.id).not.toBe(first.id);
+  });
+});

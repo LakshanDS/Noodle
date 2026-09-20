@@ -10,6 +10,7 @@ import {
 } from "../src/engine/run.js";
 import { buildCronIssueBody, buildCronErrorBody } from "../src/engine/scheduler-run.js";
 import { buildTriggerIssueBody, buildTriggerErrorBody } from "../src/engine/trigger-run.js";
+import { buildBackgroundPrompt } from "../src/engine/background-run.js";
 
 const profile = { name: "claude", provider: "anthropic", model: "claude-sonnet-4-20250514" };
 const changedFiles = ["src/auth.ts", "tests/auth.test.ts"];
@@ -342,5 +343,44 @@ describe("buildTriggerErrorBody", () => {
   it("falls back to 'unknown error' for empty messages", () => {
     const body = buildTriggerErrorBody("Noodle", "", footer);
     expect(body).toContain("unknown error");
+  });
+});
+
+describe("buildBackgroundPrompt (trigger PR context)", () => {
+  const baseInput = {
+    repo: "owner/name",
+    prompt: "review the changes",
+    branchName: "noodle/trigger-on-pr",
+    displayName: "on-pr",
+    runKind: "trigger" as const,
+    eventContext: { type: "pull_request", action: "opened", prNumber: 42 },
+  };
+  const eventPR = {
+    number: 42,
+    title: "Add TOTP login",
+    body: "",
+    head_branch: "feature/login",
+    head_repo: "owner/name",
+    base_branch: "main",
+    is_fork: false,
+    html_url: "https://github.com/owner/name/pull/42",
+    state: "open",
+  };
+
+  it("names the event PR when one is supplied", () => {
+    const prompt = buildBackgroundPrompt(baseInput, "Noodle", undefined, eventPR);
+    expect(prompt).toContain("**Event:** `pull_request.opened`");
+    expect(prompt).toContain("PR #42");
+    expect(prompt).toContain("Add TOTP login");
+    expect(prompt).toContain("git fetch origin feature/login");
+  });
+
+  it("omits the PR block without an event PR (push events, cron runs)", () => {
+    const prompt = buildBackgroundPrompt(
+      { ...baseInput, eventContext: { type: "push", action: null, prNumber: null } },
+      "Noodle",
+    );
+    expect(prompt).toContain("**Event:** `push`");
+    expect(prompt).not.toContain("head branch");
   });
 });

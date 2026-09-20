@@ -54,6 +54,10 @@ export interface WebhookHandlerDeps {
     triggerId: number;
     installationId?: number;
     profile?: string | null;
+    /** The PR the event is about, when the event carries one (pull_request.*). */
+    prNumber?: number;
+    /** The event type/action that actually fired (vs the trigger's configured filters). */
+    event?: { type: string; action: string | null };
   }): Promise<void> | void;
   /** Get the default profile name. */
   defaultProfile?: () => string | undefined;
@@ -117,17 +121,22 @@ export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDe
 
     // Always check for trigger matches — triggers can match events that
     // parseWebhookEvent ignores (e.g. pull_request lifecycle, push). EXCEPT for
-    // the bot's own check_run/check_suite echoes: Noodle creating/updating its
-    // live run check fires these back at the webhook, and they are outputs,
-    // never wake signals — the same rule that keeps bot comments from
-    // re-triggering runs. Without this, a broad trigger rule could chain-fire
-    // the agent off its own progress updates.
+    // the bot's own outputs, which are never wake signals (same rule that keeps
+    // bot comments from re-triggering the wake path):
+    //   - check_run/check_suite echoes from Noodle updating its live run check.
+    //   - issue_comment.created from the bot — trigger runs deliver their
+    //     findings as PR comments, so a broad `issue_comment` trigger rule
+    //     would otherwise chain-fire the agent off its own answer, forever.
+    // Deliberately NOT suppressed: issues.opened from the bot (the trigger
+    // chaining mechanism — see AGENTS.md).
     const sender = (payload as { sender?: { login?: string | null } | null } | null)?.sender;
-    const selfCheckEvent =
-      (event === "check_run" || event === "check_suite") &&
+    const payloadAction = (payload as { action?: string } | null)?.action;
+    const selfOutputEvent =
+      ((event === "check_run" || event === "check_suite") ||
+        (event === "issue_comment" && payloadAction === "created")) &&
       isSelfSender(sender?.login, deps.selfLogin?.());
     let triggerMatched = false;
-    if (!selfCheckEvent && deps.triggerStore && deps.enqueueTrigger) {
+    if (!selfOutputEvent && deps.triggerStore && deps.enqueueTrigger) {
       const metadata = parseWebhookMetadata(event ?? "", payload);
       if (metadata) {
         try {
@@ -141,6 +150,8 @@ export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDe
               triggerId: trigger.id,
               installationId: metadata.installationId,
               profile: trigger.profile ?? deps.defaultProfile?.() ?? null,
+              prNumber: metadata.prNumber,
+              event: { type: metadata.eventType, action: metadata.action ?? null },
             });
             deps.triggerStore.markTriggered(trigger.id);
             triggerMatched = true;

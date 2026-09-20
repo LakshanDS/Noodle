@@ -243,6 +243,8 @@ export interface WebhookMetadata {
   repo: string;
   /** For push events, the branch ref (e.g. "refs/heads/main"). */
   branch?: string;
+  /** The PR the event is about (pull_request, pull_request_review, …). */
+  prNumber?: number;
   /** Installation ID, when present (App auth mode). */
   installationId?: number;
   /** The full webhook payload for prompt context. */
@@ -260,6 +262,7 @@ export function parseWebhookMetadata(event: string, payload: unknown): WebhookMe
     installation?: { id?: number };
     repository?: { full_name?: string };
     ref?: string;
+    pull_request?: { number?: number };
   };
 
   if (!p.repository?.full_name) return null;
@@ -269,6 +272,7 @@ export function parseWebhookMetadata(event: string, payload: unknown): WebhookMe
     action: p.action,
     repo: p.repository.full_name,
     branch: p.ref,
+    prNumber: p.pull_request?.number,
     installationId: p.installation?.id,
     payload,
   };

@@ -50,10 +50,17 @@ export interface QueuedJob {
   cron_job_id: number;
   /**
    * The triggers row that enqueued this job, or 0 for non-trigger jobs.
-   * Trigger jobs work like cron jobs (no issue_number, they CREATE issues)
-   * but are driven by GitHub events instead of timers.
+   * Trigger jobs fired by a PR-carrying event also set `issue_number` to that
+   * PR (it doubles as the delivery target); other trigger jobs keep 0.
    */
   trigger_id: number;
+  /**
+   * JSON `{ type, action }` — the event that actually fired, captured at
+   * enqueue time. The trigger row's event_type/event_action are configured
+   * *filters* (action null = any), so without this the run can't tell what
+   * actually happened. Null on manual runs and pre-migration jobs.
+   */
+  event: string | null;
 }
 
 /** What the worker calls to actually run a job. */
@@ -73,6 +80,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   profile TEXT,
   cron_job_id INTEGER NOT NULL DEFAULT 0,
   trigger_id INTEGER NOT NULL DEFAULT 0,
+  event TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   started_at TEXT,
   finished_at TEXT
@@ -147,6 +155,17 @@ function migrateAddTriggerId(db: Db): void {
 }
 
 /**
+ * Idempotent migration: add `event` (JSON type/action pair captured from the
+ * webhook that fired the trigger). Same PRAGMA-introspection pattern.
+ */
+function migrateAddEvent(db: Db): void {
+  const cols = db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "event")) {
+    db.exec("ALTER TABLE jobs ADD COLUMN event TEXT");
+  }
+}
+
+/**
  * Ensure the dedupe index exists with the `cron_job_id` and `trigger_id` columns
  * in its key. Same idempotent introspection pattern as before.
  */
@@ -183,6 +202,7 @@ export class JobQueue {
     migrateAddProfile(this.db);
     migrateAddCronJobId(this.db);
     migrateAddTriggerId(this.db);
+    migrateAddEvent(this.db);
     ensureDedupeIndex(this.db);
     ensureRunningProfileIndex(this.db);
   }
@@ -196,6 +216,7 @@ export class JobQueue {
     migrateAddProfile(db);
     migrateAddCronJobId(db);
     migrateAddTriggerId(db);
+    migrateAddEvent(db);
     ensureDedupeIndex(db);
     ensureRunningProfileIndex(db);
     return q;
@@ -264,11 +285,14 @@ export class JobQueue {
   }
 
   /**
-   * Enqueue a trigger-originated job. Trigger runs have no issue_number (the
-   * agent CREATES issues during the run), so `issue_number = 0` and dedupe is
-   * keyed on `(repo, 0, 0, trigger_id)` — each trigger dedupes against itself,
-   * so a repeat fire before the prior run finishes is a no-op, while different
-   * triggers on the same repo run concurrently.
+   * Enqueue a trigger-originated job. Trigger jobs have no `issue_number` (the
+   * agent reports via issues/comments), EXCEPT when the firing event carried a
+   * PR — then `issueNumber` holds that PR (it doubles as the comment delivery
+   * target), which also makes the dedupe key `(repo, <pr>, trigger_id)`
+   * per-PR: one trigger can run for different PRs concurrently, while a repeat
+   * fire for the SAME PR before its run finishes is still deduped. `event` is
+   * the type/action pair that actually fired, kept for the run's prompt
+   * framing (the trigger row's columns are configured filters, not facts).
    */
   enqueueTrigger(opts: {
     repo: string;
@@ -276,13 +300,17 @@ export class JobQueue {
     installationId?: number;
     profile?: string | null;
     source?: string;
+    issueNumber?: number | null;
+    event?: { type: string; action: string | null };
   }): QueuedJob {
     const { repo, triggerId, installationId = null, profile = null, source = "trigger" } = opts;
+    const issueNumber = opts.issueNumber ?? 0;
+    const eventJson = opts.event ? JSON.stringify(opts.event) : null;
     const ins = this.db.prepare(
-      `INSERT OR IGNORE INTO jobs (repo, issue_number, trigger_id, installation_id, source, profile)
-       VALUES (@repo, 0, @triggerId, @installationId, @source, @profile)`,
+      `INSERT OR IGNORE INTO jobs (repo, issue_number, trigger_id, installation_id, source, profile, event)
+       VALUES (@repo, @issueNumber, @triggerId, @installationId, @source, @profile, @eventJson)`,
     );
-    ins.run({ repo, triggerId, installationId, source, profile });
+    ins.run({ repo, issueNumber, triggerId, installationId, source, profile, eventJson });
     const row = this.db
       .prepare(
         `SELECT * FROM jobs

@@ -205,6 +205,15 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         log.warn({ jobId: job.id, triggerId: job.trigger_id }, "trigger no longer exists; skipping");
         return;
       }
+      // The event context the job actually fired on, captured at enqueue time.
+      // Falls back to the trigger row's configured filters (manual runs carry
+      // neither a stored event nor a PR number).
+      let firedEvent: { type: string; action: string | null } | undefined;
+      try {
+        firedEvent = job.event ? (JSON.parse(job.event) as { type: string; action: string | null }) : undefined;
+      } catch {
+        firedEvent = undefined;
+      }
       await runTriggerJob(config, initial.gh, {
         repo: job.repo,
         prompt: trigger.prompt,
@@ -215,8 +224,11 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         profile: trigger.profile,
         jobId: `job-${job.id}`,
         token: initial.token,
-        eventType: trigger.event_type,
-        eventAction: trigger.event_action,
+        eventType: firedEvent?.type ?? trigger.event_type,
+        eventAction: firedEvent?.action ?? trigger.event_action,
+        // PR-carrying events (pull_request.*) deliver their findings as a
+        // comment on this PR instead of a new issue.
+        eventPrNumber: job.issue_number > 0 ? job.issue_number : undefined,
         // Display name for PR titles + manual-sync issues.
         triggerLabel: trigger.name,
       }, {

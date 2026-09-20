@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import { log, runLogger } from "../util/log.js";
 import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
+import type { PullRequestData } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { expandTags } from "./tags.js";
 import { generateIssueTitle, phraseOutput, templateTitle } from "./final-pass.js";
@@ -107,8 +108,12 @@ export interface BackgroundRunInput {
   token?: string;
   /** What kind of run this is — controls prompt framing only. */
   runKind: RunKind;
-  /** Trigger-only: the event type/action that fired (e.g. { type: "issues", action: "opened" }). */
-  eventContext?: { type: string; action: string | null };
+  /**
+   * Trigger-only: the event that fired. `prNumber` is set when the event was
+   * about a PR (pull_request.*) — the run then delivers its output as a
+   * comment on that PR instead of a new issue.
+   */
+  eventContext?: { type: string; action: string | null; prNumber?: number | null };
 }
 
 /**
@@ -389,7 +394,19 @@ export async function runBackgroundJob(
       } catch (e) {
         log_.warn({ err: (e as Error).message }, "failed to expand task prompt tags — using raw task");
       }
-      const prompt = buildBackgroundPrompt({ ...input, prompt: taskPrompt }, config.agent_name, fullSysInfo);
+      // PR-event trigger: name the PR the event was about in the prompt. A
+      // transient API failure must not block the run — the agent just gets the
+      // bare event header.
+      let eventPR: PullRequestData | null = null;
+      if (input.eventContext?.prNumber) {
+        eventPR = await gh
+          .getPullRequest(input.repo, input.eventContext.prNumber)
+          .catch((e: unknown) => {
+            log_.warn({ err: (e as Error).message, pr: input.eventContext?.prNumber }, "could not fetch the event PR for prompt context");
+            return null;
+          });
+      }
+      const prompt = buildBackgroundPrompt({ ...input, prompt: taskPrompt }, config.agent_name, fullSysInfo, eventPR ?? undefined);
       const throttle = throttleForRpm(profile.api_rpm);
       const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
       const loader = new DefaultResourceLoader({
@@ -600,6 +617,21 @@ export async function runBackgroundJob(
         const changedFiles: string[] = [];
         let prUrl = "";
         let issueUrl = "";
+        let commentUrl = "";
+        // PR-event trigger: findings go to the event PR as a comment instead of
+        // a new issue. Best-effort — a dead PR (closed/deleted mid-run) falls
+        // back to the regular issue path so the run is never silent.
+        const eventPrNumber = input.eventContext?.prNumber ?? null;
+        const commentOnEventPr = async (body: string): Promise<boolean> => {
+          if (!eventPrNumber) return false;
+          try {
+            commentUrl = await gh.createIssueComment(input.repo, eventPrNumber, body);
+            return true;
+          } catch (e) {
+            log_.warn({ err: (e as Error).message, pr: eventPrNumber }, "could not comment on the event PR — falling back to a new issue");
+            return false;
+          }
+        };
         if (!errored) {
           const committed = await ws.commitAll(
             `${input.runKind} run (${input.displayName})\n\n${input.runKind === "trigger" ? "Trigger" : "Scheduled"} run by ${config.agent_name} (profile: ${profile.name}).`,
@@ -636,19 +668,36 @@ export async function runBackgroundJob(
           }
           log_.info({ pr: pr.number, url: prUrl, base: prBase, changedFiles }, "opened background-run output PR");
           await runCheck?.complete("success", `Opened PR #${pr.number}`, agentAnswer ?? undefined);
+          if (eventPrNumber) {
+            // The findings still get delivered on the event PR (with a link to
+            // the output PR); the PR body already carries them, so no issue
+            // fallback here if the comment fails.
+            const findings = agentAnswer?.trim() || "_The agent ran but produced no final message._";
+            await commentOnEventPr(`${findings}\n\n**Changes:** opened PR #${pr.number} — ${prUrl}`);
+          }
         } else {
           const issueBody = errored
             ? buildBackgroundErrorBody(config.agent_name, input.runKind, stopReason.errorMessage ?? "agent run ended on error", buildFooter(profile, config.agent_name, runStats))
             : buildBackgroundIssueBody(agentAnswer, buildFooter(profile, config.agent_name, runStats));
-          const issueTitle = errored
-            ? templateTitle(input.prompt)
-            : await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry }, { kind: "issue", agentName: config.agent_name });
-          const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [outputLabel, outcome.name]);
-          issueUrl = issue.html_url;
-          log_.info({ issue: issue.number, url: issueUrl, errored, hadChanges: changedFiles.length > 0 }, "opened background-run output issue");
+          let issueNumber: number | null = null;
+          if (await commentOnEventPr(issueBody)) {
+            log_.info({ pr: eventPrNumber, url: commentUrl, errored }, "posted background-run output comment on the event PR");
+          } else {
+            const issueTitle = errored
+              ? templateTitle(input.prompt)
+              : await generateIssueTitle(agentAnswer ?? "", input.prompt, { model, modelRegistry }, { kind: "issue", agentName: config.agent_name });
+            const issue = await gh.createIssue(input.repo, issueTitle, issueBody, [outputLabel, outcome.name]);
+            issueNumber = issue.number;
+            issueUrl = issue.html_url;
+            log_.info({ issue: issue.number, url: issueUrl, errored, hadChanges: changedFiles.length > 0 }, "opened background-run output issue");
+          }
           await runCheck?.complete(
             errored ? "failure" : "success",
-            errored ? "Run failed" : `Findings posted — issue #${issue.number}`,
+            errored
+              ? "Run failed"
+              : issueNumber != null
+                ? `Findings posted — issue #${issueNumber}`
+                : `Findings posted — comment on PR #${eventPrNumber}`,
             errored ? stopReason.errorMessage ?? "unknown error" : agentAnswer,
           );
         }
@@ -662,6 +711,7 @@ export async function runBackgroundJob(
             summary: agentAnswer ?? null,
             ...(prUrl ? { pr_url: prUrl } : {}),
             ...(issueUrl ? { output_issue_url: issueUrl } : {}),
+            ...(commentUrl ? { comment_url: commentUrl } : {}),
             finished_at: nowIso(),
           });
         }
@@ -671,7 +721,7 @@ export async function runBackgroundJob(
           model: profile.model,
           changedFiles,
           agentAnswer,
-          commentUrl: "",
+          commentUrl,
           sessionPath,
           ...(prUrl ? { prUrl } : {}),
           ...(issueUrl ? { outputIssueUrl: issueUrl } : {}),
@@ -710,12 +760,21 @@ export async function runBackgroundJob(
  *  - scheduler: "You are running a scheduled task in <repo>. This is a scheduled run."
  *  - trigger:   "You are responding to a GitHub event in <repo>. Event: <type>.<action>. This is a trigger run."
  *
+ * `eventPR` (trigger runs on PR-carrying events) names the PR the event was
+ * about so the agent knows what it's responding to — the workspace is the
+ * trigger trunk, not that PR's branch.
+ *
  * Everything else (sysInfo prepend, skill-loading, findings-as-final-message
  * contract, task block) is identical. The trigger's event context is just the
- * event type/action name — no payload survives the webhook→queue→run path, and
- * the dead `eventSummary` field was never populated by any caller.
+ * event type/action name — no payload survives the webhook→queue→run path
+ * beyond that pair and the PR number.
  */
-export function buildBackgroundPrompt(input: BackgroundRunInput, agentName: string, sysInfo?: string): string {
+export function buildBackgroundPrompt(
+  input: BackgroundRunInput,
+  agentName: string,
+  sysInfo?: string,
+  eventPR?: PullRequestData | null,
+): string {
   const lines: string[] = [];
   if (sysInfo) {
     lines.push(sysInfo, "", "---", "");
@@ -726,6 +785,15 @@ export function buildBackgroundPrompt(input: BackgroundRunInput, agentName: stri
     if (eventContext) {
       const eventName = eventContext.action ? `${eventContext.type}.${eventContext.action}` : eventContext.type;
       lines.push("", `**Event:** \`${eventName}\``);
+    }
+    if (eventPR) {
+      lines.push(
+        `**The event is about PR #${eventPR.number}:** ${eventPR.title}`,
+        `URL: ${eventPR.html_url} (head branch: \`${eventPR.head_branch}\`)`,
+        "",
+        `Your working copy is the \`${input.branchName}\` trunk, NOT this PR's branch. ` +
+          `If you need its code, fetch it first: \`git fetch origin ${eventPR.head_branch}\`.`,
+      );
     }
   } else {
     lines.push(`You are running a scheduled task in the GitHub repository \`${input.repo}\`.`);

@@ -26,7 +26,7 @@ Noodle is a self-hosted GitHub bot that uses AI coding agents to automate bug fi
    - **Issue mode (no open PR)**: commits changes, pushes branch, opens a PR with `Fixes #N`, posts a comment on the issue
    - **Issue mode (open PR exists)**: commits changes, pushes branch, opens a **stacked PR** targeting the existing PR's branch, posts a comment on the issue
    - **PR comment mode**: commits changes, pushes branch, opens a **stacked PR** targeting the existing PR's branch, posts a comment on the PR
-   - **Cron/Trigger mode**: commits changes, pushes branch, opens a **new issue** with the agent's findings
+   - **Cron/Trigger mode**: commits changes, pushes branch, opens a **new issue** with the agent's findings — except when the firing event carried a PR (e.g. `pull_request.opened`), in which case the findings are posted as a **comment on that PR** instead
 
 ### Summary
 
@@ -36,7 +36,7 @@ Noodle is a self-hosted GitHub bot that uses AI coding agents to automate bug fi
 | Issue (open PR exists) | Same as above | `<agent>/issue-<N>` derived from PR branch | Stacked PR targeting existing PR |
 | PR Comment | Comment on PR with `@`, `/cmd`, `#tag` | Fresh branch derived from PR branch | Stacked PR targeting existing PR |
 | Cron | Timer (configurable interval) | Long-lived, stacked | New issue with findings |
-| Trigger | Any webhook event matching stored rules | Long-lived, stacked | New issue with findings |
+| Trigger | Any webhook event matching stored rules | Long-lived, stacked | PR comment when the event carries a PR, else new issue with findings |
 
 ### Key design decisions
 
@@ -134,18 +134,19 @@ Noodle detects its **own** events via `sender.login` and ignores them — but on
 | `issues.labeled` | **Suppressed** | The bot's own `cooking` → `cooked` label swaps must not re-fire under `trigger_on_open`. |
 | `issues.opened` / `reopened` | **NOT suppressed** | Cron/Trigger runs *open new issues* to deliver findings — that new issue must be able to chain into another agent run (see below). |
 | `issues.assigned` | **NOT suppressed** (still scoped to the bot) | Assignment to the bot itself is always an unconditional wake. |
-| Any event matched by a stored **Trigger** rule | **NOT suppressed** | The event-driven trigger path is the agent→agent chaining mechanism for Trigger mode. |
+| Any event matched by a stored **Trigger** rule | **NOT suppressed** (exception below) | The event-driven trigger path is the agent→agent chaining mechanism for Trigger mode. |
+| `issue_comment.created` matched by a **Trigger** rule | **Suppressed** | Trigger runs deliver findings as PR comments — a broad `issue_comment` trigger rule would otherwise chain-fire off the bot's own answer forever (`src/server/http.ts`, same guard as the check-run echoes). |
 
 **Login matching** (`isSelfSender` in `src/github/webhook.ts`): comparison strips the GitHub-App `[bot]` suffix and is case-insensitive, so `selfLogin` set with or without `[bot]` matches a `<app-slug>[bot]` sender. In App mode `selfLogin` defaults to `<GITHUB_APP_SLUG>[bot]` (falls back to `<agent-slug>[bot]`, then `NOODLE_LOGIN` if set explicitly).
 
 ### Agent → agent chaining (Cron/Trigger mode)
 
-In Cron and Trigger mode, the agent's output is a **new issue** (`gh.createIssue`), not a comment. That freshly-opened issue fires an `issues.opened` webhook, which:
+In Cron and Trigger mode, the agent's output is a **new issue** (`gh.createIssue`) — or, when the firing event carried a PR, a **comment on that PR** (`gh.createIssueComment`). A freshly-opened issue fires an `issues.opened` webhook, which:
 
 - passes the opt-in wake filter when its body carries a wake signal (e.g. the agent's findings mention the agent name), and/or
 - matches a stored **Trigger** rule (`push`, `issues`, `pull_request`, etc.)
 
-Either path can enqueue another agent run. This is intentional — it lets a cron run surface a finding and have it picked up by a downstream agent. The self-trigger suppression rule above is deliberately **narrowed to comments and label swaps** so this chaining path keeps working: `issues.opened`/`reopened` from the bot itself are never suppressed.
+Either path can enqueue another agent run. This is intentional — it lets a cron run surface a finding and have it picked up by a downstream agent. The self-trigger suppression rule above is deliberately **narrowed to comments and label swaps** so this chaining path keeps working: `issues.opened`/`reopened` from the bot itself are never suppressed. (The one trigger-path exception is the bot's own `issue_comment.created` — PR-comment delivery made it a loop hazard, see the table above.)
 
 ### API relay (rate-limiting proxy)
 
