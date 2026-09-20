@@ -338,7 +338,49 @@ describe("trigger PR-event passthrough + self comment suppression", () => {
         installationId: 42,
         profile: "p",
         prNumber: 42,
-        event: { type: "pull_request", action: "opened" },
+        event: { type: "pull_request", action: "opened", issueNumber: null },
+      },
+    ]);
+  });
+
+  it("passes the fired issue number through to enqueueTrigger (no prNumber)", async () => {
+    const issueTriggerStore = {
+      listByRepo: () => [{ id: 4, event_type: "issues", event_action: "opened", branch_pattern: null }],
+      markTriggered: () => {},
+    };
+    const received: Array<Record<string, unknown>> = [];
+    const app = createWebhookApp(() => SECRET, {
+      enqueue: async () => {},
+      selfLogin: () => "noodle[bot]",
+      triggerStore: issueTriggerStore as any,
+      enqueueTrigger: async (o) => {
+        received.push(o as unknown as Record<string, unknown>);
+      },
+      defaultProfile: () => "p",
+    });
+    apps.add(app);
+    const body = JSON.stringify({
+      action: "opened",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      sender: { login: "a-human" },
+      issue: { number: 195 },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sign(body), "x-github-event": "issues" },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(received).toEqual([
+      {
+        repo: "owner/name",
+        triggerId: 4,
+        installationId: 42,
+        profile: "p",
+        prNumber: undefined,
+        event: { type: "issues", action: "opened", issueNumber: 195 },
       },
     ]);
   });

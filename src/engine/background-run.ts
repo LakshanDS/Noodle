@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import { log, runLogger } from "../util/log.js";
 import { registerCustomProviders } from "../profiles/custom-providers.js";
 import { GitHubClient } from "../github/client.js";
-import type { PullRequestData } from "../github/client.js";
+import type { PullRequestData, IssueData } from "../github/client.js";
 import { Workspace, cloneUrlFor } from "./workspace.js";
 import { expandTags } from "./tags.js";
 import { generateIssueTitle, phraseOutput, templateTitle } from "./final-pass.js";
@@ -111,9 +111,16 @@ export interface BackgroundRunInput {
   /**
    * Trigger-only: the event that fired. `prNumber` is set when the event was
    * about a PR (pull_request.*) — the run then delivers its output as a
-   * comment on that PR instead of a new issue.
+   * comment on that PR instead of a new issue. `issueNumber` is set when the
+   * event carried an issue (issues.*, issue_comment.*) — the issue's
+   * title/body/URL are injected into the prompt.
    */
-  eventContext?: { type: string; action: string | null; prNumber?: number | null };
+  eventContext?: {
+    type: string;
+    action: string | null;
+    prNumber?: number | null;
+    issueNumber?: number | null;
+  };
 }
 
 /**
@@ -394,10 +401,11 @@ export async function runBackgroundJob(
       } catch (e) {
         log_.warn({ err: (e as Error).message }, "failed to expand task prompt tags — using raw task");
       }
-      // PR-event trigger: name the PR the event was about in the prompt. A
+      // PR/issue-event trigger: name what the event was about in the prompt. A
       // transient API failure must not block the run — the agent just gets the
       // bare event header.
       let eventPR: PullRequestData | null = null;
+      let eventIssue: IssueData | null = null;
       if (input.eventContext?.prNumber) {
         eventPR = await gh
           .getPullRequest(input.repo, input.eventContext.prNumber)
@@ -405,8 +413,15 @@ export async function runBackgroundJob(
             log_.warn({ err: (e as Error).message, pr: input.eventContext?.prNumber }, "could not fetch the event PR for prompt context");
             return null;
           });
+      } else if (input.eventContext?.issueNumber) {
+        eventIssue = await gh
+          .getIssue(input.repo, input.eventContext.issueNumber)
+          .catch((e: unknown) => {
+            log_.warn({ err: (e as Error).message, issue: input.eventContext?.issueNumber }, "could not fetch the event issue for prompt context");
+            return null;
+          });
       }
-      const prompt = buildBackgroundPrompt({ ...input, prompt: taskPrompt }, config.agent_name, fullSysInfo, eventPR ?? undefined);
+      const prompt = buildBackgroundPrompt({ ...input, prompt: taskPrompt }, config.agent_name, fullSysInfo, eventPR ?? undefined, eventIssue ?? undefined);
       const throttle = throttleForRpm(profile.api_rpm);
       const settingsManager = buildSettingsManager(ws.path, join(ws.path, ".noodle-agent"), profile);
       const loader = new DefaultResourceLoader({
@@ -762,18 +777,20 @@ export async function runBackgroundJob(
  *
  * `eventPR` (trigger runs on PR-carrying events) names the PR the event was
  * about so the agent knows what it's responding to — the workspace is the
- * trigger trunk, not that PR's branch.
+ * trigger trunk, not that PR's branch. `eventIssue` (issue-carrying events)
+ * appends the issue's title/body/URL after the Task section.
  *
  * Everything else (sysInfo prepend, skill-loading, findings-as-final-message
  * contract, task block) is identical. The trigger's event context is just the
  * event type/action name — no payload survives the webhook→queue→run path
- * beyond that pair and the PR number.
+ * beyond that pair and the PR/issue number.
  */
 export function buildBackgroundPrompt(
   input: BackgroundRunInput,
   agentName: string,
   sysInfo?: string,
   eventPR?: PullRequestData | null,
+  eventIssue?: IssueData | null,
 ): string {
   const lines: string[] = [];
   if (sysInfo) {
@@ -834,6 +851,18 @@ export function buildBackgroundPrompt(
     "",
     input.prompt.trim() || "_(no task specified)_",
   );
+  if (eventIssue) {
+    lines.push(
+      "",
+      "## The issue this event is about",
+      "",
+      `**${eventIssue.title}** (#${eventIssue.number})`,
+      "",
+      eventIssue.body || "_(no description)_",
+      "",
+      `Issue URL: ${eventIssue.html_url}`,
+    );
+  }
   return lines.join("\n");
 }
 

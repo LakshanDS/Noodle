@@ -57,7 +57,7 @@ export interface WebhookHandlerDeps {
     /** The PR the event is about, when the event carries one (pull_request.*). */
     prNumber?: number;
     /** The event type/action that actually fired (vs the trigger's configured filters). */
-    event?: { type: string; action: string | null };
+    event?: { type: string; action: string | null; issueNumber?: number | null };
   }): Promise<void> | void;
   /** Get the default profile name. */
   defaultProfile?: () => string | undefined;
@@ -151,7 +151,11 @@ export function createWebhookApp(getSecret: () => string, deps: WebhookHandlerDe
               installationId: metadata.installationId,
               profile: trigger.profile ?? deps.defaultProfile?.() ?? null,
               prNumber: metadata.prNumber,
-              event: { type: metadata.eventType, action: metadata.action ?? null },
+              event: {
+                type: metadata.eventType,
+                action: metadata.action ?? null,
+                issueNumber: metadata.issueNumber ?? null,
+              },
             });
             deps.triggerStore.markTriggered(trigger.id);
             triggerMatched = true;
