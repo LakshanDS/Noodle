@@ -208,11 +208,9 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
       // The event context the job actually fired on, captured at enqueue time.
       // Falls back to the trigger row's configured filters (manual runs carry
       // neither a stored event nor a PR number).
-      let firedEvent: { type: string; action: string | null; issueNumber?: number | null } | undefined;
+      let firedEvent: { type: string; action: string | null } | undefined;
       try {
-        firedEvent = job.event
-          ? (JSON.parse(job.event) as { type: string; action: string | null; issueNumber?: number | null })
-          : undefined;
+        firedEvent = job.event ? (JSON.parse(job.event) as { type: string; action: string | null }) : undefined;
       } catch {
         firedEvent = undefined;
       }
@@ -231,10 +229,6 @@ export async function serve(configPath: string | undefined, opts: ServeOptions =
         // PR-carrying events (pull_request.*) deliver their findings as a
         // comment on this PR instead of a new issue.
         eventPrNumber: job.issue_number > 0 ? job.issue_number : undefined,
-        // Issue-carrying events (issues.*, issue_comment.*) get the issue's
-        // title/body/URL injected into the prompt (prompt context only —
-        // delivery is unchanged).
-        eventIssueNumber: firedEvent?.issueNumber ?? undefined,
         // Display name for PR titles + manual-sync issues.
         triggerLabel: trigger.name,
       }, {

@@ -375,16 +375,6 @@ describe("trigger jobs: PR number + fired event", () => {
     expect(JSON.parse(job.event ?? "null")).toEqual({ type: "pull_request", action: "opened" });
   });
 
-  it("round-trips the issue number inside the event JSON (issue_number column stays 0)", () => {
-    const job = queue.enqueueTrigger({
-      repo: "o/r",
-      triggerId: 5,
-      event: { type: "issues", action: "opened", issueNumber: 195 },
-    });
-    expect(job.issue_number).toBe(0);
-    expect(JSON.parse(job.event ?? "null")).toEqual({ type: "issues", action: "opened", issueNumber: 195 });
-  });
-
   it("defaults issue_number to 0 and event to null (manual runs)", () => {
     const job = queue.enqueueTrigger({ repo: "o/r", triggerId: 5, source: "manual" });
     expect(job.issue_number).toBe(0);

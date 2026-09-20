@@ -55,12 +55,6 @@ export interface TriggerRunInput {
    * instead of opening a new issue. Undefined for other events / manual runs.
    */
   eventPrNumber?: number | null;
-  /**
-   * The issue the firing event was about (issues.*, issue_comment.*). Prompt
-   * context only — title/body/URL are injected into the run prompt; delivery
-   * is unchanged. Undefined for other events / manual runs.
-   */
-  eventIssueNumber?: number | null;
   /** Display name (trigger name) for PR titles and manual-sync issues. */
   triggerLabel?: string | null;
 }
@@ -119,7 +113,6 @@ export async function runTriggerJob(
       type: input.eventType,
       action: input.eventAction ?? null,
       prNumber: input.eventPrNumber ?? null,
-      issueNumber: input.eventIssueNumber ?? null,
     },
   }, engineDeps);
 }
