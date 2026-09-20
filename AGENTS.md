@@ -20,7 +20,7 @@ Noodle is a self-hosted GitHub bot that uses AI coding agents to automate bug fi
 
 3. **The AI agent runs** on the cloned branch with a system prompt + the user's task:
    - Issue/PR: the issue title, body, comments, and URL are injected into the prompt
-   - Cron/Trigger: a freeform task prompt plus the event's context — type/action always, and for `pull_request.*` / `issues.*` / `issue_comment.*` triggers the PR or issue the event was about (number/title/body/URL; the PR block also carries its head branch). PR-event runs additionally deliver their output as a comment on that PR
+   - Cron/Trigger: a freeform task prompt plus event context (for triggers)
 
 4. **Results are delivered**:
    - **Issue mode (no open PR)**: commits changes, pushes branch, opens a PR with `Fixes #N`, posts a comment on the issue

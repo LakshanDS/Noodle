@@ -291,9 +291,8 @@ export class JobQueue {
    * target), which also makes the dedupe key `(repo, <pr>, trigger_id)`
    * per-PR: one trigger can run for different PRs concurrently, while a repeat
    * fire for the SAME PR before its run finishes is still deduped. `event` is
-   * the event that actually fired — type/action plus the issue number when the
-   * event carried one — kept for the run's prompt framing (the trigger row's
-   * columns are configured filters, not facts).
+   * the type/action pair that actually fired, kept for the run's prompt
+   * framing (the trigger row's columns are configured filters, not facts).
    */
   enqueueTrigger(opts: {
     repo: string;
@@ -302,7 +301,7 @@ export class JobQueue {
     profile?: string | null;
     source?: string;
     issueNumber?: number | null;
-    event?: { type: string; action: string | null; issueNumber?: number | null };
+    event?: { type: string; action: string | null };
   }): QueuedJob {
     const { repo, triggerId, installationId = null, profile = null, source = "trigger" } = opts;
     const issueNumber = opts.issueNumber ?? 0;
