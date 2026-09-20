@@ -383,4 +383,29 @@ describe("buildBackgroundPrompt (trigger PR context)", () => {
     expect(prompt).toContain("**Event:** `push`");
     expect(prompt).not.toContain("head branch");
   });
+
+  it("appends the event issue context after the Task section", () => {
+    const input = {
+      ...baseInput,
+      eventContext: { type: "issues", action: "opened", prNumber: null, issueNumber: 195 },
+      prompt: "investigate this issue",
+    };
+    const eventIssue = {
+      number: 195,
+      title: "Login page throws 500",
+      body: "Steps to reproduce:\n1. open /login",
+      labels: ["bug"],
+      html_url: "https://github.com/owner/name/issues/195",
+      pull_request: false,
+    };
+    const prompt = buildBackgroundPrompt(input, "Noodle", undefined, undefined, eventIssue);
+    // Issue context comes AFTER the Task section, per the trigger-prompt contract.
+    const taskIdx = prompt.indexOf("## Task");
+    const issueIdx = prompt.indexOf("## The issue this event is about");
+    expect(taskIdx).toBeGreaterThan(-1);
+    expect(issueIdx).toBeGreaterThan(taskIdx);
+    expect(prompt).toContain("**Login page throws 500** (#195)");
+    expect(prompt).toContain("1. open /login");
+    expect(prompt).toContain("Issue URL: https://github.com/owner/name/issues/195");
+  });
 });
