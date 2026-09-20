@@ -234,3 +234,112 @@ describe("self check-run webhook suppression", () => {
     expect(enqueued).toEqual([1]);
   });
 });
+
+describe("trigger PR-event passthrough + self comment suppression", () => {
+  /** A trigger store with one trigger that fires on ANY issue_comment event. */
+  const commentTriggerStore = {
+    listByRepo: () => [{ id: 2, event_type: "issue_comment", event_action: null, branch_pattern: null }],
+    markTriggered: () => {},
+  };
+
+  const commentPayload = (login: string) =>
+    JSON.stringify({
+      action: "created",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      sender: { login },
+      issue: { number: 7 },
+      comment: { body: "hello" },
+    });
+
+  it("does NOT fire a trigger for the bot's own issue_comment.created (PR-comment loop guard)", async () => {
+    const enqueued: number[] = [];
+    const app = createWebhookApp(() => SECRET, {
+      enqueue: async () => {},
+      selfLogin: () => "noodle[bot]",
+      triggerStore: commentTriggerStore as any,
+      enqueueTrigger: async (o) => {
+        enqueued.push(o.triggerId);
+      },
+      defaultProfile: () => "p",
+    });
+    apps.add(app);
+    const body = commentPayload("noodle[bot]");
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sign(body), "x-github-event": "issue_comment" },
+      payload: body,
+    });
+    // Trigger runs deliver their findings as PR comments — the bot's own
+    // comment must never chain-fire a broad issue_comment trigger.
+    expect(res.statusCode).toBe(202);
+    expect(res.json().ignored).toBe(true);
+    expect(enqueued).toEqual([]);
+  });
+
+  it("still fires an issue_comment trigger for a comment from someone else", async () => {
+    const enqueued: number[] = [];
+    const app = createWebhookApp(() => SECRET, {
+      enqueue: async () => {},
+      selfLogin: () => "noodle[bot]",
+      triggerStore: commentTriggerStore as any,
+      enqueueTrigger: async (o) => {
+        enqueued.push(o.triggerId);
+      },
+      defaultProfile: () => "p",
+    });
+    apps.add(app);
+    const body = commentPayload("a-human");
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sign(body), "x-github-event": "issue_comment" },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(enqueued).toEqual([2]);
+  });
+
+  it("passes the event PR number + fired event through to enqueueTrigger", async () => {
+    const prTriggerStore = {
+      listByRepo: () => [{ id: 3, event_type: "pull_request", event_action: null, branch_pattern: null }],
+      markTriggered: () => {},
+    };
+    const received: Array<Record<string, unknown>> = [];
+    const app = createWebhookApp(() => SECRET, {
+      enqueue: async () => {},
+      selfLogin: () => "noodle[bot]",
+      triggerStore: prTriggerStore as any,
+      enqueueTrigger: async (o) => {
+        received.push(o as unknown as Record<string, unknown>);
+      },
+      defaultProfile: () => "p",
+    });
+    apps.add(app);
+    const body = JSON.stringify({
+      action: "opened",
+      installation: { id: 42 },
+      repository: { full_name: "owner/name" },
+      sender: { login: "a-human" },
+      pull_request: { number: 42 },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sign(body), "x-github-event": "pull_request" },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(received).toEqual([
+      {
+        repo: "owner/name",
+        triggerId: 3,
+        installationId: 42,
+        profile: "p",
+        prNumber: 42,
+        event: { type: "pull_request", action: "opened" },
+      },
+    ]);
+  });
+});

@@ -18,8 +18,9 @@
  * PR-when-changes output — is identical to schedulers and lives in the engine.
  *
  * Note: `TriggerRunInput.eventSummary` was never populated by any caller (dead
- * code) and is dropped here. The trigger's only event context that actually
- * survived the webhook→queue→run path is the event type/action name pair.
+ * code) and is dropped here. The trigger's event context that survives the
+ * webhook→queue→run path is the fired event type/action pair plus — for PR
+ * events — the PR number the event was about (the delivery target).
  */
 import type { GitHubClient } from "../github/client.js";
 import type { NoodleConfig } from "../config/schema.js";
@@ -48,6 +49,12 @@ export interface TriggerRunInput {
   eventType: string;
   /** The event action (e.g. "opened", "created"). May be null. */
   eventAction?: string | null;
+  /**
+   * The PR the firing event was about (pull_request.* events). When set, the
+   * run delivers its findings — and error notices — as a comment on this PR
+   * instead of opening a new issue. Undefined for other events / manual runs.
+   */
+  eventPrNumber?: number | null;
   /** Display name (trigger name) for PR titles and manual-sync issues. */
   triggerLabel?: string | null;
 }
@@ -102,7 +109,11 @@ export async function runTriggerJob(
     jobId: input.jobId,
     token: input.token,
     runKind: "trigger",
-    eventContext: { type: input.eventType, action: input.eventAction ?? null },
+    eventContext: {
+      type: input.eventType,
+      action: input.eventAction ?? null,
+      prNumber: input.eventPrNumber ?? null,
+    },
   }, engineDeps);
 }
 
